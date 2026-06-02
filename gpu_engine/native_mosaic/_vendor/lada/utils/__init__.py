@@ -1,0 +1,90 @@
+# SPDX-FileCopyrightText: Lada Authors
+# SPDX-License-Identifier: AGPL-3.0
+
+from dataclasses import dataclass
+from fractions import Fraction
+
+import numpy as np
+import torch
+
+"""
+A bounding box of a detected object defined by two points, the top/left and bottom/right pixel.
+Represented as X/Y coordinate tuple: top-left (Y), top-left (X), bottom-right (Y), bottom-right (X)
+"""
+type Box = tuple[int, int, int, int]
+
+"""
+A segmentation mask of a detected object. Pixel values of 0 indicate that the pixel is not part of the object.
+Shape: (H, W, 1), dtype: np.uint8, range: 0-255
+"""
+type Mask = np.ndarray[np.uint8]
+
+"""
+A segmentation mask of a detected object. Pixel values of 0 indicate that the pixel is not part of the object.
+Shape: (H, W, 1), dtype: torch.uint8, range: 0-255
+"""
+type MaskTensor = torch.Tensor
+
+"""
+Color Image
+Shape: (H, W, C=3), dtype: np.uint8, range: 0-255
+H, W, C stand for image height, width and color channels respectively. C is in BGR instead of RGB order
+"""
+type Image = np.ndarray[np.uint8]
+
+"""
+Color Image
+Shape: (H, W, C=3), dtype: torch.uint8, range: 0-255
+H, W, C stand for image height, width and color channels respectively. C is in BGR instead of RGB order
+"""
+type ImageTensor = torch.Tensor
+
+"""
+Padding of an Image or Mask represented as tuple padding values (number of black pixels) added to each image edge:
+(padding-top, padding-bottom, padding-left, padding-right)
+"""
+type Pad = tuple[int, int, int, int]
+
+"""
+Metadata about a video file
+"""
+@dataclass
+class VideoMetadata:
+    video_file: str
+    video_height: int
+    video_width: int
+    video_fps: float
+    average_fps: float
+    video_fps_exact: Fraction
+    codec_name: str
+    frames_count: int
+    duration: float
+    time_base: Fraction
+    start_pts: int
+
+@dataclass
+class Detection:
+    cls: int
+    box: Box
+    mask: Mask # Binary segmentation mask. Values can be either 0 (background) or mask_val
+    confidence: float | None = None # value between 0 and 1 where 1 is completely certain
+
+"""
+Detection result containing bounding box and segmentation mask of the detected object within the frame
+"""
+@dataclass
+class Detections:
+    frame: Image
+    detections: list[Detection]
+
+"""
+Mapping for class ids and mask values.
+Mask value is anon-zero value used in binary mask (Mask) to indicate if pixel belongs to the class
+"""
+DETECTION_CLASSES = {
+    "nsfw": dict(cls=0, mask_value=255),
+    "sfw_head": dict(cls=1, mask_value=127),
+    "sfw_face": dict(cls=2, mask_value=192),
+    "watermark": dict(cls=3, mask_value=60),
+    "mosaic": dict(cls=4, mask_value=90),
+}

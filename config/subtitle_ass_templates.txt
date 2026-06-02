@@ -1,0 +1,12 @@
+[Script Info]
+ScriptType: v4.00+
+PlayResX: {width}
+PlayResY: {height}
+
+[V4+ Styles]
+Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
+Style: Default,sans-serif,{cn_size},{DefaultPrimaryColour},&H000000FF,{DefaultOutlineColour},&H00000000,-1,0,0,0,100,100,3.2,0,1,2.0,0,{alignment},10,10,{marginv},1,\q1
+Style: Secondary,sans-serif,{jp_size},{SecondaryPrimaryColour},&H000000FF,{SecondaryOutlineColour},&H00000000,-1,0,0,0,100,100,0.8,0,1,2.0,0,{alignment},10,10,{marginv},1,\q1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text

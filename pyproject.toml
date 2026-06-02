@@ -1,0 +1,55 @@
+[project]
+name = "vr-video-toolbox"
+version = "0.1.0"
+description = "VR Video Toolbox (CUDA EDITION) GUI"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "Pillow>=10.0.0",
+    "pyinstaller>=6.11.1",
+    "ffmpy3>=0.2.4",
+    "faster-whisper>=1.1.1",
+    # numpy <2.1 keeps CuPy 12.x and PyNvVideoCodec wheels compatible.
+    # PTMediaServer uses the same upper bound; see reference/PTMediaServer/pyproject.toml.
+    "numpy>=1.26,<2.1",
+    "auditok>=0.3.0",
+    "huggingface-hub>=1.8.0",
+    "keyring>=25.7.0",
+    "requests>=2.32.5",
+    "av>=17.0.1",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.20.0",
+    # GPU pipeline plus the built-in demosaic engine, all aligned to CUDA 12.8.
+    # Keep torch/cupy/nvrtc on the same major CUDA line to avoid nvrtc conflicts.
+    "pynvvideocodec>=2.1.0",
+    # CuPy uses cuda12x plus 12.8 nvrtc/runtime/cccl wheels. These are
+    # self-contained and do not require a system CUDA toolkit; sm_120 is
+    # supported through nvrtc 12.8 and PTX JIT.
+    "cupy-cuda12x>=14.0",
+    "nvidia-cuda-nvrtc-cu12==12.8.93",
+    "nvidia-cuda-runtime-cu12==12.8.90",
+    "nvidia-cuda-cccl-cu12>=12.9.27",
+    # Built-in native_gpu engine: integrates Lada's torch pipeline in-process.
+    # The cu128 wheel includes sm_120 kernels.
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    "ultralytics==8.4.4",
+    "mmengine==0.10.7",
+]
+
+[tool.uv]
+package = false
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]

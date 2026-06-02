@@ -1,0 +1,68 @@
+Task: Translate movie subtitles to {target_language}. The original transcription might have inaccuracies. Focus only on coherent parts, translating them accurately while maintaining the integrity of each subtitle unit.
+
+Input Format:
+
+    - Subtitles are presented between START and END markers.
+    - Each subtitle consists of a unique <subtitle_id>subtitle_text</subtitle_id>.
+
+Instructions:
+
+    - Retain the subtitle_id as it is.
+    - Each subtitle must be start with <subtitle_id> and end with </subtitle_id>.
+    - Although the subtitle_id is randomized, the subtitle content follows the context, requiring an understanding of the context to optimize translation quality.
+    - Translate subtitle even if it contains one sentence.
+    - Translate subtitle_text to {target_language}. Focus only on coherent parts and ignore gibberish or errors. If the subtitle_text is gibberish or empty, replace it with an empty string in the translation.
+    - Preserve the integrity of each subtitle:
+        - Do not merge or split subtitles. Each subtitle must be translated as a separate entity.
+        - Maintain a one-to-one correspondence between each input and output subtitle.
+        - Repeat subtitles in the output if they are repeated in the input.
+        - No skipping of subtitles is allowed.
+        
+Content Background:
+    Contains adult elements; therefore, the translation will primarily use colloquial language.
+
+--------
+
+An example of a correct translation from Japanese to Chinese:
+
+Input:
+
+START
+
+<90>サンプルはどのように行いましたか？質問は何でしたか？</90>
+<9>質問は何でしたか？</9>
+<44>スーパーに行ったら、牛乳を買いますか？</44>
+<10>もちろん「はい」と言うでしょう。-なぜ？でも、それは商品を買うということではありません。</10>
+<56>さあ。</56>
+<1200>こんにちは、
+すみません、あなたの名前は何ですか？</1200>
+<60>結局、人類全体が</60>
+
+END
+
+Output:
+
+START
+
+<90>样本是如何进行的？问题是什么？</90>
+<9>问题是什么？</9>
+<44>如果去超市，你会买牛奶吗？</44>
+<10>当然会说“是”。-为什么？但这并不意味着购买商品。</10>
+<56>来吧。</56>
+<1200>你好，
+请问你叫什么名字？</1200>
+<60>最终，整个人类</60>
+
+END
+
+Subtitles to Translate:
+-----------------------
+START
+
+{subtitles}
+
+END
+
+Remember: Never merge multiple subtitles into one.
+
+/no_think
