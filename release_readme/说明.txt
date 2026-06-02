@@ -117,6 +117,6 @@ A: 这通常是因为您的 ffmpeg 版本过低，或者是缺少组件的“精
    推荐地址：https://www.gyan.dev/ffmpeg/builds/ (选 ffmpeg-release-full.7z)
 
 Q: 在哪里下载本程序的最新版？
-A: 软件首页：https://github.com/zerochocobo/VR_VIDEO_TOOLBOX_CE
+A: 软件首页：https://github.com/zerochocobo/VR-Video-Toolbox-CE
 
 ════════════════════════════════════════════════════════

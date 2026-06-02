@@ -6,7 +6,7 @@ VRビデオの整理、修復、および字幕処理向けに設計されたWin
 
 本バージョンは **NVIDIA CUDA** 向けにプログラムレベルで最適化されています。対応するワークフローでは、NVIDIA GPU によるデコード、ジオメトリ変換、AI処理、エンコードを優先し、未対応のソースや実行環境では FFmpeg 経路へフォールバックします。
 
-ホームページ：https://github.com/zerochocobo/VR_VIDEO_TOOLBOX_CE
+ホームページ：https://github.com/zerochocobo/VR-Video-Toolbox-CE
 
 現在の主な機能：
 

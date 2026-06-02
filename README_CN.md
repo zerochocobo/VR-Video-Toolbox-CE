@@ -6,7 +6,7 @@
 
 本版本针对 **NVIDIA CUDA** 程序性优化：支持的流程会优先使用 NVIDIA GPU 完成解码、几何变换、AI 处理和编码，不支持的素材或运行环境会自动回退到 FFmpeg 路径。
 
-软件首页：https://github.com/zerochocobo/VR_VIDEO_TOOLBOX_CE
+软件首页：https://github.com/zerochocobo/VR-Video-Toolbox-CE
 
 当前主要功能：
 

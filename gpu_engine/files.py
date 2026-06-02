@@ -198,7 +198,8 @@ def _resolve_bitrate(out_w: int, out_h: int, fps: float,
 
 
 def _encoder_kwargs(meta: probe.VideoMetadata, bitrate_bps: int, *,
-                    maxrate_multiplier: float = 1.0) -> dict:
+                    maxrate_multiplier: float = 1.0,
+                    max_bitrate_bps: int | None = None) -> dict:
     """Always use capped VBR to avoid uncontrolled constqp output sizes.
 
     Note the NVENC preset semantics: P1 is fastest/lowest quality and P7 is
@@ -208,7 +209,10 @@ def _encoder_kwargs(meta: probe.VideoMetadata, bitrate_bps: int, *,
     preset = str(_cfg("gpu_encode_preset", "P7") or "P7").upper()
     if preset not in {f"P{i}" for i in range(1, 8)}:
         preset = "P7"
-    maxrate = max(int(bitrate_bps), int(bitrate_bps * max(1.0, float(maxrate_multiplier or 1.0))))
+    if max_bitrate_bps and max_bitrate_bps > 0:
+        maxrate = max(int(bitrate_bps), int(max_bitrate_bps))
+    else:
+        maxrate = max(int(bitrate_bps), int(bitrate_bps * max(1.0, float(maxrate_multiplier or 1.0))))
     return {
         "fps": f"{meta.source_fps:.6f}",
         "gop": "30",
@@ -289,6 +293,7 @@ def process_video(
     bit_depth: int | None = None,
     cq: int | None = 18,
     bitrate_bps: int | None = None,
+    max_bitrate_bps: int | None = None,
     keep_audio: bool = True,
     log_callback=None,
     raw_only: bool = False,
@@ -313,7 +318,7 @@ def process_video(
     out_w, out_h = out_size if out_size else (info.width, info.height)
 
     bitrate_bps = _resolve_bitrate(out_w, out_h, meta.source_fps, bitrate_bps, meta.bitrate_bps)
-    enc_kwargs = _encoder_kwargs(meta, bitrate_bps)
+    enc_kwargs = _encoder_kwargs(meta, bitrate_bps, max_bitrate_bps=max_bitrate_bps)
     _log_encoder_settings("process video", out_w, out_h, bd, enc_kwargs, log_callback)
     enc = PyNvEncoderSession(
         out_w, out_h, bit_depth=bd, codec="hevc",
@@ -445,6 +450,7 @@ def vr_to_flat(
     roll: float = 0.0,
     cq: int | None = 18,
     bitrate_bps: int | None = None,
+    max_bitrate_bps: int | None = None,
     keep_audio: bool = True,
     log_callback=None,
     cancel_token: "CancelToken | None" = None,
@@ -453,6 +459,7 @@ def vr_to_flat(
     transform = _make_flat_transform(out_w, out_h, yaw, pitch, d_fov, roll)
     return process_video(
         src, dst, transform, out_size=(out_w, out_h), cq=cq, bitrate_bps=bitrate_bps,
+        max_bitrate_bps=max_bitrate_bps,
         keep_audio=keep_audio, log_callback=log_callback, cancel_token=cancel_token,
     )
 
@@ -491,6 +498,7 @@ def process_video_multi(
     bit_depth: int | None = None,
     cq: int | None = 18,
     bitrate_bps: int | None = None,
+    max_bitrate_bps: int | None = None,
     keep_audio: bool = True,
     start_sec: float | None = None,
     end_sec: float | None = None,
@@ -522,7 +530,7 @@ def process_video_multi(
     for job in jobs:
         ow, oh = job["out_size"]
         br = _resolve_bitrate(ow, oh, fps, bitrate_bps, meta.bitrate_bps)
-        enc_kwargs = _encoder_kwargs(meta, br)
+        enc_kwargs = _encoder_kwargs(meta, br, max_bitrate_bps=max_bitrate_bps)
         _log_encoder_settings(f"multi output {Path(job['dst']).name}", ow, oh, bd, enc_kwargs, log_callback)
         enc = PyNvEncoderSession(ow, oh, bit_depth=bd, codec="hevc",
                                  **enc_kwargs)
@@ -626,6 +634,7 @@ def split_video(
     to_fisheye: bool = False,
     cq: int | None = 18,
     bitrate_bps: int | None = None,
+    max_bitrate_bps: int | None = None,
     keep_audio: bool = True,
     start_sec: float | None = None,
     end_sec: float | None = None,
@@ -646,6 +655,7 @@ def split_video(
         jobs.append({"transform": _make_crop_transform(mode, to_fisheye),
                      "dst": dst, "out_size": (cw_, ch_)})
     return process_video_multi(src, jobs, cq=cq, bitrate_bps=bitrate_bps,
+                               max_bitrate_bps=max_bitrate_bps,
                                keep_audio=keep_audio, start_sec=start_sec, end_sec=end_sec,
                                log_callback=log_callback, cancel_token=cancel_token)
 
@@ -1402,6 +1412,7 @@ def extract_clip(
     end_sec: float | None = None,
     cq: int | None = 18,
     bitrate_bps: int | None = None,
+    max_bitrate_bps: int | None = None,
     keep_audio: bool = True,
     log_callback=None,
     cancel_token: "CancelToken | None" = None,
@@ -1443,7 +1454,7 @@ def extract_clip(
     lut_c = v360_lut.make_lut("heq2fisheye", out_w // 2, out_h // 2, fov) if to_fisheye else None
 
     bitrate_bps = _resolve_bitrate(out_w, out_h, fps, bitrate_bps, meta.bitrate_bps)
-    enc_kwargs = _encoder_kwargs(meta, bitrate_bps)
+    enc_kwargs = _encoder_kwargs(meta, bitrate_bps, max_bitrate_bps=max_bitrate_bps)
     _log_encoder_settings("extract clip", out_w, out_h, bd, enc_kwargs, log_callback)
     enc = PyNvEncoderSession(out_w, out_h, bit_depth=bd, codec="hevc",
                              **enc_kwargs)

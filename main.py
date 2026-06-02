@@ -296,7 +296,7 @@ class VRVideoToolboxLauncher:
 
         link_lbl = ttk.Label(statusbar, text=get_text('link_opensource'), style="Link.TLabel", cursor="hand2")
         link_lbl.grid(row=0, column=1, sticky='')
-        link_lbl.bind("<Button-1>", lambda e: webbrowser.open("https://github.com/zerochocobo/VR_VIDEO_TOOLBOX_CE"))
+        link_lbl.bind("<Button-1>", lambda e: webbrowser.open("https://github.com/zerochocobo/VR-Video-Toolbox-CE"))
 
         ttk.Label(statusbar, text=ver_name).grid(row=0, column=2, sticky='e')
 

@@ -151,7 +151,7 @@ class SourceTimeScannerTests(unittest.TestCase):
                 "10.000000",
                 "20.000000",
             ))
-            self.assertEqual(split_plain.call_args.kwargs["final_bitrate_kbps"], 500)
+            self.assertNotIn("final_bitrate_kbps", split_plain.call_args.kwargs)
             self.assertFalse(split_plain.call_args.kwargs["keep_audio"])
             process_lada.assert_called_once()
 
@@ -267,6 +267,10 @@ class SourceTimeScannerTests(unittest.TestCase):
 
             self.assertEqual(result, logic.PreExtractResult.OK)
             self.assertEqual(extract_rect.call_count, 2)
+            expected_rect_bitrate = int(2_000_000 * (512 * 512) / (4096 * 4096) * 2.0)
+            for call in extract_rect.call_args_list:
+                self.assertIsNone(call.kwargs["cq"])
+                self.assertEqual(call.kwargs["bitrate_bps"], expected_rect_bitrate)
             self.assertEqual(process_lada.call_count, 2)
             vr_projection.assert_not_called()
             paste_fallback.assert_not_called()

@@ -22,6 +22,24 @@ import threading
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _VENDOR = os.path.join(_HERE, "_vendor")
 _engine = None
+
+
+def _vendor_dir() -> str:
+    """Resolve the vendored Lada root, robust to frozen __file__ quirks.
+
+    In a PyInstaller onedir build the data tree is bundled under
+    <_MEIPASS>/gpu_engine/native_mosaic/_vendor. Depending on how __file__ is
+    set for the frozen module, _VENDOR may already be correct; if not, fall back
+    to the _MEIPASS-relative location.
+    """
+    candidates = [_VENDOR]
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(os.path.join(meipass, "gpu_engine", "native_mosaic", "_vendor"))
+    for c in candidates:
+        if os.path.isdir(os.path.join(c, "lada")):
+            return c
+    return _VENDOR
 _lock = threading.Lock()
 _prepared = False
 
@@ -69,22 +87,48 @@ def _prepare():
     except Exception:
         pass
     # 2) Add vendored Lada to import paths because it uses absolute imports such as `from lada ...`.
-    if _VENDOR not in sys.path:
-        sys.path.insert(0, _VENDOR)
+    vendor = _vendor_dir()
+    if vendor not in sys.path:
+        sys.path.insert(0, vendor)
     _prepared = True
+
+
+def unavailable_reason() -> str | None:
+    """Return None when the engine is available, otherwise a human-readable reason.
+
+    This makes the one-click dependency check actionable instead of a black box:
+    it distinguishes torch import failure, missing CUDA/GPU, and each missing
+    model file (printing the exact path expected).
+    """
+    try:
+        _prepare()
+    except Exception as e:
+        return f"引擎初始化失败: {e}"
+    try:
+        import torch
+    except Exception as e:
+        return f"无法导入 torch: {e}"
+    try:
+        if not torch.cuda.is_available():
+            return "torch.cuda 不可用（未检测到可用的 NVIDIA GPU 或 CUDA 运行时未正确加载）"
+    except Exception as e:
+        return f"torch.cuda 检测异常: {e}"
+    try:
+        from .models_cfg import detection_model_path, restoration_model_path
+        det = detection_model_path()
+        res = restoration_model_path()
+    except Exception as e:
+        return f"无法解析模型路径: {e}"
+    if not os.path.isfile(det):
+        return f"缺少检测模型文件: {det}"
+    if not os.path.isfile(res):
+        return f"缺少修复模型文件: {res}"
+    return None
 
 
 def available() -> bool:
     """Return true when torch.cuda is available and detection/restoration model files exist."""
-    try:
-        _prepare()
-        import torch
-        if not torch.cuda.is_available():
-            return False
-        from .models_cfg import detection_model_path, restoration_model_path
-        return os.path.isfile(detection_model_path()) and os.path.isfile(restoration_model_path())
-    except Exception:
-        return False
+    return unavailable_reason() is None
 
 
 def get_engine():

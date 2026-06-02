@@ -133,6 +133,6 @@ A: This usually means your ffmpeg version is too old, or you are using a "minima
    Download: https://www.gyan.dev/ffmpeg/builds/ (Select ffmpeg-release-full.7z)
 
 Q: Where can I download the latest version of this program?
-A: Homepage: https://github.com/zerochocobo/VR_VIDEO_TOOLBOX_CE
+A: Homepage: https://github.com/zerochocobo/VR-Video-Toolbox-CE
 
 ════════════════════════════════════════════════════════

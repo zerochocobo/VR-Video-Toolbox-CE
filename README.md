@@ -6,7 +6,7 @@ The original project, https://codeberg.org/zelefans/vr_remove_mosaic, only made 
 
 This edition is programmatically optimized for **NVIDIA CUDA**. CUDA-capable workflows use NVIDIA GPU acceleration for decoding, geometry transforms, AI processing, and encoding where supported, with FFmpeg fallback for unsupported sources or runtime environments.
 
-Homepage: https://github.com/zerochocobo/VR_VIDEO_TOOLBOX_CE
+Homepage: https://github.com/zerochocobo/VR-Video-Toolbox-CE
 
 Current main features:
 

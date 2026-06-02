@@ -227,38 +227,147 @@ def ensure_cuda_headers() -> None:
         info("WARNING: cuda_fp16.h not found in dist. nvrtc JIT may fail at runtime.")
 
 
-def consolidate_cuda_dlls() -> None:
-    """Copy CUDA DLLs from _internal\\nvidia\\... and _internal\\torch\\lib into DIST\\bin\\.
+def _file_size(p: Path) -> int:
+    try:
+        return p.stat().st_size
+    except OSError:
+        return -1
 
-    CuPy calls add_dll_directory(CUDA_PATH\\bin) during import, so gathering all
-    nvrtc / cudart / cuBLAS / cuDNN DLLs into bin\\ gives the most reliable
-    fallback lookup path.
+
+def dedupe_root_vs_torch_lib() -> None:
+    """Remove DLLs duplicated between _internal\\ root and _internal\\torch\\lib.
+
+    PyInstaller's collect_all("torch") frequently emits the same DLL twice:
+    once at _internal\\torch\\lib\\<name>.dll (where torch's loader expects it)
+    and once at _internal\\<name>.dll (PyInstaller flattening). Keep only the
+    torch\\lib copy because torch resolves its DLLs relative to that directory.
     """
-    bin_dir = DIST / "bin"
-    bin_dir.mkdir(parents=True, exist_ok=True)
-
-    sources: list[Path] = []
-    nvidia_root = INTERNAL / "nvidia"
-    if nvidia_root.exists():
-        sources.extend(p for p in nvidia_root.rglob("*.dll"))
     torch_lib = INTERNAL / "torch" / "lib"
-    if torch_lib.exists():
-        sources.extend(p for p in torch_lib.glob("*.dll"))
-    cupy_data = INTERNAL / "cupy" / ".data" / "lib"
-    if cupy_data.exists():
-        sources.extend(p for p in cupy_data.glob("*.dll"))
-
-    copied = 0
-    for src in sources:
-        dst = bin_dir / src.name
-        if dst.exists():
+    if not torch_lib.exists():
+        return
+    removed = 0
+    bytes_freed = 0
+    for src in torch_lib.glob("*.dll"):
+        dup = INTERNAL / src.name
+        if not dup.is_file():
+            continue
+        if _file_size(dup) != _file_size(src):
             continue
         try:
-            copy_file(src, dst)
-            copied += 1
+            sz = _file_size(dup)
+            dup.unlink()
+            removed += 1
+            bytes_freed += max(sz, 0)
         except OSError:
             pass
-    info(f"consolidated {copied} CUDA-related DLLs into {bin_dir}")
+    if removed:
+        info(f"deduped {removed} torch DLL copies from _internal root ({bytes_freed/1024/1024:.1f} MiB)")
+
+
+def dedupe_root_vs_nvidia_wheels() -> None:
+    """Remove DLLs duplicated between _internal\\ root and _internal\\nvidia\\*\\bin."""
+    nvidia_root = INTERNAL / "nvidia"
+    if not nvidia_root.exists():
+        return
+    removed = 0
+    bytes_freed = 0
+    for src in nvidia_root.rglob("*.dll"):
+        dup = INTERNAL / src.name
+        if not dup.is_file():
+            continue
+        if _file_size(dup) != _file_size(src):
+            continue
+        try:
+            sz = _file_size(dup)
+            dup.unlink()
+            removed += 1
+            bytes_freed += max(sz, 0)
+        except OSError:
+            pass
+    if removed:
+        info(f"deduped {removed} nvidia wheel DLL copies from _internal root ({bytes_freed/1024/1024:.1f} MiB)")
+
+
+def prune_torch_bloat() -> None:
+    """Strip torch artifacts not needed at runtime: C++ headers, static libs, tests, docs.
+
+    These are required for `pip install torch` build extensions but never loaded by the
+    frozen GUI. Removing them shaves hundreds of MB without affecting functionality.
+    """
+    torch_root = INTERNAL / "torch"
+    if not torch_root.exists():
+        return
+    bytes_freed = 0
+
+    # Whole subdirectories that the runtime never reads.
+    for rel in (
+        "include",                # C++ headers (~100+ MiB)
+        "share/cmake",            # cmake configs
+        "share/man",
+        "test",                   # bundled test scripts/fixtures
+        "utils/benchmark",        # benchmarking helpers
+        "utils/model_dump",
+        "utils/bottleneck",
+        "_C_flatbuffer.pyi",
+    ):
+        target = torch_root / rel
+        if target.exists():
+            try:
+                if target.is_dir():
+                    for p in target.rglob("*"):
+                        if p.is_file():
+                            bytes_freed += _file_size(p)
+                    shutil.rmtree(target, onerror=on_rm_error)
+                else:
+                    bytes_freed += _file_size(target)
+                    target.unlink()
+            except OSError:
+                pass
+
+    # Per-extension trim under torch\lib: *.lib (static), *.pdb (debug), *.exp/.h
+    torch_lib = torch_root / "lib"
+    if torch_lib.exists():
+        for p in list(torch_lib.iterdir()):
+            if p.suffix.lower() in {".lib", ".pdb", ".exp", ".h"}:
+                try:
+                    bytes_freed += _file_size(p)
+                    p.unlink()
+                except OSError:
+                    pass
+
+    # Drop torchgen if collected — pure codegen scripts, not a runtime dep here.
+    torchgen = INTERNAL / "torchgen"
+    if torchgen.exists():
+        try:
+            for p in torchgen.rglob("*"):
+                if p.is_file():
+                    bytes_freed += _file_size(p)
+            shutil.rmtree(torchgen, onerror=on_rm_error)
+        except OSError:
+            pass
+
+    if bytes_freed:
+        info(f"pruned torch bloat: freed {bytes_freed/1024/1024:.1f} MiB")
+
+
+def prune_nvidia_bloat() -> None:
+    """Strip nvidia-*-cu12 wheel headers/static libs not needed at runtime."""
+    nvidia_root = INTERNAL / "nvidia"
+    if not nvidia_root.exists():
+        return
+    bytes_freed = 0
+    for p in list(nvidia_root.rglob("*")):
+        if not p.is_file():
+            continue
+        suffix = p.suffix.lower()
+        if suffix in {".lib", ".a", ".pdb", ".exp"}:
+            try:
+                bytes_freed += _file_size(p)
+                p.unlink()
+            except OSError:
+                pass
+    if bytes_freed:
+        info(f"pruned nvidia wheel bloat: freed {bytes_freed/1024/1024:.1f} MiB")
 
 
 # --------- Verification ---------
@@ -275,8 +384,19 @@ OPTIONAL_DLLS = (
 
 
 def _exists_anywhere(name: str) -> Path | None:
-    for d in (DIST, DIST / "bin", INTERNAL, INTERNAL / "torch" / "lib"):
-        for hit in d.rglob(name) if d.exists() else ():
+    # Search the actual bundled wheel locations. No DLL consolidation happens any
+    # more — the runtime hook exposes torch/lib, nvidia/*/bin, cupy/.data/lib to
+    # the DLL loader directly, so we only need to confirm the files exist there.
+    for d in (
+        INTERNAL,
+        INTERNAL / "torch" / "lib",
+        INTERNAL / "nvidia",
+        INTERNAL / "cupy" / ".data" / "lib",
+        DIST,
+    ):
+        if not d.exists():
+            continue
+        for hit in d.rglob(name):
             return hit
     return None
 
@@ -341,7 +461,18 @@ def main() -> int:
             build_dlna(pyi)
         merge_dlna_into_main()
         ensure_cuda_headers()
-        consolidate_cuda_dlls()
+        # Dedupe + prune to slim the release. The runtime hook adds torch/lib +
+        # nvidia/*/bin to the DLL search path, so no DLL needs to live at the
+        # _internal root or in a separate bin/ directory.
+        dedupe_root_vs_torch_lib()
+        dedupe_root_vs_nvidia_wheels()
+        prune_torch_bloat()
+        prune_nvidia_bloat()
+        # Stale dist\bin from earlier builds (no longer produced) — clean it up.
+        stale_bin = DIST / "bin"
+        if stale_bin.exists():
+            remove_path(stale_bin)
+            info("removed stale dist/bin (DLL consolidation no longer needed)")
         if not args.no_verify:
             verify()
     except BuildError as e:

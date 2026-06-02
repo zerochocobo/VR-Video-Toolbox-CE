@@ -52,6 +52,15 @@ class AppConfigLanguageTests(unittest.TestCase):
         self.assertEqual(kwargs["bitrate"], "9677852")
         self.assertEqual(kwargs["maxbitrate"], "9677852")
 
+    def test_gpu_encoder_accepts_explicit_max_bitrate(self) -> None:
+        app_config._cache = {"gpu_encode_preset": "P4"}
+        meta = VideoMetadata(path="in.mp4", source_fps=59.94)
+
+        kwargs = _encoder_kwargs(meta, 15_000_000, max_bitrate_bps=20_000_000)
+
+        self.assertEqual(kwargs["bitrate"], "15000000")
+        self.assertEqual(kwargs["maxbitrate"], "20000000")
+
     def test_gpu_media_temp_path_is_next_to_output(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             out = Path(raw) / "nested" / "video.mp4"

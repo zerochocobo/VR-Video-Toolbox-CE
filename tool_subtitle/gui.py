@@ -165,7 +165,7 @@ class SubtitleToolsApp:
         model_frame.pack(fill='x', pady=5)
         ttk.Label(model_frame, text=get_text('lbl_model')).pack(side='left', padx=(0, 10))
         
-        self.model_var = tk.StringVar(value="kotoba")
+        self.model_var = tk.StringVar(value="large-v3")
         
         ttk.Radiobutton(model_frame, text=get_text('opt_kotoba'), variable=self.model_var, value="kotoba", command=self.check_model_status).pack(side='left', padx=5)
         ttk.Radiobutton(model_frame, text=get_text('opt_large_v3'), variable=self.model_var, value="large-v3", command=self.check_model_status).pack(side='left', padx=5)

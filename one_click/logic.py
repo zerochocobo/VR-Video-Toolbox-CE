@@ -25,10 +25,11 @@ def check_dependencies():
         # The built-in engine has no CLI dependency; check torch.cuda and model files.
         try:
             from gpu_engine import native_mosaic
-            if not native_mosaic.available():
-                missing.append("内置引擎(torch CUDA / 模型文件)")
-        except Exception:
-            missing.append("内置引擎(torch CUDA / 模型文件)")
+            reason = native_mosaic.unavailable_reason()
+            if reason:
+                missing.append(f"内置引擎: {reason}")
+        except Exception as e:
+            missing.append(f"内置引擎(torch CUDA / 模型文件): {e}")
     else:
         engine_cli = engine_runner.get_engine_executable()
         if engine_cli:
@@ -63,6 +64,57 @@ _CROP_MODE = {
     "crop=iw:ih/2:0:0": "top",
     "crop=iw:ih/2:0:ih/2": "bottom",
 }
+
+
+def _single_eye_split_vbr_bps(source_bitrate_bps: int | None) -> tuple[int | None, int | None]:
+    """Return one-eye split VBR target/max as 0.75x/1.0x source bitrate."""
+    try:
+        source = int(source_bitrate_bps or 0)
+    except (TypeError, ValueError):
+        return None, None
+    if source <= 0:
+        return None, None
+    return max(1, int(source * 0.75)), source
+
+
+def _area_scaled_bitrate_bps(source_bitrate_bps: int | None,
+                             source_w: int | None,
+                             source_h: int | None,
+                             out_w: int | None,
+                             out_h: int | None,
+                             expansion: float = 2.0) -> int | None:
+    """Scale source bitrate by output/source area with a quality expansion factor."""
+    try:
+        source = int(source_bitrate_bps or 0)
+        src_area = int(source_w or 0) * int(source_h or 0)
+        out_area = int(out_w or 0) * int(out_h or 0)
+        factor = float(expansion or 1.0)
+    except (TypeError, ValueError):
+        return None
+    if source <= 0 or src_area <= 0 or out_area <= 0 or factor <= 0:
+        return None
+    return max(1, int(source * (out_area / src_area) * factor))
+
+
+def _bitrate_bps_to_kbps(bitrate_bps: int | None) -> int | None:
+    if not bitrate_bps or bitrate_bps <= 0:
+        return None
+    return max(1, int(bitrate_bps) // 1000)
+
+
+def _nvenc_vbr_or_cq_args(target_kbps: int | None, max_kbps: int | None = None) -> list[str]:
+    if target_kbps and target_kbps > 0:
+        maxrate = max(int(target_kbps), int(max_kbps if max_kbps and max_kbps > 0 else target_kbps * 1.2))
+        bufsize = max(int(target_kbps * 2), int(maxrate * 2))
+        return [
+            "-c:v", "hevc_nvenc",
+            "-preset", "p7",
+            "-rc", "vbr",
+            "-b:v", f"{int(target_kbps)}k",
+            "-maxrate:v", f"{maxrate}k",
+            "-bufsize:v", f"{bufsize}k",
+        ]
+    return ["-c:v", "hevc_nvenc", "-preset", "p7", "-cq", "18"]
 
 
 class _ProcessFileLogger:
@@ -211,12 +263,17 @@ def run_process(cmd, log_callback, process_callback=None):
 
 # --- Core Actions ---
 
-def split_video(input_file, output_file, crop_filter, start_time=None, end_time=None, log_callback=None, process_callback=None, final_bitrate_kbps=None, keep_audio=True):
+def split_video(input_file, output_file, crop_filter, start_time=None, end_time=None, log_callback=None, process_callback=None, final_bitrate_kbps=None, max_bitrate_kbps=None, keep_audio=True):
     """Single-eye crop with optional time range and bitrate. Prefer GPU and fall back to ffmpeg on failure."""
     crop_mode = _CROP_MODE.get(crop_filter)
     try:
         from gpu_engine import probe as gpu_probe, fallback as gpu_fallback, files as gpu_files
         meta, decision = gpu_probe.route(input_file)
+        auto_bitrate_bps, auto_max_bps = _single_eye_split_vbr_bps(meta.bitrate_bps)
+        target_bps = int(final_bitrate_kbps * 1000) if final_bitrate_kbps else auto_bitrate_bps
+        max_bps = int(max_bitrate_kbps * 1000) if max_bitrate_kbps else (auto_max_bps if not final_bitrate_kbps else None)
+        target_kbps = _bitrate_bps_to_kbps(target_bps)
+        max_kbps = _bitrate_bps_to_kbps(max_bps)
 
         def _gpu_fn():
             token = gpu_files.CancelToken()
@@ -225,14 +282,15 @@ def split_video(input_file, output_file, crop_filter, start_time=None, end_time=
             gpu_files.extract_clip(
                 input_file, output_file, crop_mode=crop_mode,
                 start_sec=_time_to_sec(start_time), end_sec=_time_to_sec(end_time),
-                cq=None if final_bitrate_kbps else 18,
-                bitrate_bps=int(final_bitrate_kbps * 1000) if final_bitrate_kbps else None,
+                cq=None if target_bps else 18,
+                bitrate_bps=target_bps,
+                max_bitrate_bps=max_bps,
                 keep_audio=keep_audio, log_callback=log_callback, cancel_token=token,
             )
             return True
 
         def _ffmpeg_fn():
-            return _split_video_ffmpeg(input_file, output_file, crop_filter, start_time, end_time, log_callback, process_callback, final_bitrate_kbps, keep_audio=keep_audio)
+            return _split_video_ffmpeg(input_file, output_file, crop_filter, start_time, end_time, log_callback, process_callback, target_kbps, max_kbps, keep_audio=keep_audio)
 
         if log_callback: log_callback(f"Splitting: {input_file} -> {output_file}")
         return gpu_fallback.run_with_fallback(
@@ -244,7 +302,7 @@ def split_video(input_file, output_file, crop_filter, start_time=None, end_time=
         raise
 
 
-def split_video_fisheye(input_file, output_file, crop_filter, start_time=None, end_time=None, log_callback=None, process_callback=None, final_bitrate_kbps=None, keep_audio=True):
+def split_video_fisheye(input_file, output_file, crop_filter, start_time=None, end_time=None, log_callback=None, process_callback=None, final_bitrate_kbps=None, max_bitrate_kbps=None, keep_audio=True):
     """Single-eye path: crop + hequirect->fisheye in one decode/encode, avoiding one transcode pass.
 
     Prefer GPU through gpu_files.extract_clip(crop+to_fisheye), falling back to
@@ -254,6 +312,11 @@ def split_video_fisheye(input_file, output_file, crop_filter, start_time=None, e
     try:
         from gpu_engine import probe as gpu_probe, fallback as gpu_fallback, files as gpu_files
         meta, decision = gpu_probe.route(input_file)
+        auto_bitrate_bps, auto_max_bps = _single_eye_split_vbr_bps(meta.bitrate_bps)
+        target_bps = int(final_bitrate_kbps * 1000) if final_bitrate_kbps else auto_bitrate_bps
+        max_bps = int(max_bitrate_kbps * 1000) if max_bitrate_kbps else (auto_max_bps if not final_bitrate_kbps else None)
+        target_kbps = _bitrate_bps_to_kbps(target_bps)
+        max_kbps = _bitrate_bps_to_kbps(max_bps)
 
         def _gpu_fn():
             token = gpu_files.CancelToken()
@@ -262,14 +325,15 @@ def split_video_fisheye(input_file, output_file, crop_filter, start_time=None, e
             gpu_files.extract_clip(
                 input_file, output_file, crop_mode=crop_mode, to_fisheye=True,
                 start_sec=_time_to_sec(start_time), end_sec=_time_to_sec(end_time),
-                cq=None if final_bitrate_kbps else 18,
-                bitrate_bps=int(final_bitrate_kbps * 1000) if final_bitrate_kbps else None,
+                cq=None if target_bps else 18,
+                bitrate_bps=target_bps,
+                max_bitrate_bps=max_bps,
                 keep_audio=keep_audio, log_callback=log_callback, cancel_token=token,
             )
             return True
 
         def _ffmpeg_fn():
-            return _split_video_fisheye_ffmpeg(input_file, output_file, crop_filter, start_time, end_time, log_callback, process_callback, final_bitrate_kbps, keep_audio=keep_audio)
+            return _split_video_fisheye_ffmpeg(input_file, output_file, crop_filter, start_time, end_time, log_callback, process_callback, target_kbps, max_kbps, keep_audio=keep_audio)
 
         if log_callback: log_callback(f"Splitting + VR->Fisheye: {input_file} -> {output_file}")
         return gpu_fallback.run_with_fallback(
@@ -281,7 +345,7 @@ def split_video_fisheye(input_file, output_file, crop_filter, start_time=None, e
         raise
 
 
-def _split_video_fisheye_ffmpeg(input_file, output_file, crop_filter, start_time=None, end_time=None, log_callback=None, process_callback=None, final_bitrate_kbps=None, keep_audio=True):
+def _split_video_fisheye_ffmpeg(input_file, output_file, crop_filter, start_time=None, end_time=None, log_callback=None, process_callback=None, final_bitrate_kbps=None, max_bitrate_kbps=None, keep_audio=True):
     """ffmpeg fallback: crop + v360=hequirect:fisheye in one command."""
     info = get_video_info(input_file)
     codec = info['codec'] if info else 'hevc'
@@ -296,17 +360,12 @@ def _split_video_fisheye_ffmpeg(input_file, output_file, crop_filter, start_time
     cmd.extend(["-i", input_file])
     cmd.extend(["-vf", f"{crop_filter},v360=hequirect:fisheye"])
     cmd.extend(["-c:a", "copy"] if keep_audio else ["-an"])
-    if final_bitrate_kbps:
-        cmd.extend(["-c:v", "hevc_nvenc", "-preset", "p7", "-rc", "vbr",
-                    "-b:v", f"{final_bitrate_kbps}k", "-maxrate:v", f"{int(final_bitrate_kbps*1.2)}k",
-                    "-bufsize:v", f"{int(final_bitrate_kbps*2)}k"])
-    else:
-        cmd.extend(["-c:v", "hevc_nvenc", "-preset", "p7", "-cq", "18"])
+    cmd.extend(_nvenc_vbr_or_cq_args(final_bitrate_kbps, max_bitrate_kbps))
     cmd.extend([output_file, "-y"])
     run_process(cmd, log_callback, process_callback)
 
 
-def _split_video_ffmpeg(input_file, output_file, crop_filter, start_time=None, end_time=None, log_callback=None, process_callback=None, final_bitrate_kbps=None, keep_audio=True):
+def _split_video_ffmpeg(input_file, output_file, crop_filter, start_time=None, end_time=None, log_callback=None, process_callback=None, final_bitrate_kbps=None, max_bitrate_kbps=None, keep_audio=True):
     # Detect codec for hardware acceleration
     info = get_video_info(input_file)
     codec = info['codec'] if info else 'hevc'
@@ -324,21 +383,7 @@ def _split_video_ffmpeg(input_file, output_file, crop_filter, start_time=None, e
     cmd.extend(["-vf", crop_filter])
     cmd.extend(["-c:a", "copy"] if keep_audio else ["-an"])
     
-    if final_bitrate_kbps:
-        cmd.extend([
-            "-c:v", "hevc_nvenc", 
-            "-preset", "p7", 
-            "-rc", "vbr",
-            "-b:v", f"{final_bitrate_kbps}k",
-            "-maxrate:v", f"{int(final_bitrate_kbps * 1.2)}k",
-            "-bufsize:v", f"{int(final_bitrate_kbps * 2)}k"
-        ])
-    else:
-        cmd.extend([
-            "-c:v", "hevc_nvenc", 
-            "-preset", "p7", 
-            "-cq", "18"
-        ])
+    cmd.extend(_nvenc_vbr_or_cq_args(final_bitrate_kbps, max_bitrate_kbps))
     cmd.extend([output_file, "-y"])
     
     if log_callback: log_callback(f"Splitting: {input_file} -> {output_file}")
@@ -349,6 +394,9 @@ def split_video_dual(input_file, output_left, output_right, start_time=None, end
     try:
         from gpu_engine import probe as gpu_probe, fallback as gpu_fallback, files as gpu_files
         meta, decision = gpu_probe.route(input_file)
+        target_bps, max_bps = _single_eye_split_vbr_bps(meta.bitrate_bps)
+        target_kbps = _bitrate_bps_to_kbps(target_bps)
+        max_kbps = _bitrate_bps_to_kbps(max_bps)
 
         def _gpu_fn():
             token = gpu_files.CancelToken()
@@ -356,14 +404,16 @@ def split_video_dual(input_file, output_left, output_right, start_time=None, end
                 process_callback(token)
             gpu_files.split_video(
                 input_file, {"left": output_left, "right": output_right},
-                to_fisheye=False, cq=18,
+                to_fisheye=False, cq=None if target_bps else 18,
+                bitrate_bps=target_bps,
+                max_bitrate_bps=max_bps,
                 start_sec=_time_to_sec(start_time), end_sec=_time_to_sec(end_time),
                 keep_audio=keep_audio, log_callback=log_callback, cancel_token=token,
             )
             return True
 
         def _ffmpeg_fn():
-            return _split_video_dual_ffmpeg(input_file, output_left, output_right, start_time, end_time, log_callback, process_callback, keep_audio=keep_audio)
+            return _split_video_dual_ffmpeg(input_file, output_left, output_right, start_time, end_time, log_callback, process_callback, target_kbps, max_kbps, keep_audio=keep_audio)
 
         if log_callback: log_callback(f"Splitting (dual): {input_file} -> {output_left}, {output_right}")
         return gpu_fallback.run_with_fallback(
@@ -375,7 +425,7 @@ def split_video_dual(input_file, output_left, output_right, start_time=None, end
         raise
 
 
-def _split_video_dual_ffmpeg(input_file, output_left, output_right, start_time=None, end_time=None, log_callback=None, process_callback=None, keep_audio=True):
+def _split_video_dual_ffmpeg(input_file, output_left, output_right, start_time=None, end_time=None, log_callback=None, process_callback=None, final_bitrate_kbps=None, max_bitrate_kbps=None, keep_audio=True):
     """Split video into left and right halves in a single ffmpeg call."""
     # Detect codec for hardware acceleration
     info = get_video_info(input_file)
@@ -399,13 +449,13 @@ def _split_video_dual_ffmpeg(input_file, output_left, output_right, start_time=N
     # Left output
     cmd.extend(["-map", "[left]"])
     cmd.extend(["-map", "0:a?", "-c:a", "copy"] if keep_audio else ["-an"])
-    cmd.extend(["-c:v", "hevc_nvenc", "-preset", "p7", "-cq", "18"])
+    cmd.extend(_nvenc_vbr_or_cq_args(final_bitrate_kbps, max_bitrate_kbps))
     cmd.extend([output_left, "-y"])
     
     # Right output
     cmd.extend(["-map", "[right]"])
     cmd.extend(["-map", "0:a?", "-c:a", "copy"] if keep_audio else ["-an"])
-    cmd.extend(["-c:v", "hevc_nvenc", "-preset", "p7", "-cq", "18"])
+    cmd.extend(_nvenc_vbr_or_cq_args(final_bitrate_kbps, max_bitrate_kbps))
     cmd.extend([output_right, "-y"])
     
     if log_callback: log_callback(f"Splitting (dual): {input_file} -> {output_left}, {output_right}")
@@ -416,6 +466,9 @@ def split_video_dual_fisheye(input_file, output_left_fisheye, output_right_fishe
     try:
         from gpu_engine import probe as gpu_probe, fallback as gpu_fallback, files as gpu_files
         meta, decision = gpu_probe.route(input_file)
+        target_bps, max_bps = _single_eye_split_vbr_bps(meta.bitrate_bps)
+        target_kbps = _bitrate_bps_to_kbps(target_bps)
+        max_kbps = _bitrate_bps_to_kbps(max_bps)
 
         def _gpu_fn():
             token = gpu_files.CancelToken()
@@ -423,14 +476,16 @@ def split_video_dual_fisheye(input_file, output_left_fisheye, output_right_fishe
                 process_callback(token)
             gpu_files.split_video(
                 input_file, {"left": output_left_fisheye, "right": output_right_fisheye},
-                to_fisheye=True, cq=18,
+                to_fisheye=True, cq=None if target_bps else 18,
+                bitrate_bps=target_bps,
+                max_bitrate_bps=max_bps,
                 start_sec=_time_to_sec(start_time), end_sec=_time_to_sec(end_time),
                 keep_audio=keep_audio, log_callback=log_callback, cancel_token=token,
             )
             return True
 
         def _ffmpeg_fn():
-            return _split_video_dual_fisheye_ffmpeg(input_file, output_left_fisheye, output_right_fisheye, start_time, end_time, log_callback, process_callback, keep_audio=keep_audio)
+            return _split_video_dual_fisheye_ffmpeg(input_file, output_left_fisheye, output_right_fisheye, start_time, end_time, log_callback, process_callback, target_kbps, max_kbps, keep_audio=keep_audio)
 
         if log_callback: log_callback(f"Splitting + VR->Fisheye: {input_file} -> {output_left_fisheye}, {output_right_fisheye}")
         return gpu_fallback.run_with_fallback(
@@ -442,7 +497,7 @@ def split_video_dual_fisheye(input_file, output_left_fisheye, output_right_fishe
         raise
 
 
-def _split_video_dual_fisheye_ffmpeg(input_file, output_left_fisheye, output_right_fisheye, start_time=None, end_time=None, log_callback=None, process_callback=None, keep_audio=True):
+def _split_video_dual_fisheye_ffmpeg(input_file, output_left_fisheye, output_right_fisheye, start_time=None, end_time=None, log_callback=None, process_callback=None, final_bitrate_kbps=None, max_bitrate_kbps=None, keep_audio=True):
     """Split video into left and right halves and convert to fisheye in a single ffmpeg call."""
     # Detect codec for hardware acceleration
     info = get_video_info(input_file)
@@ -466,13 +521,13 @@ def _split_video_dual_fisheye_ffmpeg(input_file, output_left_fisheye, output_rig
     # Left output
     cmd.extend(["-map", "[left]"])
     cmd.extend(["-map", "0:a?", "-c:a", "copy"] if keep_audio else ["-an"])
-    cmd.extend(["-c:v", "hevc_nvenc", "-preset", "p7", "-cq", "18"])
+    cmd.extend(_nvenc_vbr_or_cq_args(final_bitrate_kbps, max_bitrate_kbps))
     cmd.extend([output_left_fisheye, "-y"])
     
     # Right output
     cmd.extend(["-map", "[right]"])
     cmd.extend(["-map", "0:a?", "-c:a", "copy"] if keep_audio else ["-an"])
-    cmd.extend(["-c:v", "hevc_nvenc", "-preset", "p7", "-cq", "18"])
+    cmd.extend(_nvenc_vbr_or_cq_args(final_bitrate_kbps, max_bitrate_kbps))
     cmd.extend([output_right_fisheye, "-y"])
     
     if log_callback: log_callback(f"Splitting + VR->Fisheye: {input_file} -> {output_left_fisheye}, {output_right_fisheye}")
@@ -858,6 +913,7 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
     paste_segments = []
     meta = gpu_probe.probe_video(base_clip)
     eye_w = int(meta.width // 2)
+    rect_source_bitrate = int(original_bitrate or meta.bitrate_bps or 0)
     bitrate_bps = int(original_bitrate) if (keep_original_bitrate and original_bitrate) else None
 
     def _extract_restore(side: str, segments, x_offset: int):
@@ -866,10 +922,21 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
             fish = "_fisheye" if use_fisheye else ""
             seg_in = os.path.join(base_dir, f"{stem}_{side_name}{fish}.seg{seg.seg_id:03d}.mp4")
             seg_out = os.path.join(base_dir, f"{stem}_{side_name}{fish}.seg{seg.seg_id:03d}.restored.mp4")
+            rect_bitrate_bps = _area_scaled_bitrate_bps(
+                rect_source_bitrate,
+                meta.width,
+                meta.height,
+                seg.w,
+                seg.h,
+                2.0,
+            )
+            rect_bitrate_kbps = _bitrate_bps_to_kbps(rect_bitrate_bps)
+            rect_bitrate_label = f"{rect_bitrate_kbps}kbps" if rect_bitrate_kbps else "auto"
             if log_callback:
                 log_callback(
                     f"[source-scan] fine {side_name} segment {seg.seg_id}: "
-                    f"{seg.start_s:.3f}-{seg.end_s:.3f}s rect={seg.x},{seg.y},{seg.w}x{seg.h}"
+                    f"{seg.start_s:.3f}-{seg.end_s:.3f}s rect={seg.x},{seg.y},{seg.w}x{seg.h} "
+                    f"bitrate={rect_bitrate_label}"
                 )
             if not os.path.exists(seg_in):
                 token = gpu_files.CancelToken()
@@ -883,6 +950,8 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
                     to_fisheye=use_fisheye,
                     start_sec=seg.start_s,
                     end_sec=seg.end_s,
+                    cq=None if rect_bitrate_bps else 18,
+                    bitrate_bps=rect_bitrate_bps,
                     keep_audio=False,
                     log_callback=log_callback,
                     cancel_token=token,
@@ -1062,7 +1131,6 @@ def _process_single_eye_clip_to_output(input_file, output_file, *, eye_mode: int
         split_video(
             input_file, file_cut, crop_filter,
             start_time, end_time, log_callback, process_callback,
-            final_bitrate_kbps=final_bitrate_kbps,
             keep_audio=split_keep_audio,
         )
         _process_pre_extract_or_lada(file_cut, output_file, pre_extract_enabled, keep_intermediate, log_callback, process_callback)
@@ -1710,6 +1778,9 @@ def run_single_file_pipeline(input_file, start_time, end_time, use_fisheye, keep
         final_bitrate_kbps = None
         if keep_original_bitrate and original_bitrate:
             final_bitrate_kbps = int((original_bitrate / 2) / 1000)
+        split_bitrate_bps, split_max_bps = _single_eye_split_vbr_bps(original_bitrate)
+        split_bitrate_kbps = _bitrate_bps_to_kbps(split_bitrate_bps)
+        split_max_kbps = _bitrate_bps_to_kbps(split_max_bps)
         pre_extract_enabled = _pre_extract_supported(pre_extract, log_callback)
         source_scan_enabled = _source_scan_supported(source_scan, log_callback)
 
@@ -1879,7 +1950,12 @@ def run_single_eye_pipeline(input_file, eye_mode, start_time, end_time, use_fish
             # Step 1: crop + VR->Fisheye in one pass, avoiding one extra transcode.
             if log_callback: log_callback(f"--- Step 1/3: Splitting + VR->Fisheye ({side_suffix}) ---")
             if not os.path.exists(file_cut_fish):
-                split_video_fisheye(input_file, file_cut_fish, crop_filter, start_time, end_time, log_callback, process_callback)
+                split_video_fisheye(
+                    input_file, file_cut_fish, crop_filter, start_time, end_time,
+                    log_callback, process_callback,
+                    final_bitrate_kbps=split_bitrate_kbps,
+                    max_bitrate_kbps=split_max_kbps,
+                )
             else:
                 if log_callback: log_callback(f"Intermediate file exists: {file_cut_fish}. Skipping.")
             # Step 2: Process (lada/jasna)
@@ -1893,7 +1969,12 @@ def run_single_eye_pipeline(input_file, eye_mode, start_time, end_time, use_fish
             # Step 1: Split
             if log_callback: log_callback(f"--- Step 1/2: Splitting ({side_suffix}) ---")
             if not os.path.exists(file_cut):
-                split_video(input_file, file_cut, crop_filter, start_time, end_time, log_callback, process_callback, final_bitrate_kbps=final_bitrate_kbps)
+                split_video(
+                    input_file, file_cut, crop_filter, start_time, end_time,
+                    log_callback, process_callback,
+                    final_bitrate_kbps=split_bitrate_kbps,
+                    max_bitrate_kbps=split_max_kbps,
+                )
             else:
                 if log_callback: log_callback(f"Intermediate file exists: {file_cut}. Skipping split.")
             # Step 2: Process (lada/jasna)
@@ -2107,6 +2188,9 @@ def run_batch_eye_pipeline(directory, eye_mode, use_fisheye, keep_original_bitra
             final_bitrate_kbps = None
             if keep_original_bitrate and original_bitrate:
                 final_bitrate_kbps = int((original_bitrate / 2) / 1000)
+            split_bitrate_bps, split_max_bps = _single_eye_split_vbr_bps(original_bitrate)
+            split_bitrate_kbps = _bitrate_bps_to_kbps(split_bitrate_bps)
+            split_max_kbps = _bitrate_bps_to_kbps(split_max_bps)
 
             if source_scan_enabled:
                 result = _run_source_scan_branch(
@@ -2140,14 +2224,24 @@ def run_batch_eye_pipeline(directory, eye_mode, use_fisheye, keep_original_bitra
             if use_fisheye:
                 # Crop + VR->Fisheye in one pass.
                 if not os.path.exists(file_cut_fish):
-                    split_video_fisheye(input_file, file_cut_fish, crop_filter, None, None, log_callback, process_callback)
+                    split_video_fisheye(
+                        input_file, file_cut_fish, crop_filter, None, None,
+                        log_callback, process_callback,
+                        final_bitrate_kbps=split_bitrate_kbps,
+                        max_bitrate_kbps=split_max_kbps,
+                    )
                 _process_pre_extract_or_lada(file_cut_fish, file_cut_fish_restored, pre_extract_enabled, False, log_callback, process_callback)
                 convert_projection(file_cut_fish_restored, file_final, "fisheye:hequirect", final_bitrate_kbps=final_bitrate_kbps, log_callback=log_callback, process_callback=process_callback)
                 if os.path.exists(file_cut_fish): os.remove(file_cut_fish)
                 if os.path.exists(file_cut_fish_restored): os.remove(file_cut_fish_restored)
             else:
                 if not os.path.exists(file_cut):
-                    split_video(input_file, file_cut, crop_filter, None, None, log_callback, process_callback, final_bitrate_kbps=final_bitrate_kbps)
+                    split_video(
+                        input_file, file_cut, crop_filter, None, None,
+                        log_callback, process_callback,
+                        final_bitrate_kbps=split_bitrate_kbps,
+                        max_bitrate_kbps=split_max_kbps,
+                    )
                 _process_pre_extract_or_lada(file_cut, file_final, pre_extract_enabled, False, log_callback, process_callback)
                 if os.path.exists(file_cut): os.remove(file_cut)
             cleanup_success_artifacts = True
