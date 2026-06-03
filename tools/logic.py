@@ -113,6 +113,332 @@ def get_video_resolution(file_path):
         print(f"Error getting resolution: {e}")
         return None, None
 
+def get_video_stream_info(file_path):
+    """Return basic metadata for the first video stream."""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=codec_name,profile,pix_fmt,width,height,bit_rate",
+            "-of", "json",
+            file_path,
+        ]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            check=True,
+            startupinfo=get_startupinfo(),
+        )
+        data = json.loads(result.stdout or "{}")
+        streams = data.get("streams", [])
+        if not streams:
+            return {}
+        stream = streams[0]
+        info = {
+            "codec_name": stream.get("codec_name") or "unknown",
+            "profile": stream.get("profile") or "",
+            "pix_fmt": stream.get("pix_fmt") or "",
+            "width": None,
+            "height": None,
+            "bit_rate": None,
+        }
+        for key in ("width", "height", "bit_rate"):
+            try:
+                if stream.get(key) is not None:
+                    info[key] = int(stream.get(key))
+            except (TypeError, ValueError):
+                info[key] = None
+        return info
+    except Exception as e:
+        print(f"Error getting video stream info: {e}")
+        return {}
+
+def find_mp4_files(base_dir, search_subdirs=True):
+    """Collect MP4 files from a directory in a stable order."""
+    files = []
+    if search_subdirs:
+        for root, _, filenames in os.walk(base_dir):
+            for filename in filenames:
+                if filename.lower().endswith(".mp4"):
+                    files.append(os.path.join(root, filename))
+    else:
+        for filename in os.listdir(base_dir):
+            path = os.path.join(base_dir, filename)
+            if filename.lower().endswith(".mp4") and os.path.isfile(path):
+                files.append(path)
+    return sorted(files, key=lambda path: path.lower())
+
+def build_transcode_output_path(input_file, convert_to_hevc8=True, downscale_8k=False):
+    """Build the output MP4 path using the suffix rules from the transcode tab."""
+    directory = os.path.dirname(input_file)
+    stem = os.path.splitext(os.path.basename(input_file))[0]
+
+    if downscale_8k:
+        new_stem, count = re.subn(r"_8k", "_4k", stem, count=1, flags=re.IGNORECASE)
+        stem = new_stem if count else f"{stem}_4k"
+
+    if convert_to_hevc8:
+        stem = f"{stem}_hevc8"
+
+    return os.path.join(directory, f"{stem}.mp4")
+
+def build_transcode_temp_output_path(output_file):
+    directory = os.path.dirname(output_file)
+    stem, ext = os.path.splitext(os.path.basename(output_file))
+    return os.path.join(directory, f"{stem}.transcoding.tmp{ext or '.mp4'}")
+
+def is_hevc_main10_stream(stream_info):
+    codec = (stream_info.get("codec_name") or "").lower()
+    profile = (stream_info.get("profile") or "").lower()
+    pix_fmt = (stream_info.get("pix_fmt") or "").lower()
+    return codec == "hevc" and ("main 10" in profile or "10" in pix_fmt)
+
+def is_8k_stream(stream_info):
+    width = stream_info.get("width")
+    height = stream_info.get("height")
+    if not width or not height:
+        return False
+    return max(width, height) >= 7680
+
+def resolve_transcode_targets(stream_info, convert_to_hevc8=True, downscale_8k=False):
+    """Return the per-file operations that actually apply to this source."""
+    actual_convert = bool(convert_to_hevc8 and is_hevc_main10_stream(stream_info))
+    actual_downscale = bool(downscale_8k and is_8k_stream(stream_info))
+    return actual_convert, actual_downscale
+
+def transcode_output_resolution(stream_info, downscale_8k=False):
+    width = stream_info.get("width")
+    height = stream_info.get("height")
+    if not width or not height:
+        return None, None
+    if downscale_8k:
+        return max(2, (width // 4) * 2), max(2, (height // 4) * 2)
+    return width, height
+
+def build_transcode_ffmpeg_command(
+    input_file,
+    output_file,
+    convert_to_hevc8=True,
+    downscale_8k=False,
+    keep_bitrate=True,
+    preset="p7",
+    stream_info=None,
+    log_callback=None,
+):
+    """Build an ffmpeg command for the batch transcode tool."""
+    stream_info = stream_info or {}
+    codec = (stream_info.get("codec_name") or "").lower()
+    profile = stream_info.get("profile") or ""
+    pix_fmt = stream_info.get("pix_fmt") or ""
+    preset = preset if preset in {"p4", "p5", "p6", "p7"} else "p7"
+
+    if convert_to_hevc8:
+        encoder = "hevc_nvenc"
+        profile_args = ["-profile:v", "main"]
+        output_pix_fmt = "yuv420p"
+    elif codec == "hevc":
+        encoder = "hevc_nvenc"
+        if "10" in profile or "10" in pix_fmt:
+            profile_args = ["-profile:v", "main10"]
+            output_pix_fmt = "p010le"
+        else:
+            profile_args = []
+            output_pix_fmt = "yuv420p"
+    else:
+        encoder = "h264_nvenc"
+        profile_args = ["-profile:v", "high"]
+        output_pix_fmt = "yuv420p"
+
+    filters = []
+    if convert_to_hevc8 or downscale_8k:
+        scale_parts = []
+        if downscale_8k:
+            scale_parts.extend([
+                "w=trunc(iw/4)*2",
+                "h=trunc(ih/4)*2",
+                "interp_algo=lanczos",
+            ])
+        if output_pix_fmt:
+            scale_parts.append(f"format={output_pix_fmt}")
+        filters.append("scale_cuda=" + ":".join(scale_parts))
+
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-stats",
+        "-hwaccel", "cuda",
+        "-hwaccel_output_format", "cuda",
+        "-i", input_file,
+        "-map", "0:v:0",
+        "-map", "0:a?",
+        "-map", "0:s?",
+        "-map_metadata", "0",
+    ]
+
+    if filters:
+        cmd.extend(["-vf", ",".join(filters)])
+
+    cmd.extend([
+        "-c:v", encoder,
+        "-gpu", "0",
+        "-preset", preset,
+    ])
+
+    cmd.extend(profile_args)
+
+    if keep_bitrate:
+        original_bitrate = get_video_bitrate(input_file, None)
+        if original_bitrate:
+            original_kbps = max(1, int(round(original_bitrate / 1000)))
+            target_kbps = max(1, int(round(original_kbps * 0.5))) if downscale_8k else original_kbps
+            cmd.extend([
+                "-rc", "vbr",
+                "-b:v", f"{target_kbps}k",
+                "-maxrate:v", f"{target_kbps}k",
+                "-bufsize:v", f"{target_kbps * 2}k",
+            ])
+            if log_callback:
+                if downscale_8k:
+                    log_callback(f"Using half original video bitrate for 8K->4K: {target_kbps}k (original {original_kbps}k)")
+                else:
+                    log_callback(f"Using original video bitrate: {target_kbps}k")
+        else:
+            cmd.extend(["-cq", "18"])
+            if log_callback:
+                log_callback("Original bitrate not found. Falling back to CQ 18.")
+    else:
+        cmd.extend(["-cq", "18"])
+
+    cmd.extend([
+        "-c:a", "copy",
+        "-c:s", "copy",
+        "-movflags", "+faststart",
+        "-y", output_file,
+    ])
+    return cmd
+
+def batch_transcode_videos(
+    base_dir,
+    search_subdirs=True,
+    convert_to_hevc8=True,
+    downscale_8k=False,
+    keep_bitrate=True,
+    preset="p7",
+    log_callback=print,
+    process_callback=None,
+    should_stop=None,
+):
+    """Batch transcode MP4 files from a directory."""
+    if not check_ffmpeg():
+        log_callback("[!] Error: ffmpeg or ffprobe not found. Please refer to '说明.txt' or 'readme.txt' for installation steps.")
+        return False
+
+    if not os.path.isdir(base_dir):
+        log_callback(f"Error: Directory not found: {base_dir}")
+        return False
+
+    if not convert_to_hevc8 and not downscale_8k:
+        log_callback("Error: No transcode option selected.")
+        return False
+
+    files = find_mp4_files(base_dir, search_subdirs)
+    if not files:
+        log_callback("No MP4 files found.")
+        return True
+
+    log_callback(f"Found {len(files)} MP4 file(s).")
+    success_count = 0
+    skip_count = 0
+    fail_count = 0
+
+    for index, input_file in enumerate(files, start=1):
+        if should_stop and should_stop():
+            log_callback("Transcode stopped.")
+            return False
+
+        rel_input = os.path.relpath(input_file, base_dir)
+        stream_info = get_video_stream_info(input_file)
+        if stream_info:
+            width = stream_info.get("width") or "?"
+            height = stream_info.get("height") or "?"
+            codec = stream_info.get("codec_name") or "unknown"
+            profile = stream_info.get("profile") or ""
+            pix_fmt = stream_info.get("pix_fmt") or ""
+        else:
+            width = height = "?"
+            codec = "unknown"
+            profile = ""
+            pix_fmt = ""
+
+        actual_convert, actual_downscale = resolve_transcode_targets(
+            stream_info,
+            convert_to_hevc8,
+            downscale_8k,
+        )
+
+        if not actual_convert and not actual_downscale:
+            reasons = []
+            if convert_to_hevc8:
+                reasons.append("source is not HEVC Main 10")
+            if downscale_8k:
+                reasons.append("source is not 8K")
+            reason_text = "; ".join(reasons) if reasons else "no applicable operation"
+            log_callback(f"[{index}/{len(files)}] Skipped ({reason_text}): {rel_input}")
+            skip_count += 1
+            continue
+
+        output_file = build_transcode_output_path(input_file, actual_convert, actual_downscale)
+
+        if os.path.abspath(input_file) == os.path.abspath(output_file):
+            log_callback(f"[{index}/{len(files)}] Skipped (output path equals input): {rel_input}")
+            skip_count += 1
+            continue
+
+        if os.path.exists(output_file):
+            log_callback(f"[{index}/{len(files)}] Skipped (target exists): {os.path.basename(output_file)}")
+            skip_count += 1
+            continue
+
+        temp_output_file = build_transcode_temp_output_path(output_file)
+
+        log_callback(f"--- [{index}/{len(files)}] Processing: {rel_input} ---")
+        log_callback(f"Source: {codec} {profile} {pix_fmt}, {width}x{height}")
+        log_callback(f"Temporary output: {os.path.basename(temp_output_file)}")
+
+        cmd = build_transcode_ffmpeg_command(
+            input_file,
+            temp_output_file,
+            actual_convert,
+            actual_downscale,
+            keep_bitrate,
+            preset,
+            stream_info,
+            log_callback,
+        )
+
+        try:
+            run_process(cmd, log_callback, process_callback)
+            if os.path.exists(output_file):
+                try:
+                    os.remove(temp_output_file)
+                except Exception:
+                    pass
+                log_callback(f"Skipped final rename because target now exists: {os.path.basename(output_file)}")
+                skip_count += 1
+                continue
+            os.rename(temp_output_file, output_file)
+            success_count += 1
+            log_callback(f"Success: {os.path.basename(output_file)}")
+        except Exception as e:
+            if should_stop and should_stop():
+                log_callback("Transcode stopped.")
+                return False
+            fail_count += 1
+            log_callback(f"Error processing {os.path.basename(input_file)}: {e}")
+
+    log_callback(f"Batch Transcode Completed. Success: {success_count}, Skipped: {skip_count}, Failed: {fail_count}.")
+    return fail_count == 0
+
 def get_video_keyframes(file_path):
     """Get list of keyframe timestamps (seconds) using ffprobe."""
     try:

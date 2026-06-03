@@ -42,7 +42,7 @@ class VRVideoToolsApp:
              self.log_to_all(get_text('warn_path'))
 
     def log_to_all(self, message):
-        for log_widget in [self.ss_log, self.patch_log, self.zoom_log, self.merge_log, self.cut_log, self.kf_log]:
+        for log_widget in [self.ss_log, self.patch_log, self.zoom_log, self.merge_log, self.cut_log, self.kf_log, self.transcode_log]:
             self.log(log_widget, message)
 
     def validate_time_input(self, P):
@@ -135,6 +135,11 @@ class VRVideoToolsApp:
         self.tab_cut = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(self.tab_cut, text=get_text('tab_cut'))
         self.setup_cut_tab()
+
+        # Tab 6: Batch Transcode
+        self.tab_transcode = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(self.tab_transcode, text=get_text('tab_transcode'))
+        self.setup_transcode_tab()
 
         # Attach hover tooltips to all notebook tabs
         self._setup_tab_tooltips()
@@ -804,6 +809,88 @@ class VRVideoToolsApp:
         self.cut_log = tk.Text(log_frame, height=15, state='disabled')
         self.cut_log.pack(fill='both', expand=True)
 
+    # --- Batch Transcode Tab ---
+    def setup_transcode_tab(self):
+        frame = self.tab_transcode
+        frame.grid_columnconfigure(1, weight=1)
+
+        ttk.Label(frame, text=get_text('lbl_video_dir')).grid(row=0, column=0, padx=5, pady=5, sticky='w')
+        self.transcode_dir_path = tk.StringVar()
+
+        dir_frame = ttk.Frame(frame)
+        dir_frame.grid(row=0, column=1, padx=5, pady=5, sticky='ew')
+        ttk.Entry(dir_frame, textvariable=self.transcode_dir_path).pack(side='left', fill='x', expand=True, padx=(0, 5))
+        ttk.Button(dir_frame, text=get_text('btn_browse'), command=self.browse_transcode_dir).pack(side='right')
+
+        options_frame = ttk.LabelFrame(frame, text=get_text('grp_transcode_options'), padding=10)
+        options_frame.grid(row=1, column=0, columnspan=2, padx=5, pady=5, sticky='ew')
+        options_frame.grid_columnconfigure(0, weight=1)
+
+        self.transcode_search_subdirs = tk.BooleanVar(value=True)
+        self.transcode_to_hevc8 = tk.BooleanVar(value=True)
+        self.transcode_downscale_8k = tk.BooleanVar(value=False)
+        self.transcode_keep_bitrate = tk.BooleanVar(value=True)
+
+        preset_frame = ttk.Frame(options_frame)
+        preset_frame.grid(row=0, column=0, padx=5, pady=4, sticky='w')
+        ttk.Label(preset_frame, text=get_text('lbl_quality_speed')).pack(side='left', padx=(0, 8))
+
+        self.transcode_preset_choices = [
+            (get_text('opt_preset_p7'), 'p7'),
+            (get_text('opt_preset_p6'), 'p6'),
+            (get_text('opt_preset_p5'), 'p5'),
+            (get_text('opt_preset_p4'), 'p4'),
+        ]
+        self.transcode_preset_var = tk.StringVar(value=self.transcode_preset_choices[0][0])
+        self.transcode_preset_combo = ttk.Combobox(
+            preset_frame,
+            textvariable=self.transcode_preset_var,
+            values=[label for label, _ in self.transcode_preset_choices],
+            state='readonly',
+            width=28,
+        )
+        self.transcode_preset_combo.pack(side='left')
+
+        ttk.Checkbutton(
+            options_frame,
+            text=get_text('chk_search_subdirs_mp4'),
+            variable=self.transcode_search_subdirs,
+        ).grid(row=1, column=0, padx=5, pady=4, sticky='w')
+        ttk.Checkbutton(
+            options_frame,
+            text=get_text('chk_transcode_hevc8'),
+            variable=self.transcode_to_hevc8,
+        ).grid(row=2, column=0, padx=5, pady=4, sticky='w')
+        ttk.Checkbutton(
+            options_frame,
+            text=get_text('chk_downscale_8k'),
+            variable=self.transcode_downscale_8k,
+        ).grid(row=3, column=0, padx=5, pady=4, sticky='w')
+        ttk.Checkbutton(
+            options_frame,
+            text=get_text('chk_transcode_keep_bitrate'),
+            variable=self.transcode_keep_bitrate,
+        ).grid(row=4, column=0, padx=5, pady=4, sticky='w')
+
+        btn_frame = ttk.Frame(frame, padding=10)
+        btn_frame.grid(row=2, column=0, columnspan=2, padx=5, pady=5, sticky='ew')
+
+        self.btn_transcode = ttk.Button(btn_frame, text=get_text('btn_start_transcode'), command=self.run_transcode)
+        self.btn_transcode.pack(side='left', fill='x', expand=True, padx=(0, 5))
+
+        self.btn_stop_transcode = ttk.Button(btn_frame, text=get_text('btn_stop'), command=self.stop_transcode, state='disabled')
+        self.btn_stop_transcode.pack(side='left', fill='x', expand=True, padx=(5, 0))
+
+        self.proc_transcode = None
+        self.stop_transcode_requested = False
+
+        log_frame = ttk.LabelFrame(frame, text=get_text('lbl_log'), padding=10)
+        log_frame.grid(row=3, column=0, columnspan=2, padx=5, pady=5, sticky='nsew')
+
+        frame.grid_rowconfigure(3, weight=1)
+        self.transcode_log = tk.Text(log_frame, height=14, state='disabled')
+        self.transcode_log.pack(fill='both', expand=True)
+
     def setup_keyframe_tab(self):
         frame = self.tab_keyframe
         
@@ -1047,3 +1134,72 @@ class VRVideoToolsApp:
             except Exception: pass
             self.proc_cut = None
             self.log(self.cut_log, get_text('msg_stop'))
+
+    def browse_transcode_dir(self):
+        path = filedialog.askdirectory()
+        if path:
+            self.transcode_dir_path.set(path)
+
+    def selected_transcode_preset(self):
+        selected = self.transcode_preset_var.get()
+        for label, preset in self.transcode_preset_choices:
+            if label == selected:
+                return preset
+        return 'p7'
+
+    def run_transcode(self):
+        base_dir = self.transcode_dir_path.get()
+        if not base_dir or not os.path.isdir(base_dir):
+            messagebox.showerror("Error", get_text('err_dir'))
+            return
+
+        if not self.transcode_to_hevc8.get() and not self.transcode_downscale_8k.get():
+            messagebox.showerror("Error", get_text('err_transcode_option'))
+            return
+
+        def _on_proc(p):
+            self.proc_transcode = p
+            if self.stop_transcode_requested:
+                try: p.kill()
+                except Exception: pass
+
+        def task():
+            start_time = time.time()
+            self.log(self.transcode_log, get_text('msg_start_transcode'))
+            try:
+                logic.batch_transcode_videos(
+                    base_dir,
+                    self.transcode_search_subdirs.get(),
+                    self.transcode_to_hevc8.get(),
+                    self.transcode_downscale_8k.get(),
+                    self.transcode_keep_bitrate.get(),
+                    self.selected_transcode_preset(),
+                    lambda msg: self.log(self.transcode_log, msg),
+                    _on_proc,
+                    lambda: self.stop_transcode_requested,
+                )
+            except Exception as e:
+                self.log(self.transcode_log, f"Error: {e}")
+            finally:
+                elapsed = time.time() - start_time
+                h = int(elapsed // 3600)
+                m = int((elapsed % 3600) // 60)
+                s = int(elapsed % 60)
+                self.log(self.transcode_log, f"[System] Process completed. Total time elapsed: {h} hours, {m} minutes, {s} seconds.")
+                self.root.after(0, lambda: self.btn_transcode.config(state='normal'))
+                self.root.after(0, lambda: self.btn_stop_transcode.config(state='disabled'))
+                self.proc_transcode = None
+
+        self.btn_transcode.config(state='disabled')
+        self.btn_stop_transcode.config(state='normal')
+        self.stop_transcode_requested = False
+        threading.Thread(target=task, daemon=True).start()
+
+    def stop_transcode(self):
+        self.stop_transcode_requested = True
+        proc = self.proc_transcode
+        if proc:
+            try: proc.kill()
+            except Exception: pass
+            self.proc_transcode = None
+        self.log(self.transcode_log, get_text('msg_stop'))
