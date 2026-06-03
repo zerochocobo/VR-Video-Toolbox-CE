@@ -43,6 +43,11 @@ HF_REPO_IDS = {
     "whisperSeg": "TransWithAI/Whisper-Vad-EncDec-ASMR-onnx",
 }
 
+KOTOBA_DECODER_LAYERS = 2
+KOTOBA_DECODER_ATTENTION_HEADS = 20
+KOTOBA_ALIGNMENT_HEADS = [[1, head] for head in range(KOTOBA_DECODER_ATTENTION_HEADS)]
+KOTOBA_CONFIG_BACKUP_SUFFIX = ".kotoba_alignment_heads.bak"
+
 # Options adapted from original script
 KOTOBA_BALANCED_OPTIONS = {
     "vad_parameters": {
@@ -60,7 +65,7 @@ KOTOBA_BALANCED_OPTIONS = {
     "log_prob_threshold": -1.5,
     "no_speech_threshold": 0.34,
     "condition_on_previous_text": False,
-    "word_timestamps": False,
+    "word_timestamps": True,
     "suppress_tokens": None,
     "suppress_blank": True,
     "without_timestamps": False,
@@ -84,7 +89,7 @@ KOTOBA_SCENE_OPTIONS = {
     "log_prob_threshold": None,
     "no_speech_threshold": None,
     "condition_on_previous_text": False,
-    "word_timestamps": False,
+    "word_timestamps": True,
     "suppress_tokens": None,
     "suppress_blank": True,
     "without_timestamps": False,
@@ -95,7 +100,7 @@ KOTOBA_SCENE_OPTIONS = {
 MODEL_SCENE_OVERRIDES = {
     "kotoba": {
         "condition_on_previous_text": False,
-        "word_timestamps": False, #it will crash if set it to True
+        "word_timestamps": True,
     },
     "large-v3": {
         "compression_ratio_threshold": 2.4,
@@ -310,6 +315,61 @@ def check_model_files(model_key: str, models_root: str) -> bool:
     
     return has_config and has_model
 
+def _read_json_utf8_sig(path: Path) -> dict:
+    with path.open("r", encoding="utf-8-sig") as file:
+        return json.load(file)
+
+def _write_json_utf8(path: Path, data: dict) -> None:
+    with path.open("w", encoding="utf-8") as file:
+        json.dump(data, file, ensure_ascii=False, indent=2)
+        file.write("\n")
+
+def _is_valid_alignment_head(value) -> bool:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return False
+    layer, head = value
+    if not isinstance(layer, int) or isinstance(layer, bool):
+        return False
+    if not isinstance(head, int) or isinstance(head, bool):
+        return False
+    return (
+        0 <= layer < KOTOBA_DECODER_LAYERS
+        and 0 <= head < KOTOBA_DECODER_ATTENTION_HEADS
+    )
+
+def kotoba_alignment_heads_need_repair(config: dict) -> bool:
+    heads = config.get("alignment_heads")
+    if not isinstance(heads, list) or not heads:
+        return True
+    return any(not _is_valid_alignment_head(head) for head in heads)
+
+def repair_kotoba_alignment_heads(model_key: str, model_dir: str, log_callback=None) -> bool:
+    """Patch Kotoba's CT2 alignment heads so word_timestamps cannot crash CT2."""
+    if model_key != "kotoba":
+        return False
+
+    config_path = Path(model_dir) / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"Kotoba model config not found: {config_path}")
+
+    config = _read_json_utf8_sig(config_path)
+    if not kotoba_alignment_heads_need_repair(config):
+        return False
+
+    backup_path = config_path.with_name(config_path.name + KOTOBA_CONFIG_BACKUP_SUFFIX)
+    if not backup_path.exists():
+        shutil.copy2(config_path, backup_path)
+
+    config["alignment_heads"] = [head[:] for head in KOTOBA_ALIGNMENT_HEADS]
+    _write_json_utf8(config_path, config)
+
+    if log_callback:
+        log_callback(
+            "Patched kotoba alignment_heads for word_timestamps "
+            f"(backup: {backup_path.name})"
+        )
+    return True
+
 def download_model(model_key: str, models_root: str, log_callback) -> bool:
     """Download model from HuggingFace hub."""
     repo_id = HF_REPO_IDS.get(model_key)
@@ -375,6 +435,7 @@ def download_model(model_key: str, models_root: str, log_callback) -> bool:
             log_callback(f"[{idx}/{len(files_to_download)}] Finished: {file}")
         
         log_callback("All files downloaded successfully.")
+        repair_kotoba_alignment_heads(model_key, model_dir, log_callback)
         return True
     except ImportError:
         log_callback("Error: huggingface_hub package is not installed.")
@@ -571,6 +632,8 @@ class SubtitleGenerator:
             raise FileNotFoundError(
                 f"CTranslate2 model directory not found: {model_path}"
             )
+
+        repair_kotoba_alignment_heads(model_preset, model_path, log_callback)
 
         cpu_count = os.cpu_count() or 4
         num_workers = min(4, max(1, cpu_count // 2))
