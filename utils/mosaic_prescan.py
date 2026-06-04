@@ -15,6 +15,7 @@ from gpu_engine import probe
 
 
 _DETECTOR = None
+_DETECTOR_CONFIG = None
 _DETECTOR_LOCK = threading.Lock()
 
 
@@ -495,7 +496,17 @@ def _extract_boxes_with_debug(result, min_conf: float | None = None) -> tuple[li
     return out, debug
 
 
-def _build_detector(log_callback=None):
+def _resolve_detector_imgsz(frame_w: int | None = None, frame_h: int | None = None) -> int:
+    configured = int(_cfg("pre_extract_yolo_imgsz", 2048) or 0)
+    if configured > 0:
+        return configured
+    if frame_w and frame_h:
+        value = max(int(frame_w), int(frame_h))
+        return max(32, value + (-value % 32))
+    return 2048
+
+
+def _build_detector(log_callback=None, *, imgsz: int | None = None):
     model_path = _model_path()
     if not os.path.isfile(model_path):
         raise FileNotFoundError(f"pre-extract detection model not found: {model_path}")
@@ -508,8 +519,8 @@ def _build_detector(log_callback=None):
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     fp16 = bool(device == "cuda")
-    imgsz = int(_cfg("pre_extract_yolo_imgsz", 2048) or 2048)
-    conf = float(_cfg("pre_extract_yolo_conf", 0.50) or 0.50)
+    imgsz = int(imgsz or _resolve_detector_imgsz())
+    conf = float(_cfg("pre_extract_yolo_conf", 0.20) or 0.20)
     if log_callback:
         log_callback(
             f"[pre-extract] loading detector {os.path.basename(model_path)} "
@@ -518,21 +529,26 @@ def _build_detector(log_callback=None):
     return Yolo11SegmentationModel(model_path, device=device, imgsz=imgsz, fp16=fp16, conf=conf)
 
 
-def _get_detector(log_callback=None):
-    global _DETECTOR
+def _get_detector(log_callback=None, *, frame_w: int | None = None, frame_h: int | None = None):
+    global _DETECTOR, _DETECTOR_CONFIG
+    imgsz = _resolve_detector_imgsz(frame_w, frame_h)
+    conf = float(_cfg("pre_extract_yolo_conf", 0.20) or 0.20)
+    config = (_model_path(), int(imgsz), float(conf))
     with _DETECTOR_LOCK:
-        if _DETECTOR is None:
-            _DETECTOR = _build_detector(log_callback)
+        if _DETECTOR is None or _DETECTOR_CONFIG != config:
+            _DETECTOR = _build_detector(log_callback, imgsz=imgsz)
+            _DETECTOR_CONFIG = config
         return _DETECTOR
 
 
 def release_detector(log_callback=None) -> None:
     """Release the cached YOLO detector and return its VRAM to CUDA."""
-    global _DETECTOR
+    global _DETECTOR, _DETECTOR_CONFIG
     with _DETECTOR_LOCK:
         if _DETECTOR is None:
             return
         _DETECTOR = None
+        _DETECTOR_CONFIG = None
     try:
         import gc
         import torch
@@ -566,7 +582,7 @@ def _scan_hits(video_path: str | Path, log_callback=None, cancel_token=None,
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"cannot open video for pre-extract scan: {video_path}")
-    detector = _get_detector(log_callback)
+    detector = _get_detector(log_callback, frame_w=meta.width, frame_h=meta.height)
 
     hits: list[dict] = []
     debug_records: list[dict] = []
@@ -648,14 +664,12 @@ def _scan_hits_keyframes_lowres(video_path: str | Path, log_callback=None,
             log_callback("[source-scan] no keyframe list available; falling back to normal scan")
         return _scan_hits(video_path, log_callback=log_callback, cancel_token=cancel_token, min_conf=min_conf)
 
-    scale_max = max(256, int(_cfg("source_scan_scale_max_px", 2048) or 2048))
     src_w = max(2, int(meta.width or 0))
     src_h = max(2, int(meta.height or 0))
     if src_w <= 2 or src_h <= 2:
         raise RuntimeError(f"cannot determine source size for keyframe scan: {video_path}")
-    ratio = min(1.0, float(scale_max) / float(max(src_w, src_h)))
-    out_w = max(2, int(round(src_w * ratio)))
-    out_h = max(2, int(round(src_h * ratio)))
+    out_w = max(2, src_w // 2)
+    out_h = src_h
     out_w -= out_w % 2
     out_h -= out_h % 2
     frame_bytes = out_w * out_h * 3
@@ -667,7 +681,7 @@ def _scan_hits_keyframes_lowres(video_path: str | Path, log_callback=None,
         "-skip_frame", "nokey",
         "-i", str(video_path),
         "-an", "-sn",
-        "-vf", f"scale={out_w}:{out_h}",
+        "-vf", f"crop={out_w}:{out_h}:0:0",
         "-vsync", "0",
         "-f", "rawvideo",
         "-pix_fmt", "bgr24",
@@ -676,11 +690,11 @@ def _scan_hits_keyframes_lowres(video_path: str | Path, log_callback=None,
     if log_callback:
         log_callback(
             f"[source-scan] fast keyframe scan: {len(keyframes)} keyframes, "
-            f"{src_w}x{src_h} -> {out_w}x{out_h}"
+            f"left-eye original-size crop {src_w}x{src_h} -> {out_w}x{out_h}"
         )
         log_callback(f"Executing: {' '.join(cmd)}")
 
-    detector = _get_detector(log_callback)
+    detector = _get_detector(log_callback, frame_w=out_w, frame_h=out_h)
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -757,7 +771,23 @@ def _scan_hits_keyframes_lowres(video_path: str | Path, log_callback=None,
         raise RuntimeError(f"source keyframe scan ffmpeg failed with code {proc.returncode}")
     if log_callback:
         log_callback(f"[source-scan] detector hits: {len(hits)} keyframes")
-    return hits, meta, debug_records
+    out_meta = probe.VideoMetadata(
+        path=str(video_path),
+        codec_name=meta.codec_name,
+        profile=meta.profile,
+        pix_fmt=meta.pix_fmt,
+        width=int(out_w),
+        height=int(out_h),
+        bit_depth=meta.bit_depth,
+        duration=meta.duration,
+        nb_frames=meta.nb_frames,
+        source_fps=meta.source_fps,
+        is_cfr=meta.is_cfr,
+        bitrate_bps=meta.bitrate_bps,
+        color=meta.color,
+        audio_codec="",
+    )
+    return hits, out_meta, debug_records
 
 
 def _cupy_to_torch_bgr(y_plane, uv_plane, bit_depth: int = 8):
@@ -801,7 +831,7 @@ def _scan_hits_gpu_transform(video_path: str | Path, *, crop_mode: str,
         stride_s = max(0.05, float(_cfg("pre_extract_sample_stride_s", 0.5) or 0.5))
         stride_frames = max(1, int(round(stride_s * fps)))
         batch_size = max(1, int(_cfg("pre_extract_yolo_batch", 4) or 4))
-        detector = _get_detector(log_callback)
+        detector = _get_detector(log_callback, frame_w=out_w, frame_h=out_h)
 
         hits: list[dict] = []
         debug_records: list[dict] = []

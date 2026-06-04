@@ -14,5 +14,6 @@ dist
 uv.lock
 reference
 runtime_cache
+debug_output
 videos
 models/

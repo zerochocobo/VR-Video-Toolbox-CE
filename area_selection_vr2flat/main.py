@@ -24,6 +24,12 @@ def get_runtime_base_dir():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _preview_debug_path(filename="preview_flat.jpg"):
+    out_dir = os.path.join(get_runtime_base_dir(), "debug_output", "area_selection_vr2flat")
+    os.makedirs(out_dir, exist_ok=True)
+    return os.path.join(out_dir, filename)
+
+
 def find_model_files(pattern):
     base_dir = get_runtime_base_dir()
     search_dirs = [base_dir, os.path.join(base_dir, "models"), os.getcwd(), os.path.join(os.getcwd(), "models")]
@@ -390,7 +396,7 @@ class VRMosaicApp:
         path = self.loc_input.get()
         if not path: return
         try:
-            tmp = "preview_flat.jpg"
+            tmp = _preview_debug_path()
             flat_w = 0
             flat_h = 0
             if hasattr(self, 'video_info') and self.video_info and hasattr(self, 'sel_ratio_w'):

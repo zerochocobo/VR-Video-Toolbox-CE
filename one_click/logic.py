@@ -571,6 +571,14 @@ def _pre_extract_supported(pre_extract, log_callback=None) -> bool:
     return True
 
 
+def _resolve_fine_conf(fine_conf=None) -> float:
+    value = fine_conf if fine_conf is not None else app_config.get("pre_extract_fine_yolo_conf", 0.50)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.50
+
+
 def _release_pre_extract_detector_if_needed(pre_extract_enabled, log_callback=None) -> None:
     if not pre_extract_enabled:
         return
@@ -583,7 +591,8 @@ def _release_pre_extract_detector_if_needed(pre_extract_enabled, log_callback=No
 
 
 def _run_pre_extract_branch(base_path, restored_path, keep_intermediate=False,
-                            log_callback=None, process_callback=None) -> str:
+                            log_callback=None, process_callback=None,
+                            fine_conf=None) -> str:
     """Run detect/cut/restore/paste for one prepared base video.
 
     SCAN_FAILED means the detector failed and callers should fall back to full
@@ -609,7 +618,7 @@ def _run_pre_extract_branch(base_path, restored_path, keep_intermediate=False,
     if process_callback:
         process_callback(scan_token)
     try:
-        fine_conf = float(app_config.get("pre_extract_fine_yolo_conf", 0.60) or 0.60)
+        fine_conf = _resolve_fine_conf(fine_conf)
         if log_callback:
             log_callback(f"[pre-extract] fine detection conf filter: {fine_conf:.2f}")
         segments = scan_segments(base_path, log_callback=log_callback, cancel_token=scan_token, min_conf=fine_conf)
@@ -711,7 +720,7 @@ def _run_pre_extract_branch(base_path, restored_path, keep_intermediate=False,
 
 def _process_pre_extract_or_lada(base_path, restored_path, pre_extract_enabled,
                                  keep_intermediate=False, log_callback=None,
-                                 process_callback=None) -> str:
+                                 process_callback=None, fine_conf=None) -> str:
     if not pre_extract_enabled:
         process_lada(base_path, restored_path, log_callback=log_callback, process_callback=process_callback)
         return PreExtractResult.OK
@@ -721,6 +730,7 @@ def _process_pre_extract_or_lada(base_path, restored_path, pre_extract_enabled,
         keep_intermediate=keep_intermediate,
         log_callback=log_callback,
         process_callback=process_callback,
+        fine_conf=fine_conf,
     )
     if result == PreExtractResult.SCAN_FAILED:
         if log_callback:
@@ -781,6 +791,47 @@ def _segment_spatial_overlap_ratio(a, b) -> float:
     return inter / max(1.0, min(area_a, area_b))
 
 
+def _segment_frame_bounds(seg, fps: float) -> tuple[int, int]:
+    fps = float(fps or 30.0)
+    start = max(0, int(round(float(seg.start_s) * fps)))
+    end = max(start + 1, int(round(float(seg.end_s) * fps)))
+    return start, end
+
+
+def _paired_segment_cache_key(seg, fps: float) -> str:
+    start_frame, end_frame = _segment_frame_bounds(seg, fps)
+    return (
+        f"f{start_frame:08d}-{end_frame:08d}."
+        f"r{int(seg.x)}_{int(seg.y)}_{int(seg.w)}x{int(seg.h)}"
+    )
+
+
+def _paired_segment_paths(base_dir: str, stem: str, side_name: str, fish: str, seg, fps: float) -> tuple[str, str]:
+    key = _paired_segment_cache_key(seg, fps)
+    base = os.path.join(base_dir, f"{stem}_{side_name}{fish}.{key}")
+    return f"{base}.mp4", f"{base}.restored.mp4"
+
+
+def _cleanup_orphan_paired_segment_files(base_dir: str, stem: str, fish: str,
+                                         valid_paths: set[str], log_callback=None) -> None:
+    valid = {os.path.abspath(path) for path in valid_paths}
+    patterns = []
+    for side_name in ("L", "R"):
+        patterns.append(os.path.join(base_dir, f"{stem}_{side_name}{fish}.seg*.mp4"))
+        patterns.append(os.path.join(base_dir, f"{stem}_{side_name}{fish}.f*.r*.mp4"))
+    for pattern in patterns:
+        for path in glob.glob(pattern):
+            abs_path = os.path.abspath(path)
+            if abs_path in valid:
+                continue
+            try:
+                os.remove(abs_path)
+                if log_callback:
+                    log_callback(f"[source-scan] removed orphan fine segment cache: {abs_path}")
+            except OSError:
+                pass
+
+
 def _pair_eye_segments_by_time(left_segments, right_segments, log_callback=None):
     min_overlap_s = max(0.0, float(app_config.get("pre_extract_pair_min_overlap_s", 0.25) or 0.25))
     min_spatial = max(0.0, float(app_config.get("pre_extract_pair_min_spatial_overlap", 0.05) or 0.05))
@@ -810,6 +861,7 @@ def _pair_eye_segments_by_time(left_segments, right_segments, log_callback=None)
 
     paired_left = []
     paired_right = []
+    paired_items = []
     used_left = set()
     used_right = set()
     for item in sorted(candidates, key=lambda c: (c["spatial"], c["overlap_s"]), reverse=True):
@@ -819,11 +871,25 @@ def _pair_eye_segments_by_time(left_segments, right_segments, log_callback=None)
         right = item["right"]
         used_left.add(item["li"])
         used_right.add(item["ri"])
-        paired_left.append(_clone_segment(left, seg_id=len(paired_left), start_s=item["start"], end_s=item["end"]))
-        paired_right.append(_clone_segment(right, seg_id=len(paired_right), start_s=item["start"], end_s=item["end"]))
+        paired_items.append(item)
+
+    paired_items.sort(key=lambda item: (
+        float(item["start"]),
+        float(item["end"]),
+        int(item["left"].y),
+        int(item["left"].x),
+        int(item["right"].y),
+        int(item["right"].x),
+    ))
+    for item in paired_items:
+        left = item["left"]
+        right = item["right"]
+        seg_id = len(paired_left)
+        paired_left.append(_clone_segment(left, seg_id=seg_id, start_s=item["start"], end_s=item["end"]))
+        paired_right.append(_clone_segment(right, seg_id=seg_id, start_s=item["start"], end_s=item["end"]))
         if log_callback:
             log_callback(
-                f"[source-scan] pair fine segment L{left.seg_id}<->R{right.seg_id}: "
+                f"[source-scan] pair fine segment {seg_id}: L{left.seg_id}<->R{right.seg_id}, "
                 f"{item['start']:.3f}-{item['end']:.3f}s, spatial_overlap={item['spatial']:.2f}"
             )
 
@@ -857,7 +923,8 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
                                          original_bitrate: int | None,
                                          keep_original_bitrate: bool,
                                          log_callback=None,
-                                         process_callback=None) -> str:
+                                         process_callback=None,
+                                         fine_conf=None) -> str:
     from gpu_engine import probe as gpu_probe
     from gpu_engine import files as gpu_files
     from utils.mosaic_prescan import save_segments_json, scan_segments_gpu_transform
@@ -867,7 +934,7 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
     output_file = os.path.abspath(output_file)
     base_dir = os.path.dirname(base_clip)
     stem = os.path.splitext(os.path.basename(base_clip))[0]
-    fine_conf = float(app_config.get("pre_extract_fine_yolo_conf", 0.60) or 0.60)
+    fine_conf = _resolve_fine_conf(fine_conf)
     if log_callback:
         log_callback(
             f"[source-scan] Stage 3 paired fine pre-extract: base={base_clip}, "
@@ -910,18 +977,25 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
     save_segments_json(right_segments, os.path.join(base_dir, f"{stem}_R{'_fisheye' if use_fisheye else ''}.segments.json"), source=base_clip)
 
     restored_paths = []
+    segment_input_paths = []
     paste_segments = []
     meta = gpu_probe.probe_video(base_clip)
+    fps = meta.source_fps or 30.0
     eye_w = int(meta.width // 2)
     rect_source_bitrate = int(original_bitrate or meta.bitrate_bps or 0)
     bitrate_bps = int(original_bitrate) if (keep_original_bitrate and original_bitrate) else None
+    fish = "_fisheye" if use_fisheye else ""
+    expected_cache_paths = set()
+    for side_name, segments in (("L", left_segments), ("R", right_segments)):
+        for seg in segments:
+            expected_cache_paths.update(_paired_segment_paths(base_dir, stem, side_name, fish, seg, fps))
+    _cleanup_orphan_paired_segment_files(base_dir, stem, fish, expected_cache_paths, log_callback=log_callback)
 
     def _extract_restore(side: str, segments, x_offset: int):
         for seg in segments:
             side_name = "L" if side == "left" else "R"
-            fish = "_fisheye" if use_fisheye else ""
-            seg_in = os.path.join(base_dir, f"{stem}_{side_name}{fish}.seg{seg.seg_id:03d}.mp4")
-            seg_out = os.path.join(base_dir, f"{stem}_{side_name}{fish}.seg{seg.seg_id:03d}.restored.mp4")
+            seg_in, seg_out = _paired_segment_paths(base_dir, stem, side_name, fish, seg, fps)
+            cache_key = _paired_segment_cache_key(seg, fps)
             rect_bitrate_bps = _area_scaled_bitrate_bps(
                 rect_source_bitrate,
                 meta.width,
@@ -936,7 +1010,7 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
                 log_callback(
                     f"[source-scan] fine {side_name} segment {seg.seg_id}: "
                     f"{seg.start_s:.3f}-{seg.end_s:.3f}s rect={seg.x},{seg.y},{seg.w}x{seg.h} "
-                    f"bitrate={rect_bitrate_label}"
+                    f"key={cache_key} bitrate={rect_bitrate_label}"
                 )
             if not os.path.exists(seg_in):
                 token = gpu_files.CancelToken()
@@ -958,6 +1032,7 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
                 )
             if not os.path.exists(seg_out):
                 process_lada(seg_in, seg_out, log_callback=log_callback, process_callback=process_callback)
+            segment_input_paths.append(seg_in)
             paste_segments.append(_clone_segment(seg, seg_id=len(paste_segments), x_offset=x_offset))
             restored_paths.append(seg_out)
 
@@ -997,13 +1072,12 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
 
     keep_segments = bool(app_config.get("pre_extract_keep_segments", False)) or bool(keep_intermediate)
     if not keep_segments:
-        for path in restored_paths:
-            for p in (path, path.replace(".restored.mp4", ".mp4")):
-                try:
-                    if os.path.exists(p):
-                        os.remove(p)
-                except OSError:
-                    pass
+        for p in segment_input_paths + restored_paths:
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError:
+                pass
         for p in cleanup_extra:
             try:
                 if os.path.exists(p):
@@ -1024,7 +1098,8 @@ def _process_sbs_clip_to_output(input_file, output_file, *, use_fisheye: bool,
                                 work_stem: str | None = None,
                                 split_keep_audio: bool = True,
                                 log_callback=None,
-                                process_callback=None) -> None:
+                                process_callback=None,
+                                fine_conf=None) -> None:
     directory = os.path.abspath(work_dir) if work_dir else os.path.dirname(os.path.abspath(input_file))
     os.makedirs(directory, exist_ok=True)
     stem = work_stem or os.path.splitext(os.path.basename(input_file))[0]
@@ -1051,8 +1126,8 @@ def _process_sbs_clip_to_output(input_file, output_file, *, use_fisheye: bool,
         )
         if log_callback:
             log_callback("[source-scan] Stage 3: restore fisheye eyes")
-        _process_pre_extract_or_lada(file_l_fish, file_l_fish_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback)
-        _process_pre_extract_or_lada(file_r_fish, file_r_fish_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback)
+        _process_pre_extract_or_lada(file_l_fish, file_l_fish_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf)
+        _process_pre_extract_or_lada(file_r_fish, file_r_fish_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf)
         if log_callback:
             log_callback("[source-scan] Stage 3: Fisheye->VR + merge")
         merge_videos_fisheye(file_l_fish_restored, file_r_fish_restored, output_file, original_bitrate, keep_original_bitrate, log_callback, process_callback)
@@ -1070,8 +1145,8 @@ def _process_sbs_clip_to_output(input_file, output_file, *, use_fisheye: bool,
         )
         if log_callback:
             log_callback("[source-scan] Stage 3: restore eyes")
-        _process_pre_extract_or_lada(file_l, file_l_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback)
-        _process_pre_extract_or_lada(file_r, file_r_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback)
+        _process_pre_extract_or_lada(file_l, file_l_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf)
+        _process_pre_extract_or_lada(file_r, file_r_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf)
         if log_callback:
             log_callback("[source-scan] Stage 3: merge SBS")
         merge_videos(file_l_restored, file_r_restored, output_file, original_bitrate, keep_original_bitrate, log_callback, process_callback)
@@ -1097,7 +1172,8 @@ def _process_single_eye_clip_to_output(input_file, output_file, *, eye_mode: int
                                        work_stem: str | None = None,
                                        split_keep_audio: bool = True,
                                        log_callback=None,
-                                       process_callback=None) -> None:
+                                       process_callback=None,
+                                       fine_conf=None) -> None:
     directory = os.path.abspath(work_dir) if work_dir else os.path.dirname(os.path.abspath(input_file))
     os.makedirs(directory, exist_ok=True)
     stem = work_stem or os.path.splitext(os.path.basename(input_file))[0]
@@ -1119,7 +1195,7 @@ def _process_single_eye_clip_to_output(input_file, output_file, *, eye_mode: int
             start_time, end_time, log_callback, process_callback,
             keep_audio=split_keep_audio,
         )
-        _process_pre_extract_or_lada(file_cut_fish, file_cut_fish_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback)
+        _process_pre_extract_or_lada(file_cut_fish, file_cut_fish_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf)
         convert_projection(file_cut_fish_restored, output_file, "fisheye:hequirect", final_bitrate_kbps=final_bitrate_kbps, log_callback=log_callback, process_callback=process_callback)
         cleanup = [file_cut_fish, file_cut_fish_restored]
     else:
@@ -1133,7 +1209,7 @@ def _process_single_eye_clip_to_output(input_file, output_file, *, eye_mode: int
             start_time, end_time, log_callback, process_callback,
             keep_audio=split_keep_audio,
         )
-        _process_pre_extract_or_lada(file_cut, output_file, pre_extract_enabled, keep_intermediate, log_callback, process_callback)
+        _process_pre_extract_or_lada(file_cut, output_file, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf)
         cleanup = [file_cut]
 
     if not keep_intermediate:
@@ -1154,7 +1230,8 @@ def _run_source_scan_branch(input_file, final_output, *, use_fisheye: bool,
                             mode: str = "sbs",
                             eye_mode: int | None = None,
                             log_callback=None,
-                            process_callback=None) -> str:
+                            process_callback=None,
+                            fine_conf=None) -> str:
     from gpu_engine import probe as gpu_probe
     from gpu_engine.files import CancelToken
     from utils.keyframe_cutter import cut_source_by_intervals
@@ -1270,6 +1347,7 @@ def _run_source_scan_branch(input_file, final_output, *, use_fisheye: bool,
                         final_bitrate_kbps=final_bitrate_kbps,
                         log_callback=log_callback,
                         process_callback=process_callback,
+                        fine_conf=fine_conf,
                     )
                 else:
                     if pre_extract_inner:
@@ -1282,6 +1360,7 @@ def _run_source_scan_branch(input_file, final_output, *, use_fisheye: bool,
                             keep_original_bitrate=keep_original_bitrate,
                             log_callback=log_callback,
                             process_callback=process_callback,
+                            fine_conf=fine_conf,
                         )
                         if paired_result == PreExtractResult.SCAN_FAILED:
                             if log_callback:
@@ -1296,6 +1375,7 @@ def _run_source_scan_branch(input_file, final_output, *, use_fisheye: bool,
                                 keep_original_bitrate=keep_original_bitrate,
                                 log_callback=log_callback,
                                 process_callback=process_callback,
+                                fine_conf=fine_conf,
                             )
                     else:
                         _process_sbs_clip_to_output(
@@ -1308,6 +1388,7 @@ def _run_source_scan_branch(input_file, final_output, *, use_fisheye: bool,
                             keep_original_bitrate=keep_original_bitrate,
                             log_callback=log_callback,
                             process_callback=process_callback,
+                            fine_conf=fine_conf,
                         )
                 entry.path = restored
                 entry.inpoint_s = None
@@ -1740,7 +1821,7 @@ def _run_native_single_eye_stream(input_file, output_file, eye_mode, start_time,
             log_callback(f"[native-stream fallback] {type(e).__name__}: {e}; using legacy intermediate-file path")
         return False
 
-def run_single_file_pipeline(input_file, start_time, end_time, use_fisheye, keep_intermediate=False, keep_original_bitrate=False, log_callback=None, process_callback=None, pre_extract=False, source_scan=False):
+def run_single_file_pipeline(input_file, start_time, end_time, use_fisheye, keep_intermediate=False, keep_original_bitrate=False, log_callback=None, process_callback=None, pre_extract=False, source_scan=True, fine_conf=None):
     pre_extract_enabled = False
     source_scan_enabled = False
     process_logger = _ProcessFileLogger(input_file, log_callback)
@@ -1797,6 +1878,7 @@ def run_single_file_pipeline(input_file, start_time, end_time, use_fisheye, keep
                 mode="sbs",
                 log_callback=log_callback,
                 process_callback=process_callback,
+                fine_conf=fine_conf,
             )
             if result in {PreExtractResult.OK, PreExtractResult.NO_MOSAIC}:
                 if log_callback and result == PreExtractResult.OK:
@@ -1823,8 +1905,8 @@ def run_single_file_pipeline(input_file, start_time, end_time, use_fisheye, keep
             
             # Step 2: LADA processing (2 commands)
             if log_callback: log_callback("--- Step 2/3: Processing ---")
-            _process_pre_extract_or_lada(file_l_fish, file_l_fish_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback)
-            _process_pre_extract_or_lada(file_r_fish, file_r_fish_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback)
+            _process_pre_extract_or_lada(file_l_fish, file_l_fish_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf)
+            _process_pre_extract_or_lada(file_r_fish, file_r_fish_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf)
             
             # Step 3: Fisheye->VR + Merge in one pass
             if log_callback: log_callback("--- Step 3/3: Fisheye->VR + Merging ---")
@@ -1844,8 +1926,8 @@ def run_single_file_pipeline(input_file, start_time, end_time, use_fisheye, keep
             
             # Step 2: Process
             if log_callback: log_callback("--- Step 2/3: Processing ---")
-            _process_pre_extract_or_lada(file_l, file_l_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback)
-            _process_pre_extract_or_lada(file_r, file_r_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback)
+            _process_pre_extract_or_lada(file_l, file_l_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf)
+            _process_pre_extract_or_lada(file_r, file_r_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf)
             
             # Step 3: Merge
             if log_callback: log_callback("--- Step 3/3: Merging ---")
@@ -1876,7 +1958,7 @@ def run_single_file_pipeline(input_file, start_time, end_time, use_fisheye, keep
                 log_callback=process_logger.ui_callback,
             )
 
-def run_single_eye_pipeline(input_file, eye_mode, start_time, end_time, use_fisheye, keep_intermediate=False, keep_original_bitrate=True, log_callback=None, process_callback=None, pre_extract=False, source_scan=False):
+def run_single_eye_pipeline(input_file, eye_mode, start_time, end_time, use_fisheye, keep_intermediate=False, keep_original_bitrate=True, log_callback=None, process_callback=None, pre_extract=False, source_scan=True, fine_conf=None):
     # eye_mode: 1=Left, 2=Right
     pre_extract_enabled = False
     source_scan_enabled = False
@@ -1928,6 +2010,7 @@ def run_single_eye_pipeline(input_file, eye_mode, start_time, end_time, use_fish
                 eye_mode=eye_mode,
                 log_callback=log_callback,
                 process_callback=process_callback,
+                fine_conf=fine_conf,
             )
             if result in {PreExtractResult.OK, PreExtractResult.NO_MOSAIC}:
                 if log_callback and result == PreExtractResult.OK:
@@ -1960,7 +2043,7 @@ def run_single_eye_pipeline(input_file, eye_mode, start_time, end_time, use_fish
                 if log_callback: log_callback(f"Intermediate file exists: {file_cut_fish}. Skipping.")
             # Step 2: Process (lada/jasna)
             if log_callback: log_callback("--- Step 2/3: Processing ---")
-            _process_pre_extract_or_lada(file_cut_fish, file_cut_fish_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback)
+            _process_pre_extract_or_lada(file_cut_fish, file_cut_fish_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf)
             # Step 3: Fisheye->VR
             if log_callback: log_callback("--- Step 3/3: Fisheye->VR ---")
             convert_projection(file_cut_fish_restored, file_final, "fisheye:hequirect", final_bitrate_kbps=final_bitrate_kbps, log_callback=log_callback, process_callback=process_callback)
@@ -1979,7 +2062,7 @@ def run_single_eye_pipeline(input_file, eye_mode, start_time, end_time, use_fish
                 if log_callback: log_callback(f"Intermediate file exists: {file_cut}. Skipping split.")
             # Step 2: Process (lada/jasna)
             if log_callback: log_callback("--- Step 2/2: Processing ---")
-            _process_pre_extract_or_lada(file_cut, file_final, pre_extract_enabled, keep_intermediate, log_callback, process_callback)
+            _process_pre_extract_or_lada(file_cut, file_final, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf)
             cleanup_list = [file_cut]
 
         # Cleanup
@@ -2006,7 +2089,7 @@ def run_single_eye_pipeline(input_file, eye_mode, start_time, end_time, use_fish
                 log_callback=process_logger.ui_callback,
             )
 
-def run_batch_pipeline(directory, use_fisheye, keep_original_bitrate=False, log_callback=None, process_callback=None, pre_extract=False, source_scan=False):
+def run_batch_pipeline(directory, use_fisheye, keep_original_bitrate=False, log_callback=None, process_callback=None, pre_extract=False, source_scan=True, fine_conf=None):
     ui_log_callback = log_callback
     mp4_files = glob.glob(os.path.join(directory, "*.mp4"))
     pre_extract_enabled = _pre_extract_supported(pre_extract, log_callback)
@@ -2056,6 +2139,7 @@ def run_batch_pipeline(directory, use_fisheye, keep_original_bitrate=False, log_
                     mode="sbs",
                     log_callback=log_callback,
                     process_callback=process_callback,
+                    fine_conf=fine_conf,
                 )
                 if result in {PreExtractResult.OK, PreExtractResult.NO_MOSAIC}:
                     if log_callback and result == PreExtractResult.OK:
@@ -2091,7 +2175,7 @@ def run_batch_pipeline(directory, use_fisheye, keep_original_bitrate=False, log_
                         split_video(input_file, file_l, "crop=iw/2:ih:0:0", None, None, log_callback, process_callback)
                         convert_projection(file_l, file_l_fish, "hequirect:fisheye", log_callback, process_callback)
                         if os.path.exists(file_l): os.remove(file_l)
-                    _process_pre_extract_or_lada(file_l_fish, file_l_fish_restored, pre_extract_enabled, False, log_callback, process_callback)
+                    _process_pre_extract_or_lada(file_l_fish, file_l_fish_restored, pre_extract_enabled, False, log_callback, process_callback, fine_conf=fine_conf)
                 
                 if not skip_r:
                     if not os.path.exists(file_r_fish):
@@ -2099,7 +2183,7 @@ def run_batch_pipeline(directory, use_fisheye, keep_original_bitrate=False, log_
                         split_video(input_file, file_r, "crop=iw/2:ih:iw/2:0", None, None, log_callback, process_callback)
                         convert_projection(file_r, file_r_fish, "hequirect:fisheye", log_callback, process_callback)
                         if os.path.exists(file_r): os.remove(file_r)
-                    _process_pre_extract_or_lada(file_r_fish, file_r_fish_restored, pre_extract_enabled, False, log_callback, process_callback)
+                    _process_pre_extract_or_lada(file_r_fish, file_r_fish_restored, pre_extract_enabled, False, log_callback, process_callback, fine_conf=fine_conf)
                 
                 # Step 3: Fisheye->VR + Merge in one pass
                 merge_videos_fisheye(file_l_fish_restored, file_r_fish_restored, file_final, original_bitrate, keep_original_bitrate, log_callback, process_callback)
@@ -2125,9 +2209,9 @@ def run_batch_pipeline(directory, use_fisheye, keep_original_bitrate=False, log_
                     
                 # Step 2: Process
                 if not skip_l:
-                    _process_pre_extract_or_lada(file_l, file_l_restored, pre_extract_enabled, False, log_callback, process_callback)
+                    _process_pre_extract_or_lada(file_l, file_l_restored, pre_extract_enabled, False, log_callback, process_callback, fine_conf=fine_conf)
                 if not skip_r:
-                    _process_pre_extract_or_lada(file_r, file_r_restored, pre_extract_enabled, False, log_callback, process_callback)
+                    _process_pre_extract_or_lada(file_r, file_r_restored, pre_extract_enabled, False, log_callback, process_callback, fine_conf=fine_conf)
                     
                 # Step 3: Merge
                 merge_videos(file_l_restored, file_r_restored, file_final, original_bitrate, keep_original_bitrate, log_callback, process_callback)
@@ -2152,7 +2236,7 @@ def run_batch_pipeline(directory, use_fisheye, keep_original_bitrate=False, log_
             log_callback = ui_log_callback
     _release_pre_extract_detector_if_needed(pre_extract_enabled or source_scan_enabled, ui_log_callback)
 
-def run_batch_eye_pipeline(directory, eye_mode, use_fisheye, keep_original_bitrate=True, log_callback=None, process_callback=None, pre_extract=False, source_scan=False):
+def run_batch_eye_pipeline(directory, eye_mode, use_fisheye, keep_original_bitrate=True, log_callback=None, process_callback=None, pre_extract=False, source_scan=True, fine_conf=None):
     ui_log_callback = log_callback
     mp4_files = glob.glob(os.path.join(directory, "*.mp4"))
     side_suffix = "_L" if eye_mode == 1 else "_R"
@@ -2204,6 +2288,7 @@ def run_batch_eye_pipeline(directory, eye_mode, use_fisheye, keep_original_bitra
                     eye_mode=eye_mode,
                     log_callback=log_callback,
                     process_callback=process_callback,
+                    fine_conf=fine_conf,
                 )
                 if result in {PreExtractResult.OK, PreExtractResult.NO_MOSAIC}:
                     if log_callback and result == PreExtractResult.OK:
@@ -2230,7 +2315,7 @@ def run_batch_eye_pipeline(directory, eye_mode, use_fisheye, keep_original_bitra
                         final_bitrate_kbps=split_bitrate_kbps,
                         max_bitrate_kbps=split_max_kbps,
                     )
-                _process_pre_extract_or_lada(file_cut_fish, file_cut_fish_restored, pre_extract_enabled, False, log_callback, process_callback)
+                _process_pre_extract_or_lada(file_cut_fish, file_cut_fish_restored, pre_extract_enabled, False, log_callback, process_callback, fine_conf=fine_conf)
                 convert_projection(file_cut_fish_restored, file_final, "fisheye:hequirect", final_bitrate_kbps=final_bitrate_kbps, log_callback=log_callback, process_callback=process_callback)
                 if os.path.exists(file_cut_fish): os.remove(file_cut_fish)
                 if os.path.exists(file_cut_fish_restored): os.remove(file_cut_fish_restored)
@@ -2242,7 +2327,7 @@ def run_batch_eye_pipeline(directory, eye_mode, use_fisheye, keep_original_bitra
                         final_bitrate_kbps=split_bitrate_kbps,
                         max_bitrate_kbps=split_max_kbps,
                     )
-                _process_pre_extract_or_lada(file_cut, file_final, pre_extract_enabled, False, log_callback, process_callback)
+                _process_pre_extract_or_lada(file_cut, file_final, pre_extract_enabled, False, log_callback, process_callback, fine_conf=fine_conf)
                 if os.path.exists(file_cut): os.remove(file_cut)
             cleanup_success_artifacts = True
 

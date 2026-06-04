@@ -21,6 +21,10 @@ except ImportError:
 def get_text(key):
     return i18n.translate('one_click', key)
 
+_FINE_CONF_VALUES = ("0.3（误检多）", "0.4", "0.5", "0.6", "0.7", "0.8（漏检多）")
+_DEFAULT_FINE_CONF = "0.5"
+
+
 class VRMosaicOneClickApp:
     def __init__(self, root, on_return=None):
         self.root = root
@@ -71,15 +75,28 @@ class VRMosaicOneClickApp:
         lang = app_config.get_language()
         return {'zh': zh, 'en': en, 'ja': ja}.get(lang, zh)
 
-    def _grid_pre_extract_check(self, parent, variable, row):
-        check = ttk.Checkbutton(parent, text=get_text('opt_pre_extract'), variable=variable)
-        check.grid(row=row, column=0, columnspan=2, sticky='w', padx=5, pady=5)
-        return check
+    def _grid_pre_extract_check(self, parent, enabled_variable, conf_variable, row):
+        frame = ttk.Frame(parent)
+        frame.grid(row=row, column=0, columnspan=2, sticky='w', padx=5, pady=5)
+        ttk.Checkbutton(frame, text=get_text('opt_pre_extract'), variable=enabled_variable).pack(side='left')
+        ttk.Combobox(
+            frame,
+            textvariable=conf_variable,
+            state='readonly',
+            width=5,
+            values=_FINE_CONF_VALUES,
+        ).pack(side='left', padx=(8, 0))
+        return frame
 
-    def _grid_source_scan_check(self, parent, variable, row):
-        check = ttk.Checkbutton(parent, text=get_text('opt_source_time_filter'), variable=variable)
-        check.grid(row=row, column=0, columnspan=2, sticky='w', padx=5, pady=5)
-        return check
+    def _selected_fine_conf(self, variable):
+        try:
+            text = str(variable.get()).strip()
+            for value in ("0.3", "0.4", "0.5", "0.6", "0.7", "0.8"):
+                if text.startswith(value):
+                    return float(value)
+            return float(text)
+        except (tk.TclError, TypeError, ValueError):
+            return float(_DEFAULT_FINE_CONF)
 
     def create_settings_bar(self, parent):
         """Quality/speed dropdown mapped to NVENC encode presets P4-P7.
@@ -208,18 +225,17 @@ class VRMosaicOneClickApp:
         
         self.s_auto_fisheye = tk.BooleanVar()
         self.s_auto_pre_extract = tk.BooleanVar(value=True)
-        self.s_auto_source_scan = tk.BooleanVar(value=bool(app_config.get('source_scan_enabled', True)))
+        self.s_auto_fine_conf = tk.StringVar(value=_DEFAULT_FINE_CONF)
         self.s_auto_keep = tk.BooleanVar()
         self.s_auto_keep_bitrate = tk.BooleanVar(value=True)
         
-        self._grid_source_scan_check(tab, self.s_auto_source_scan, 3)
-        ttk.Checkbutton(tab, text=get_text('opt_fisheye'), variable=self.s_auto_fisheye).grid(row=4, column=0, columnspan=2, sticky='w', padx=5, pady=5)
-        self._grid_pre_extract_check(tab, self.s_auto_pre_extract, 5)
-        ttk.Checkbutton(tab, text=get_text('chk_keep_inter'), variable=self.s_auto_keep).grid(row=6, column=0, columnspan=2, sticky='w', padx=5, pady=5)
-        ttk.Checkbutton(tab, text=get_text('chk_keep_bitrate'), variable=self.s_auto_keep_bitrate).grid(row=7, column=0, columnspan=2, sticky='w', padx=5, pady=5)
+        ttk.Checkbutton(tab, text=get_text('opt_fisheye'), variable=self.s_auto_fisheye).grid(row=3, column=0, columnspan=2, sticky='w', padx=5, pady=5)
+        self._grid_pre_extract_check(tab, self.s_auto_pre_extract, self.s_auto_fine_conf, 4)
+        ttk.Checkbutton(tab, text=get_text('chk_keep_inter'), variable=self.s_auto_keep).grid(row=5, column=0, columnspan=2, sticky='w', padx=5, pady=5)
+        ttk.Checkbutton(tab, text=get_text('chk_keep_bitrate'), variable=self.s_auto_keep_bitrate).grid(row=6, column=0, columnspan=2, sticky='w', padx=5, pady=5)
 
         btn_frame = ttk.Frame(tab)
-        btn_frame.grid(row=8, column=1, pady=20, sticky='w', padx=5)
+        btn_frame.grid(row=7, column=1, pady=20, sticky='w', padx=5)
         
         self.btn_s_auto = ttk.Button(btn_frame, text=get_text('btn_start'), command=self.run_s_auto)
         self.btn_s_auto.pack(side='left', padx=5)
@@ -228,8 +244,8 @@ class VRMosaicOneClickApp:
         self.btn_stop_s_auto.pack(side='left', padx=5)
         
         log_frame = ttk.LabelFrame(tab, text=get_text('grp_log'))
-        log_frame.grid(row=9, column=0, columnspan=3, sticky='nsew', padx=5, pady=5)
-        tab.grid_rowconfigure(9, weight=1)
+        log_frame.grid(row=8, column=0, columnspan=3, sticky='nsew', padx=5, pady=5)
+        tab.grid_rowconfigure(8, weight=1)
         tab.grid_columnconfigure(1, weight=1)
         self.log_s_auto = scrolledtext.ScrolledText(log_frame, height=8, state='normal')
         self.log_s_auto.pack(fill='both', expand=True)
@@ -275,7 +291,8 @@ class VRMosaicOneClickApp:
                 lambda msg: self.log_to_widget(self.log_s_auto, msg),
                 _on_proc,
                 pre_extract=self.s_auto_pre_extract.get(),
-                source_scan=self.s_auto_source_scan.get()
+                source_scan=True,
+                fine_conf=self._selected_fine_conf(self.s_auto_fine_conf)
             )
         except Exception as e:
             self.log_to_widget(self.log_s_auto, f"Error: {e}")
@@ -321,18 +338,17 @@ class VRMosaicOneClickApp:
         
         self.s_eye_fisheye = tk.BooleanVar()
         self.s_eye_pre_extract = tk.BooleanVar(value=True)
-        self.s_eye_source_scan = tk.BooleanVar(value=bool(app_config.get('source_scan_enabled', True)))
+        self.s_eye_fine_conf = tk.StringVar(value=_DEFAULT_FINE_CONF)
         self.s_eye_keep = tk.BooleanVar()
         self.s_eye_keep_bitrate = tk.BooleanVar(value=True)
         
-        self._grid_source_scan_check(tab, self.s_eye_source_scan, 4)
-        ttk.Checkbutton(tab, text=get_text('opt_fisheye'), variable=self.s_eye_fisheye).grid(row=5, column=0, columnspan=2, sticky='w', padx=5, pady=5)
-        self._grid_pre_extract_check(tab, self.s_eye_pre_extract, 6)
-        ttk.Checkbutton(tab, text=get_text('chk_keep_inter'), variable=self.s_eye_keep).grid(row=7, column=0, columnspan=2, sticky='w', padx=5, pady=5)
-        ttk.Checkbutton(tab, text=get_text('chk_keep_bitrate'), variable=self.s_eye_keep_bitrate).grid(row=8, column=0, columnspan=2, sticky='w', padx=5, pady=5)
+        ttk.Checkbutton(tab, text=get_text('opt_fisheye'), variable=self.s_eye_fisheye).grid(row=4, column=0, columnspan=2, sticky='w', padx=5, pady=5)
+        self._grid_pre_extract_check(tab, self.s_eye_pre_extract, self.s_eye_fine_conf, 5)
+        ttk.Checkbutton(tab, text=get_text('chk_keep_inter'), variable=self.s_eye_keep).grid(row=6, column=0, columnspan=2, sticky='w', padx=5, pady=5)
+        ttk.Checkbutton(tab, text=get_text('chk_keep_bitrate'), variable=self.s_eye_keep_bitrate).grid(row=7, column=0, columnspan=2, sticky='w', padx=5, pady=5)
 
         btn_frame = ttk.Frame(tab)
-        btn_frame.grid(row=9, column=1, pady=20, sticky='w', padx=5)
+        btn_frame.grid(row=8, column=1, pady=20, sticky='w', padx=5)
         
         self.btn_s_eye = ttk.Button(btn_frame, text=get_text('btn_start'), command=self.run_s_eye)
         self.btn_s_eye.pack(side='left', padx=5)
@@ -341,8 +357,8 @@ class VRMosaicOneClickApp:
         self.btn_stop_s_eye.pack(side='left', padx=5)
         
         log_frame = ttk.LabelFrame(tab, text=get_text('grp_log'))
-        log_frame.grid(row=10, column=0, columnspan=3, sticky='nsew', padx=5, pady=5)
-        tab.grid_rowconfigure(10, weight=1)
+        log_frame.grid(row=9, column=0, columnspan=3, sticky='nsew', padx=5, pady=5)
+        tab.grid_rowconfigure(9, weight=1)
         tab.grid_columnconfigure(1, weight=1)
         self.log_s_eye = scrolledtext.ScrolledText(log_frame, height=8, state='normal')
         self.log_s_eye.pack(fill='both', expand=True)
@@ -389,7 +405,8 @@ class VRMosaicOneClickApp:
                 lambda msg: self.log_to_widget(self.log_s_eye, msg),
                 _on_proc,
                 pre_extract=self.s_eye_pre_extract.get(),
-                source_scan=self.s_eye_source_scan.get()
+                source_scan=True,
+                fine_conf=self._selected_fine_conf(self.s_eye_fine_conf)
             )
         except Exception as e:
             self.log_to_widget(self.log_s_eye, f"Error: {e}")
@@ -418,15 +435,14 @@ class VRMosaicOneClickApp:
         
         self.b_auto_fisheye = tk.BooleanVar()
         self.b_auto_pre_extract = tk.BooleanVar(value=True)
-        self.b_auto_source_scan = tk.BooleanVar(value=bool(app_config.get('source_scan_enabled', True)))
+        self.b_auto_fine_conf = tk.StringVar(value=_DEFAULT_FINE_CONF)
         self.b_auto_keep_bitrate = tk.BooleanVar(value=True)
-        self._grid_source_scan_check(tab, self.b_auto_source_scan, 1)
-        ttk.Checkbutton(tab, text=get_text('opt_fisheye'), variable=self.b_auto_fisheye).grid(row=2, column=0, columnspan=2, sticky='w', padx=5, pady=5)
-        self._grid_pre_extract_check(tab, self.b_auto_pre_extract, 3)
-        ttk.Checkbutton(tab, text=get_text('chk_keep_bitrate'), variable=self.b_auto_keep_bitrate).grid(row=4, column=0, columnspan=2, sticky='w', padx=5, pady=5)
+        ttk.Checkbutton(tab, text=get_text('opt_fisheye'), variable=self.b_auto_fisheye).grid(row=1, column=0, columnspan=2, sticky='w', padx=5, pady=5)
+        self._grid_pre_extract_check(tab, self.b_auto_pre_extract, self.b_auto_fine_conf, 2)
+        ttk.Checkbutton(tab, text=get_text('chk_keep_bitrate'), variable=self.b_auto_keep_bitrate).grid(row=3, column=0, columnspan=2, sticky='w', padx=5, pady=5)
 
         btn_frame = ttk.Frame(tab)
-        btn_frame.grid(row=5, column=1, pady=20, sticky='w', padx=5)
+        btn_frame.grid(row=4, column=1, pady=20, sticky='w', padx=5)
         
         self.btn_b_auto = ttk.Button(btn_frame, text=get_text('btn_batch'), command=self.run_b_auto)
         self.btn_b_auto.pack(side='left', padx=5)
@@ -435,8 +451,8 @@ class VRMosaicOneClickApp:
         self.btn_stop_b_auto.pack(side='left', padx=5)
         
         log_frame = ttk.LabelFrame(tab, text=get_text('grp_log'))
-        log_frame.grid(row=6, column=0, columnspan=3, sticky='nsew', padx=5, pady=5)
-        tab.grid_rowconfigure(6, weight=1)
+        log_frame.grid(row=5, column=0, columnspan=3, sticky='nsew', padx=5, pady=5)
+        tab.grid_rowconfigure(5, weight=1)
         tab.grid_columnconfigure(1, weight=1)
         self.log_b_auto = scrolledtext.ScrolledText(log_frame, height=8, state='normal')
         self.log_b_auto.pack(fill='both', expand=True)
@@ -474,7 +490,8 @@ class VRMosaicOneClickApp:
                 lambda msg: self.log_to_widget(self.log_b_auto, msg),
                 _on_proc,
                 pre_extract=self.b_auto_pre_extract.get(),
-                source_scan=self.b_auto_source_scan.get()
+                source_scan=True,
+                fine_conf=self._selected_fine_conf(self.b_auto_fine_conf)
             )
         except Exception as e:
             self.log_to_widget(self.log_b_auto, f"Error: {e}")
@@ -510,15 +527,14 @@ class VRMosaicOneClickApp:
         
         self.b_eye_fisheye = tk.BooleanVar()
         self.b_eye_pre_extract = tk.BooleanVar(value=True)
-        self.b_eye_source_scan = tk.BooleanVar(value=bool(app_config.get('source_scan_enabled', True)))
+        self.b_eye_fine_conf = tk.StringVar(value=_DEFAULT_FINE_CONF)
         self.b_eye_keep_bitrate = tk.BooleanVar(value=True)
-        self._grid_source_scan_check(tab, self.b_eye_source_scan, 2)
-        ttk.Checkbutton(tab, text=get_text('opt_fisheye'), variable=self.b_eye_fisheye).grid(row=3, column=0, columnspan=2, sticky='w', padx=5, pady=5)
-        self._grid_pre_extract_check(tab, self.b_eye_pre_extract, 4)
-        ttk.Checkbutton(tab, text=get_text('chk_keep_bitrate'), variable=self.b_eye_keep_bitrate).grid(row=5, column=0, columnspan=2, sticky='w', padx=5, pady=5)
+        ttk.Checkbutton(tab, text=get_text('opt_fisheye'), variable=self.b_eye_fisheye).grid(row=2, column=0, columnspan=2, sticky='w', padx=5, pady=5)
+        self._grid_pre_extract_check(tab, self.b_eye_pre_extract, self.b_eye_fine_conf, 3)
+        ttk.Checkbutton(tab, text=get_text('chk_keep_bitrate'), variable=self.b_eye_keep_bitrate).grid(row=4, column=0, columnspan=2, sticky='w', padx=5, pady=5)
 
         btn_frame = ttk.Frame(tab)
-        btn_frame.grid(row=6, column=1, pady=20, sticky='w', padx=5)
+        btn_frame.grid(row=5, column=1, pady=20, sticky='w', padx=5)
         
         self.btn_b_eye = ttk.Button(btn_frame, text=get_text('btn_batch'), command=self.run_b_eye)
         self.btn_b_eye.pack(side='left', padx=5)
@@ -527,8 +543,8 @@ class VRMosaicOneClickApp:
         self.btn_stop_b_eye.pack(side='left', padx=5)
         
         log_frame = ttk.LabelFrame(tab, text=get_text('grp_log'))
-        log_frame.grid(row=7, column=0, columnspan=3, sticky='nsew', padx=5, pady=5)
-        tab.grid_rowconfigure(7, weight=1)
+        log_frame.grid(row=6, column=0, columnspan=3, sticky='nsew', padx=5, pady=5)
+        tab.grid_rowconfigure(6, weight=1)
         tab.grid_columnconfigure(1, weight=1)
         self.log_b_eye = scrolledtext.ScrolledText(log_frame, height=8, state='normal')
         self.log_b_eye.pack(fill='both', expand=True)
@@ -567,7 +583,8 @@ class VRMosaicOneClickApp:
                 lambda msg: self.log_to_widget(self.log_b_eye, msg),
                 _on_proc,
                 pre_extract=self.b_eye_pre_extract.get(),
-                source_scan=self.b_eye_source_scan.get()
+                source_scan=True,
+                fine_conf=self._selected_fine_conf(self.b_eye_fine_conf)
             )
         except Exception as e:
             self.log_to_widget(self.log_b_eye, f"Error: {e}")

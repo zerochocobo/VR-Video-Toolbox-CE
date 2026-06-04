@@ -34,15 +34,17 @@ class OneClickPreExtractTests(unittest.TestCase):
             base.write_bytes(b"not a real video, but enough for copy-through")
             logs: list[str] = []
 
-            with patch("utils.mosaic_prescan.scan_segments", return_value=[]):
+            with patch("utils.mosaic_prescan.scan_segments", return_value=[]) as scan_segments:
                 result = logic._run_pre_extract_branch(
                     str(base),
                     str(restored),
                     keep_intermediate=True,
                     log_callback=logs.append,
+                    fine_conf=0.5,
                 )
 
             self.assertEqual(result, logic.PreExtractResult.NO_MOSAIC)
+            self.assertEqual(scan_segments.call_args.kwargs["min_conf"], 0.5)
             self.assertEqual(restored.read_bytes(), base.read_bytes())
             self.assertTrue(any("skipping lada/jasna" in item for item in logs))
 
@@ -88,11 +90,33 @@ class OneClickPreExtractTests(unittest.TestCase):
                     None,
                     use_fisheye=False,
                     keep_intermediate=False,
+                    source_scan=False,
                 )
 
             self.assertFalse((Path(raw) / "clip_process.log").exists())
             self.assertFalse(detections.exists())
             self.assertFalse(intervals.exists())
+
+    def test_single_file_source_scan_defaults_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            video = Path(raw) / "clip.mp4"
+            video.write_bytes(b"video")
+
+            with (
+                patch.object(logic, "get_video_bitrate", return_value=1000000),
+                patch.object(logic, "_run_source_scan_branch", return_value=logic.PreExtractResult.NO_MOSAIC) as source_scan,
+                patch.object(logic, "_run_native_sbs_stream") as native_stream,
+            ):
+                logic.run_single_file_pipeline(
+                    str(video),
+                    None,
+                    None,
+                    use_fisheye=False,
+                    keep_intermediate=False,
+                )
+
+            source_scan.assert_called_once()
+            native_stream.assert_not_called()
 
     def test_scan_failure_falls_back_to_full_lada_in_wrapper(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

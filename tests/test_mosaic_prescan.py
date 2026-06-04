@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import types
 import unittest
 from unittest.mock import patch
 
@@ -9,6 +10,10 @@ from utils import mosaic_prescan
 
 
 class MosaicPrescanAggregationTests(unittest.TestCase):
+    def test_detector_imgsz_defaults_to_2048_for_large_sources(self) -> None:
+        with patch.object(mosaic_prescan, "_cfg", side_effect=lambda _key, default: default):
+            self.assertEqual(mosaic_prescan._resolve_detector_imgsz(4096, 4096), 2048)
+
     def test_extract_boxes_can_apply_fine_conf_filter(self) -> None:
         class ArrayLike:
             def __init__(self, data):
@@ -116,6 +121,62 @@ class MosaicPrescanAggregationTests(unittest.TestCase):
 
         self.assertEqual(len(aligned), 2)
         self.assertEqual([seg.seg_id for seg in aligned], [0, 1])
+
+    def test_source_keyframe_scan_uses_left_eye_original_size_without_scale(self) -> None:
+        class Stdout:
+            def __init__(self, frame: bytes):
+                self._chunks = [frame, b""]
+
+            def read(self, _n):
+                return self._chunks.pop(0)
+
+            def close(self):
+                pass
+
+        class Proc:
+            def __init__(self, frame: bytes):
+                self.stdout = Stdout(frame)
+                self.returncode = 0
+
+            def wait(self):
+                pass
+
+        class Detector:
+            def preprocess(self, frames):
+                return frames
+
+            def inference_and_postprocess(self, preprocessed, frames):
+                class Result:
+                    boxes = None
+                    orig_shape = (4, 4, 3)
+
+                return [Result() for _ in frames]
+
+        meta = VideoMetadata(path="source.mp4", width=8, height=4, duration=1.0, source_fps=30.0)
+        seen = {}
+
+        def fake_popen(cmd, **_kwargs):
+            seen["cmd"] = cmd
+            return Proc(bytes(4 * 4 * 3))
+
+        fake_torch = types.SimpleNamespace(from_numpy=lambda frame: frame)
+
+        with (
+            patch.dict("sys.modules", {"torch": fake_torch}),
+            patch("utils.keyframe_cutter.list_keyframes", return_value=[0.0]),
+            patch("utils.mosaic_prescan.probe.probe_video", return_value=meta),
+            patch("utils.mosaic_prescan.shutil.which", return_value="ffmpeg"),
+            patch("utils.mosaic_prescan.subprocess.Popen", side_effect=fake_popen),
+            patch("utils.mosaic_prescan._get_detector", return_value=Detector()) as get_detector,
+        ):
+            hits, out_meta, _debug = mosaic_prescan._scan_hits_keyframes_lowres("source.mp4")
+
+        self.assertEqual(hits, [])
+        self.assertEqual((out_meta.width, out_meta.height), (4, 4))
+        self.assertIn("crop=4:4:0:0", seen["cmd"])
+        self.assertNotIn("scale=4:4", seen["cmd"])
+        self.assertEqual(get_detector.call_args.kwargs["frame_w"], 4)
+        self.assertEqual(get_detector.call_args.kwargs["frame_h"], 4)
 
 
 if __name__ == "__main__":

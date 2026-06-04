@@ -35,6 +35,10 @@ dependencies = [
     "torchvision==0.23.0",
     "ultralytics==8.4.4",
     "mmengine==0.10.7",
+    # Depth Anything 3 vendored inference path for tool_2dvr.
+    "omegaconf>=2.3.0",
+    "einops>=0.8.0",
+    "safetensors>=0.4.5",
 ]
 
 [tool.uv]

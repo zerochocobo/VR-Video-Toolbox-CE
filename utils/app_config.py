@@ -45,9 +45,9 @@ _DEFAULTS = {
     'pre_extract_rect_align': 16,
     'pre_extract_rect_min_px': 512,
     'pre_extract_feather_px': 12,
-    'pre_extract_yolo_imgsz': 2048,
-    'pre_extract_yolo_conf': 0.50,
-    'pre_extract_fine_yolo_conf': 0.60,
+    'pre_extract_yolo_imgsz': 2048,  # Fixed YOLO input size to avoid original-size VRAM spikes.
+    'pre_extract_yolo_conf': 0.20,
+    'pre_extract_fine_yolo_conf': 0.50,
     'pre_extract_use_mask_boxes': True,
     'pre_extract_cluster_gap_ratio': 0.03,
     'pre_extract_outlier_center_factor': 3.0,
@@ -69,7 +69,7 @@ _DEFAULTS = {
     # OneClick source-scan: scan the source SBS first and process only time ranges containing mosaics.
     'source_scan_enabled': True,
     'source_scan_strategy': 'keyframes',
-    'source_scan_scale_max_px': 2048,
+    'source_scan_scale_max_px': 0,  # legacy; source keyframe scan now uses left-eye original size
     'source_scan_merge_gap_s': 30.0,
     'source_scan_min_segment_s': 30.0,
     'source_scan_head_tail_pad_s': 5.0,
@@ -78,8 +78,18 @@ _DEFAULTS = {
     'source_scan_final_merge_mode': 'auto',  # auto | fast | gpu
 }
 
+_CODE_DEFAULT_ONLY_PREFIXES = ('pre_extract', 'source_scan')
+
 # --- In-memory cache to avoid frequent IO ---
 _cache: dict = {}
+
+
+def _is_code_default_only_key(key: object) -> bool:
+    return str(key).startswith(_CODE_DEFAULT_ONLY_PREFIXES)
+
+
+def _strip_code_default_only(data: dict) -> dict:
+    return {key: value for key, value in data.items() if not _is_code_default_only_key(key)}
 
 
 def _load() -> dict:
@@ -90,7 +100,7 @@ def _load() -> dict:
         try:
             with open(_CONFIG_PATH, 'r', encoding='utf-8-sig') as f:
                 data = json.load(f)
-                _cache = {**_DEFAULTS, **data}
+                _cache = {**_DEFAULTS, **_strip_code_default_only(data)}
                 return _cache
         except Exception:
             pass
@@ -103,7 +113,7 @@ def _save(data: dict):
     _cache = data
     try:
         with open(_CONFIG_PATH, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(_strip_code_default_only(data), f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[app_config] Failed to save config: {e}")
 
@@ -173,10 +183,14 @@ def set_language(language: str):
 
 
 def get(key: str, default=None):
+    if _is_code_default_only_key(key):
+        return _DEFAULTS.get(key, default)
     return _load().get(key, default)
 
 
 def set(key: str, value):
+    if _is_code_default_only_key(key):
+        return
     data = _load()
     data[key] = value
     _save(data)

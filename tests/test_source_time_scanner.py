@@ -171,6 +171,23 @@ class SourceTimeScannerTests(unittest.TestCase):
         self.assertAlmostEqual(paired_left[0].start_s, 10.4)
         self.assertAlmostEqual(paired_right[0].end_s, 19.8)
 
+    def test_pair_eye_segments_reindexes_by_start_time_after_score_matching(self) -> None:
+        left = [
+            MosaicSegment(0, 100.0, 110.0, 100.0, 110.0, 100, 100, 512, 512, 0.95),
+            MosaicSegment(1, 10.0, 20.0, 10.0, 20.0, 0, 100, 512, 512, 0.80),
+        ]
+        right = [
+            MosaicSegment(0, 100.0, 110.0, 100.0, 110.0, 100, 100, 512, 512, 0.94),
+            MosaicSegment(1, 12.0, 18.0, 12.0, 18.0, 300, 100, 512, 512, 0.79),
+        ]
+
+        paired_left, paired_right = logic._pair_eye_segments_by_time(left, right)
+
+        self.assertEqual([seg.seg_id for seg in paired_left], [0, 1])
+        self.assertEqual([seg.seg_id for seg in paired_right], [0, 1])
+        self.assertEqual([seg.start_s for seg in paired_left], [12.0, 100.0])
+        self.assertEqual([seg.start_s for seg in paired_right], [12.0, 100.0])
+
     def test_pair_eye_segments_requires_spatial_overlap_inside_same_time_group(self) -> None:
         left = [
             MosaicSegment(0, 5.5, 175.2, 5.5, 175.2, 1072, 2288, 2208, 1808, 0.82),
@@ -220,12 +237,14 @@ class SourceTimeScannerTests(unittest.TestCase):
                     pre_extract_inner=True,
                     keep_intermediate=False,
                     keep_original_bitrate=False,
+                    fine_conf=0.5,
                 )
 
             self.assertEqual(result, logic.PreExtractResult.OK)
             paired.assert_called_once()
             self.assertEqual(paired.call_args.args[:2], (str(mosaic), str(restored)))
             self.assertTrue(paired.call_args.kwargs["use_fisheye"])
+            self.assertEqual(paired.call_args.kwargs["fine_conf"], 0.5)
             full_eye.assert_not_called()
             gpu_merge.assert_called_once()
             self.assertEqual(gpu_merge.call_args.args[:3], (str(src), str(final), timeline))
@@ -241,7 +260,7 @@ class SourceTimeScannerTests(unittest.TestCase):
             left = [MosaicSegment(0, 1.0, 4.0, 1.0, 4.0, 100, 200, 512, 512, 0.91)]
             right = [MosaicSegment(0, 1.1, 3.9, 1.1, 3.9, 140, 220, 512, 512, 0.90)]
             cfg = {
-                "pre_extract_fine_yolo_conf": 0.60,
+                "pre_extract_fine_yolo_conf": 0.40,
                 "pre_extract_pair_merge_gap_s": 0.75,
                 "pre_extract_keep_segments": False,
             }
@@ -249,7 +268,7 @@ class SourceTimeScannerTests(unittest.TestCase):
             with (
                 patch("utils.app_config.get", side_effect=lambda key, default=None: cfg.get(key, default)),
                 patch("gpu_engine.probe.probe_video", return_value=meta),
-                patch("utils.mosaic_prescan.scan_segments_gpu_transform", side_effect=[left, right]),
+                patch("utils.mosaic_prescan.scan_segments_gpu_transform", side_effect=[left, right]) as scan_gpu,
                 patch("gpu_engine.files.extract_transformed_rect_clip") as extract_rect,
                 patch("one_click.logic.process_lada") as process_lada,
                 patch("gpu_engine.files.paste_fisheye_eye_rects_to_sbs_gpu") as fish_patch,
@@ -263,15 +282,25 @@ class SourceTimeScannerTests(unittest.TestCase):
                     keep_intermediate=False,
                     original_bitrate=2000000,
                     keep_original_bitrate=True,
+                    fine_conf=0.6,
                 )
 
             self.assertEqual(result, logic.PreExtractResult.OK)
+            self.assertEqual([call.kwargs["min_conf"] for call in scan_gpu.call_args_list], [0.6, 0.6])
             self.assertEqual(extract_rect.call_count, 2)
             expected_rect_bitrate = int(2_000_000 * (512 * 512) / (4096 * 4096) * 2.0)
             for call in extract_rect.call_args_list:
                 self.assertIsNone(call.kwargs["cq"])
                 self.assertEqual(call.kwargs["bitrate_bps"], expected_rect_bitrate)
             self.assertEqual(process_lada.call_count, 2)
+            extract_names = [Path(call.args[1]).name for call in extract_rect.call_args_list]
+            self.assertEqual(
+                extract_names,
+                [
+                    "mosaic_seg000_L_fisheye.f00000033-00000117.r100_200_512x512.mp4",
+                    "mosaic_seg000_R_fisheye.f00000033-00000117.r140_220_512x512.mp4",
+                ],
+            )
             vr_projection.assert_not_called()
             paste_fallback.assert_not_called()
             fish_patch.assert_called_once()
@@ -283,6 +312,57 @@ class SourceTimeScannerTests(unittest.TestCase):
             self.assertFalse(any("_fisheye_sbs" in str(arg) for arg in fish_patch.call_args.args))
             self.assertFalse(fish_patch.call_args.kwargs["keep_audio"])
             self.assertEqual(fish_patch.call_args.kwargs["bitrate_bps"], 2000000)
+
+    def test_paired_pre_extract_uses_frame_key_cache_and_removes_orphans(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            base = root / "mosaic_seg000.mp4"
+            out = root / "mosaic_seg000.restored.mp4"
+            base.write_bytes(b"base")
+            meta = VideoMetadata(path=str(base), width=4096, height=4096, duration=20.0, source_fps=30.0, bitrate_bps=2000000)
+            left = [MosaicSegment(0, 1.0, 2.0, 1.0, 2.0, 100, 200, 512, 512, 0.91)]
+            right = [MosaicSegment(0, 1.0, 2.0, 1.0, 2.0, 140, 220, 512, 512, 0.90)]
+            expected_files = [
+                root / "mosaic_seg000_L.f00000030-00000060.r100_200_512x512.mp4",
+                root / "mosaic_seg000_L.f00000030-00000060.r100_200_512x512.restored.mp4",
+                root / "mosaic_seg000_R.f00000030-00000060.r140_220_512x512.mp4",
+                root / "mosaic_seg000_R.f00000030-00000060.r140_220_512x512.restored.mp4",
+            ]
+            for path in expected_files:
+                path.write_bytes(b"cache")
+            orphans = [
+                root / "mosaic_seg000_L.seg000.mp4",
+                root / "mosaic_seg000_R.seg000.restored.mp4",
+                root / "mosaic_seg000_L.f00000030-00000060.r999_999_16x16.mp4",
+            ]
+            for path in orphans:
+                path.write_bytes(b"old")
+
+            with (
+                patch("utils.app_config.get", side_effect=lambda key, default=None: default),
+                patch("gpu_engine.probe.probe_video", return_value=meta),
+                patch("utils.mosaic_prescan.scan_segments_gpu_transform", side_effect=[left, right]),
+                patch("gpu_engine.files.extract_transformed_rect_clip") as extract_rect,
+                patch("one_click.logic.process_lada") as process_lada,
+                patch("utils.segment_paster.paste_segments_gpu_or_fallback") as paste_fallback,
+            ):
+                result = logic._process_sbs_paired_pre_extract_clip(
+                    str(base),
+                    str(out),
+                    use_fisheye=False,
+                    keep_intermediate=True,
+                    original_bitrate=2000000,
+                    keep_original_bitrate=True,
+                )
+
+            self.assertEqual(result, logic.PreExtractResult.OK)
+            extract_rect.assert_not_called()
+            process_lada.assert_not_called()
+            paste_fallback.assert_called_once()
+            for path in expected_files:
+                self.assertTrue(path.exists(), path.name)
+            for path in orphans:
+                self.assertFalse(path.exists(), path.name)
 
     def test_source_scan_no_mosaic_skips_without_final_output(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

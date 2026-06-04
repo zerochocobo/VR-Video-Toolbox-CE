@@ -5,6 +5,7 @@ import threading
 import os
 import locale
 import time
+import sys
 from utils import app_config, i18n
 
 
@@ -22,6 +23,19 @@ except ImportError:
 
 def get_text(key):
     return i18n.translate('vr2flat', key)
+
+
+def _runtime_base_dir():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _preview_debug_path(filename="preview_flat.jpg"):
+    out_dir = os.path.join(_runtime_base_dir(), "debug_output", "tool_vr2flat")
+    os.makedirs(out_dir, exist_ok=True)
+    return os.path.join(out_dir, filename)
+
 
 class VRMosaicApp:
     def __init__(self, root, on_return=None):
@@ -353,7 +367,7 @@ class VRMosaicApp:
         path = self.loc_input.get()
         if not path: return
         try:
-            tmp = "preview_flat.jpg"
+            tmp = _preview_debug_path()
             flat_w = 0
             flat_h = 0
             if hasattr(self, 'video_info') and self.video_info and hasattr(self, 'sel_ratio_w'):

@@ -38,6 +38,7 @@ from area_selection_rect_crop import main as area_selection_rect_crop_main
 from tool_vr2flat import main as vr2flat_main
 from tool_split_combine import main as split_combine_main
 from tool_v360_trans import main as v360_trans_main
+from tool_2dvr import main as two_d_vr_main
 from tool_subtitle import gui as tool_subtitle_gui
 from tool_subembed import main as tool_subembed_main
 from tools import gui as tools_gui
@@ -45,7 +46,7 @@ import subprocess
 from tkinter import filedialog
 from tkinter import messagebox
 
-ver_name = "v1.0 alpha (build 2026-06-02)"
+ver_name = "v1.0 beta.1 (build 2026-06-04)"
 DLNA_SERVER_EXE_NAME = "vr_dlna_server.exe"
 
 
@@ -140,11 +141,132 @@ def terminate_packaged_dlna_server_instances():
     except Exception:
         return False
 
+
+def _iter_widget_tree(widget):
+    if widget is None:
+        return
+    try:
+        children = widget.winfo_children()
+    except Exception:
+        return
+    for child in children:
+        yield child
+        yield from _iter_widget_tree(child)
+
+
+def _widget_is_enabled(widget):
+    try:
+        if "disabled" in widget.state():
+            return False
+    except Exception:
+        pass
+    try:
+        return str(widget.cget("state")) != "disabled"
+    except Exception:
+        return True
+
+
+def _is_stop_button(widget):
+    if not isinstance(widget, (ttk.Button, tk.Button)):
+        return False
+    try:
+        text = str(widget.cget("text")).strip().lower()
+    except Exception:
+        return False
+    return "stop" in text or "停止" in text
+
+
+def _enabled_stop_buttons(app):
+    root = getattr(app, "root", None)
+    return [
+        widget
+        for widget in _iter_widget_tree(root)
+        if _is_stop_button(widget) and _widget_is_enabled(widget)
+    ]
+
+
+def _process_handle_is_running(handle):
+    if handle is None:
+        return False
+    poll = getattr(handle, "poll", None)
+    if callable(poll):
+        try:
+            return poll() is None
+        except Exception:
+            return True
+    if any(callable(getattr(handle, name, None)) for name in ("kill", "terminate", "cancel")):
+        return not bool(getattr(handle, "cancelled", False))
+    return False
+
+
+def _iter_process_handles(app):
+    for name, value in vars(app).items():
+        if value is None:
+            continue
+        if "proc" not in name and "process" not in name:
+            continue
+        if any(callable(getattr(value, method, None)) for method in ("kill", "terminate", "cancel")):
+            yield value
+
+
+def _app_has_running_tasks(app):
+    if app is None:
+        return False
+    custom = getattr(app, "has_running_tasks", None)
+    if callable(custom):
+        try:
+            return bool(custom())
+        except Exception:
+            pass
+    if _enabled_stop_buttons(app):
+        return True
+    return any(_process_handle_is_running(handle) for handle in _iter_process_handles(app))
+
+
+def _stop_process_handle(handle):
+    for method in ("kill", "terminate", "cancel"):
+        callback = getattr(handle, method, None)
+        if callable(callback):
+            try:
+                callback()
+                return True
+            except Exception:
+                pass
+    return False
+
+
+def _stop_app_running_tasks(app):
+    if app is None:
+        return False
+    custom = getattr(app, "stop_running_tasks", None)
+    if callable(custom):
+        try:
+            return bool(custom())
+        except Exception:
+            pass
+
+    stopped = False
+    for button in _enabled_stop_buttons(app):
+        if not _widget_is_enabled(button):
+            continue
+        try:
+            button.invoke()
+            stopped = True
+        except Exception:
+            pass
+
+    for handle in list(_iter_process_handles(app)):
+        if _process_handle_is_running(handle):
+            stopped = _stop_process_handle(handle) or stopped
+    return stopped
+
+
 class VRVideoToolboxLauncher:
     def __init__(self, root):
         self.root = root
         self.root.title(get_text('title'))
-        self.root.geometry("840x590")
+        self.root.geometry("840x620")
+        self.app = None
         self.dlna_process = None
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.create_widgets()
@@ -265,6 +387,7 @@ class VRVideoToolboxLauncher:
         ttk.Button(tools_frame, text=get_text('btn_split_combine'), style='Big.TButton', command=self.launch_split_combine).grid(row=1, column=1, sticky='ew', padx=4, pady=2)
         ttk.Button(tools_frame, text=get_text('btn_v360_trans'), style='Big.TButton', command=self.launch_v360_trans).grid(row=2, column=0, sticky='ew', padx=4, pady=2)
         ttk.Button(tools_frame, text=get_text('btn_tools'), style='Big.TButton', command=self.launch_tools).grid(row=2, column=1, sticky='ew', padx=4, pady=2)
+        ttk.Button(tools_frame, text=get_text('btn_2dvr'), style='Big.TButton', command=self.launch_2dvr).grid(row=3, column=0, columnspan=2, sticky='ew', padx=4, pady=2)
         
         tools_frame.columnconfigure(0, weight=1)
         tools_frame.columnconfigure(1, weight=1)
@@ -393,51 +516,55 @@ class VRVideoToolboxLauncher:
     def launch_one_click(self):
         self.clear_frame()
         # Initialize One-Click App
-        self.app = one_click_main.VRMosaicOneClickApp(self.root, on_return=self.show_launcher)
+        self.app = one_click_main.VRMosaicOneClickApp(self.root, on_return=self.request_show_launcher)
 
     def launch_area_selection(self):
         self.clear_frame()
         # Initialize Area Selection App
-        self.app = area_selection_main.VRMosaicApp(self.root, on_return=self.show_launcher)
+        self.app = area_selection_main.VRMosaicApp(self.root, on_return=self.request_show_launcher)
 
     def launch_area_selection_rect_crop(self):
         self.clear_frame()
         # Initialize Area Selection Rect Crop App
-        self.app = area_selection_rect_crop_main.VRMosaicApp(self.root, on_return=self.show_launcher)
+        self.app = area_selection_rect_crop_main.VRMosaicApp(self.root, on_return=self.request_show_launcher)
 
     def launch_vr2flat(self):
         self.clear_frame()
         # Initialize VR2Flat App
-        self.app = vr2flat_main.VRMosaicApp(self.root, on_return=self.show_launcher)
+        self.app = vr2flat_main.VRMosaicApp(self.root, on_return=self.request_show_launcher)
 
     def launch_split_combine(self):
         self.clear_frame()
         # Initialize Split/Combine App
-        self.app = split_combine_main.VRSplitCombineApp(self.root, on_return=self.show_launcher)
+        self.app = split_combine_main.VRSplitCombineApp(self.root, on_return=self.request_show_launcher)
 
     def launch_v360_trans(self):
         self.clear_frame()
         # Initialize V360 Trans App
-        self.app = v360_trans_main.VRTransApp(self.root, on_return=self.show_launcher)
+        self.app = v360_trans_main.VRTransApp(self.root, on_return=self.request_show_launcher)
+
+    def launch_2dvr(self):
+        self.clear_frame()
+        self.app = two_d_vr_main.TwoDToVRApp(self.root, on_return=self.request_show_launcher)
 
     def launch_tools(self):
         self.clear_frame()
         # Initialize Tools App
-        self.app = tools_gui.VRVideoToolsApp(self.root, on_return=self.show_launcher)
+        self.app = tools_gui.VRVideoToolsApp(self.root, on_return=self.request_show_launcher)
 
     def launch_tools_zoom(self):
         self.clear_frame()
         # Initialize Tools App and select Zoom tab (index 2)
-        self.app = tools_gui.VRVideoToolsApp(self.root, on_return=self.show_launcher)
+        self.app = tools_gui.VRVideoToolsApp(self.root, on_return=self.request_show_launcher)
         self.app.notebook.select(3)
         
     def launch_subtitle_tools(self):
         self.clear_frame()
-        self.app = tool_subtitle_gui.SubtitleToolsApp(self.root, on_return=self.show_launcher)
+        self.app = tool_subtitle_gui.SubtitleToolsApp(self.root, on_return=self.request_show_launcher)
 
     def launch_subembed_tools(self):
         self.clear_frame()
-        self.app = tool_subembed_main.VRSubtitleEmbedApp(self.root, on_return=self.show_launcher)
+        self.app = tool_subembed_main.VRSubtitleEmbedApp(self.root, on_return=self.request_show_launcher)
 
     def get_startupinfo(self):
         """Build STARTUPINFO to hide black command prompt windows on Windows."""
@@ -496,6 +623,8 @@ class VRVideoToolboxLauncher:
 
     def on_close(self):
         """Ensure the independent DLNA process is fully terminated upon exiting the launcher."""
+        if not self._confirm_stop_current_app_tasks():
+            return
         if is_packaged_mode():
             terminate_packaged_dlna_server_instances()
         elif self.dlna_process is not None:
@@ -630,8 +759,27 @@ class VRVideoToolboxLauncher:
         for widget in self.root.winfo_children():
             widget.destroy()
 
+    def _confirm_stop_current_app_tasks(self):
+        if not _app_has_running_tasks(self.app):
+            return True
+        ok = messagebox.askyesno(
+            get_text('confirm_running_title'),
+            get_text('confirm_running_message'),
+            parent=self.root,
+        )
+        if not ok:
+            return False
+        _stop_app_running_tasks(self.app)
+        return True
+
+    def request_show_launcher(self):
+        if not self._confirm_stop_current_app_tasks():
+            return
+        self.show_launcher()
+
     def show_launcher(self):
         self.clear_frame()
+        self.app = None
         # Clear any menu bar set by sub-apps
         empty_menu = tk.Menu(self.root)
         self.root.config(menu=empty_menu)
