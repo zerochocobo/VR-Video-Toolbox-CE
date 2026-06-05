@@ -176,6 +176,49 @@ def _build_passthrough_plan(segments: list[PasteSeg],
     return [part for part in plan if part.end_frame > part.start_frame]
 
 
+def _probe_video_frame_count(path: str | Path) -> int | None:
+    """Return the exact frame count of a video file via ffprobe.
+
+    `-c copy` cuts almost always overshoot the requested duration because
+    stream-copy can only end on a GOP boundary. Cutting one passthrough subsegment
+    and then asking the next paste subsegment to encode "from frame N" will then
+    re-encode source frames the passthrough already delivered, producing duplicate
+    frames and time drift. The passthrough loop probes the actual frame count so
+    the next subsegment can resume from the real cursor.
+    """
+    ffprobe = shutil.which("ffprobe") or "ffprobe"
+    try:
+        # Stream header read first (fast path); count_frames decodes the file
+        # only when header field is unset.
+        result = subprocess.run(
+            [
+                ffprobe, "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=nb_frames",
+                "-of", "default=nokey=1:noprint_wrappers=1",
+                str(path),
+            ],
+            capture_output=True, text=True, check=True, **_hidden_kwargs(),
+        )
+        value = result.stdout.strip()
+        if value and value != "N/A":
+            return int(value)
+        result = subprocess.run(
+            [
+                ffprobe, "-v", "error", "-count_frames", "-select_streams", "v:0",
+                "-show_entries", "stream=nb_read_frames",
+                "-of", "default=nokey=1:noprint_wrappers=1",
+                str(path),
+            ],
+            capture_output=True, text=True, check=True, **_hidden_kwargs(),
+        )
+        value = result.stdout.strip()
+        if value and value != "N/A":
+            return int(value)
+    except (subprocess.CalledProcessError, ValueError):
+        return None
+    return None
+
+
 def _overlapping_paste_segments(segments: list[PasteSeg], start_frame: int, end_frame: int) -> list[PasteSeg]:
     start = int(start_frame)
     end = int(end_frame)
@@ -242,12 +285,38 @@ def _try_paste_segments_gpu_passthrough(base_path: str | Path, restored_path: st
         from gpu_engine import files as gpu_files
         from utils.keyframe_cutter import TimelineEntry
 
+        # Source-frame cursor walked by every part. Stream-copy passthrough cuts
+        # almost always overshoot the requested duration by 1-N frames because
+        # `-c copy` only ends at GOP boundaries; that previously caused the next
+        # paste subsegment to re-encode source frames the passthrough already
+        # delivered, producing duplicate frames and timeline drift. Tracking the
+        # actual frame count consumed by each passthrough lets the following
+        # paste subsegment start from the correct source frame, keeping the
+        # concat seamless and the final duration exactly equal to the source.
+        source_cursor = 0
         for idx, part in enumerate(plan):
-            start_s = float(part.start_frame) / fps
-            end_s = float(part.end_frame) / fps
+            expected_start = int(part.start_frame)
+            expected_end = int(part.end_frame)
+            actual_start = source_cursor
+            if actual_start >= expected_end:
+                if log_callback:
+                    log_callback(
+                        f"[pre-extract] paste passthrough part {idx}/{part.kind} "
+                        f"skipped: already consumed past expected end "
+                        f"(cursor={actual_start}, expected_end={expected_end})"
+                    )
+                continue
+            if actual_start != expected_start and log_callback:
+                log_callback(
+                    f"[pre-extract] paste passthrough part {idx}/{part.kind}: "
+                    f"start adjusted {expected_start} -> {actual_start} "
+                    f"(previous part overshoot by {actual_start - expected_start})"
+                )
+            start_s = float(actual_start) / fps
+            end_s = float(expected_end) / fps
             part_path = temp_dir / (
                 f"{restored_path.stem}.{idx:04d}.{part.kind}."
-                f"f{part.start_frame:08d}-{part.end_frame:08d}.mp4"
+                f"f{actual_start:08d}-{expected_end:08d}.mp4"
             )
             if part.kind == "passthrough":
                 keyframe_cutter._cut_copy(
@@ -258,12 +327,24 @@ def _try_paste_segments_gpu_passthrough(base_path: str | Path, restored_path: st
                     log_callback=log_callback,
                     process_callback=process_callback,
                 )
+                actual_frame_count = _probe_video_frame_count(part_path)
+                if actual_frame_count is None:
+                    raise RuntimeError(f"failed to probe passthrough cut: {part_path}")
+                actual_end = actual_start + actual_frame_count
+                if actual_end != expected_end and log_callback:
+                    log_callback(
+                        f"[pre-extract] paste passthrough part {idx}: "
+                        f"requested frames {actual_start}-{expected_end} "
+                        f"({expected_end - actual_start}), got {actual_frame_count} "
+                        f"(end shifted to {actual_end})"
+                    )
+                source_cursor = actual_end
                 kind = "gap"
             else:
-                active = _overlapping_paste_segments(paste_segments, part.start_frame, part.end_frame)
+                active = _overlapping_paste_segments(paste_segments, actual_start, expected_end)
                 if not active:
                     raise RuntimeError(
-                        f"paste subsegment has no active rects: {part.start_frame}-{part.end_frame}"
+                        f"paste subsegment has no active rects: {actual_start}-{expected_end}"
                     )
                 token = gpu_files.CancelToken()
                 if process_callback:
@@ -274,11 +355,12 @@ def _try_paste_segments_gpu_passthrough(base_path: str | Path, restored_path: st
                     active,
                     keep_audio=False,
                     bitrate_bps=bitrate_bps,
-                    start_frame=part.start_frame,
-                    end_frame=part.end_frame,
+                    start_frame=actual_start,
+                    end_frame=expected_end,
                     log_callback=log_callback,
                     cancel_token=token,
                 )
+                source_cursor = expected_end
                 kind = "mosaic"
             timeline.append(TimelineEntry(start_s, end_s, part_path, kind))
 

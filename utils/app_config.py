@@ -69,7 +69,7 @@ _DEFAULTS = {
     'pre_extract_pair_min_spatial_overlap': 0.05,
     'pre_extract_pair_keep_unmatched_conf': 0.60,
     'pre_extract_extract_group_max': 8,
-    'pre_extract_pipeline_enabled': True,
+    'pre_extract_pipeline_enabled': False,  # P9 producer-consumer: BROKEN — concurrent NVDEC (extract thread + restore in main) corrupts seek state on subsequent groups, returning content from the prior keyframe (~5s earlier). Default False until per-decoder CUDA-context isolation is added.
     'pre_extract_save_detection_debug': True,
     'pre_extract_keep_segments': False,
     'pre_extract_inject_keyframes': 'auto',
