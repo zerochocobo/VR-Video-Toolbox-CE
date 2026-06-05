@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from one_click import logic
@@ -40,6 +42,27 @@ class EngineRunnerTests(unittest.TestCase):
 
         cmd = run_process.call_args.args[0]
         self.assertEqual(cmd[cmd.index("--encoder-options") + 1], " -cq 18 -preset p5")
+
+    def test_process_lada_native_raw_restore_returns_hevc_path(self) -> None:
+        app_config._cache = {
+            "engine": "native_gpu",
+        }
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            out = root / "seg.restored.mp4"
+            raw_out = root / "seg.restored.hevc"
+
+            def fake_restore(_input, output, **kwargs):
+                self.assertFalse(kwargs["produce_mp4"])
+                self.assertEqual(output, str(out))
+                raw_out.write_bytes(b"hevc")
+                return True
+
+            with patch("gpu_engine.native_mosaic.restore_file", side_effect=fake_restore):
+                actual = logic.process_lada("in.mp4", str(out), produce_mp4=False)
+
+        self.assertEqual(actual, str(raw_out))
 
 
 if __name__ == "__main__":

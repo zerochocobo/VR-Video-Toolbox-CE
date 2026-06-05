@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from . import probe, mux, runtime
+from . import probe, mux, restored_sidecar, runtime
 from . import v360_lut, nv12_kernels
 from .fallback import OperationCancelled
 from .pynv_io import (
@@ -55,15 +55,20 @@ class _Progress:
     """Throttled progress reporter that logs ffmpeg -stats-like progress/FPS/ETA to log_callback.
 
     A silent per-frame GPU loop makes long videos look stalled, so this reports a
-    progress line periodically, once per second by default.
+    progress line periodically, rate-limited by time and percentage deltas.
     """
 
-    def __init__(self, total: int, log_callback, min_interval: float = 1.0,
-                 window_sec: float = 60.0):
+    def __init__(self, total: int, log_callback, min_interval: float | None = None,
+                 min_pct: float | None = None, window_sec: float = 60.0):
         from collections import deque
         self.total = max(0, int(total))
         self.log = log_callback
-        self.min_interval = float(min_interval)
+        if min_interval is None:
+            min_interval = _cfg("progress_log_interval_s", 5.0)
+        if min_pct is None:
+            min_pct = _cfg("progress_log_min_pct", 5.0)
+        self.min_interval = max(0.0, float(min_interval))
+        self.min_pct = max(0.0, float(min_pct))
         # Use the rolling rate over the most recent window_sec seconds for fps/ETA
         # instead of a cumulative average. Otherwise, one-time startup costs before
         # the first frame, such as pipeline construction and cudnn autotune, can
@@ -74,6 +79,7 @@ class _Progress:
         self.window_sec = float(window_sec)
         self.t0 = time.perf_counter()
         self._last = 0.0
+        self._last_pct = 0.0
         self._samples = deque()  # (t, done)
 
     @staticmethod
@@ -91,9 +97,13 @@ class _Progress:
         if not self.log:
             return
         now = time.perf_counter()
-        if not force and (now - self._last) < self.min_interval:
+        pct = (100.0 * done / self.total) if self.total else 0.0
+        time_due = (now - self._last) >= self.min_interval
+        pct_due = (pct - self._last_pct) >= self.min_pct
+        if not force and not (time_due or pct_due):
             return
         self._last = now
+        self._last_pct = pct
         el = now - self.t0
         # Rolling-window rate: keep the earliest sample still inside window_sec and measure from it to now.
         self._samples.append((now, done))
@@ -106,7 +116,6 @@ class _Progress:
             fps = dn / dt
         else:
             fps = done / el if el > 0 else 0.0  # Not enough warmup samples yet; fall back to cumulative speed.
-        pct = (100.0 * done / self.total) if self.total else 0.0
         eta = ((self.total - done) / fps) if fps > 0 else 0.0
         self.log(f"[GPU] {done}/{self.total} ({pct:.1f}%) | {fps:.1f} fps | "
                  f"elapsed {self._fmt(el)} | ETA {self._fmt(eta)}")
@@ -763,6 +772,8 @@ def paste_segments_gpu(
     bitrate_bps: int | None = None,
     keep_audio: bool = True,
     feather_px: int | None = None,
+    start_frame: int | None = None,
+    end_frame: int | None = None,
     log_callback=None,
     cancel_token: "CancelToken | None" = None,
 ) -> Path:
@@ -783,16 +794,24 @@ def paste_segments_gpu(
     if not decision.is_gpu:
         raise RuntimeError(f"base video is not GPU-paste eligible: {decision.reason}")
     bd = 10 if meta.bit_depth > 8 else 8
-    base_dec = PyNvThreadedSerialDecoder(base_src, bit_depth=bd)
+    frame_start_hint = max(0, int(start_frame or 0))
+    base_dec = PyNvThreadedSerialDecoder(base_src, bit_depth=bd, start_frame=frame_start_hint)
     info = base_dec.info
     fps = meta.source_fps or info.fps or 30.0
     total = len(base_dec)
+    frame_start = min(total, frame_start_hint)
+    frame_end = total if end_frame is None else max(frame_start, min(total, int(end_frame)))
+    frame_total = max(0, frame_end - frame_start)
+    if frame_total <= 0:
+        base_dec.stop()
+        raise ValueError(f"paste frame range is empty: {frame_start}-{frame_end} of {total}")
     feather = int(feather_px if feather_px is not None else _cfg("pre_extract_feather_px", 12) or 12)
 
-    def _open_state(seg):
-        seg_meta = probe.probe_video(seg.path)
+    def _open_state(seg, at_frame: int):
+        seg_meta = restored_sidecar.metadata_from_sidecar(seg.path) or probe.probe_video(seg.path)
         seg_bd = 10 if seg_meta.bit_depth > 8 else 8
-        dec = PyNvThreadedSerialDecoder(seg.path, bit_depth=seg_bd)
+        seg_start_frame = max(0, int(at_frame) - int(seg.base_frame_start))
+        dec = PyNvThreadedSerialDecoder(seg.path, bit_depth=seg_bd, start_frame=seg_start_frame)
         if int(seg.x) < 0 or int(seg.y) < 0 or int(seg.x + seg.w) > info.width or int(seg.y + seg.h) > info.height:
             dec.stop()
             raise ValueError(f"segment {seg.seg_id} rect out of bounds: {(seg.x, seg.y, seg.w, seg.h)} for {info.width}x{info.height}")
@@ -804,7 +823,7 @@ def paste_segments_gpu(
             "seg": seg,
             "dec": dec,
             "bd": seg_bd,
-            "frames": len(dec),
+            "frames": restored_sidecar.frame_count_from_sidecar(seg.path) or len(dec),
             "alpha_y": _make_alpha_mask(int(seg.w), int(seg.h), feather),
             "alpha_c": _make_alpha_mask(int(seg.w) // 2, int(seg.h) // 2, chroma_feather),
         }
@@ -823,11 +842,11 @@ def paste_segments_gpu(
     active: list[dict] = []
     done = 0
     cancelled = False
-    prog = _Progress(total, log_callback)
+    prog = _Progress(frame_total, log_callback)
     try:
         with open(raw, "wb") as f:
             sink = _EncodeSink(enc, f)
-            for i in range(total):
+            for i in range(frame_start, frame_end):
                 if cancel_token is not None and cancel_token.cancelled:
                     cancelled = True
                     break
@@ -837,7 +856,7 @@ def paste_segments_gpu(
                     next_idx += 1
                     if int(seg.base_frame_end) <= i:
                         continue
-                    state = _open_state(seg)
+                    state = _open_state(seg, i)
                     active.append(state)
                     if log_callback:
                         log_callback(f"[pre-extract] paste segment {seg.seg_id}: frames {seg.base_frame_start}-{seg.base_frame_end}, rect {seg.x},{seg.y},{seg.w}x{seg.h}")
@@ -889,7 +908,7 @@ def paste_segments_gpu(
                     ruv[:] = cp.rint(a_c * suv.astype(cp.float32) + (1.0 - a_c) * ruv.astype(cp.float32)).astype(uv.dtype)
 
                 app = _pack_planes(y, uv, bd)
-                sink.feed(app, force_idr=(i == 0))
+                sink.feed(app, force_idr=(i == frame_start))
                 done += 1
                 prog.update(done)
             if not cancelled:
@@ -918,7 +937,7 @@ def paste_segments_gpu(
         dst,
         fps=fps,
         color=meta.color,
-        audio_source=str(base_src) if keep_audio else None,
+        audio_source=str(base_src) if keep_audio and frame_start == 0 and frame_end == total else None,
         log_callback=log_callback,
     )
     try:
@@ -987,7 +1006,7 @@ def paste_fisheye_eye_rects_to_sbs_gpu(
     lut_f2h_c = v360_lut.make_lut("fisheye2heq", eye_cw, eye_ch, fov)
 
     def _open_state(seg):
-        seg_meta = probe.probe_video(seg.path)
+        seg_meta = restored_sidecar.metadata_from_sidecar(seg.path) or probe.probe_video(seg.path)
         seg_bd = 10 if seg_meta.bit_depth > 8 else 8
         dec = PyNvThreadedSerialDecoder(seg.path, bit_depth=seg_bd)
         sx = int(seg.x)
@@ -1019,7 +1038,7 @@ def paste_fisheye_eye_rects_to_sbs_gpu(
             "seg": seg,
             "dec": dec,
             "bd": seg_bd,
-            "frames": len(dec),
+            "frames": restored_sidecar.frame_count_from_sidecar(seg.path) or len(dec),
             "side": side,
             "x": local_x,
             "y": sy,
@@ -1286,9 +1305,11 @@ def replace_timeline_segments_gpu(
     raw = _media_temp_path(dst, "timeline")
 
     def _open_state(item):
-        seg_meta, seg_decision = probe.route(item["path"])
-        if not seg_decision.is_gpu:
-            raise RuntimeError(f"restored segment is not GPU timeline eligible: {seg_decision.reason}")
+        seg_meta = restored_sidecar.metadata_from_sidecar(item["path"])
+        if seg_meta is None:
+            seg_meta, seg_decision = probe.route(item["path"])
+            if not seg_decision.is_gpu:
+                raise RuntimeError(f"restored segment is not GPU timeline eligible: {seg_decision.reason}")
         seg_bd = 10 if seg_meta.bit_depth > 8 else 8
         dec = PyNvThreadedSerialDecoder(item["path"], bit_depth=seg_bd)
         seg_info = dec.info
@@ -1298,7 +1319,13 @@ def replace_timeline_segments_gpu(
                 f"restored segment size mismatch: {item['path']} is {seg_info.width}x{seg_info.height}, "
                 f"expected {info.width}x{info.height}"
             )
-        return {**item, "dec": dec, "bd": seg_bd, "frames": len(dec), "warned_short": False}
+        return {
+            **item,
+            "dec": dec,
+            "bd": seg_bd,
+            "frames": restored_sidecar.frame_count_from_sidecar(item["path"]) or len(dec),
+            "warned_short": False,
+        }
 
     next_idx = 0
     active: list[dict] = []
@@ -1621,3 +1648,209 @@ def extract_transformed_rect_clip(
     except OSError:
         pass
     return dst
+
+
+def extract_multi_rect_clip(
+    src: str | Path,
+    tasks: list[dict],
+    *,
+    to_fisheye: bool = False,
+    fov: float = 180.0,
+    start_sec: float | None = None,
+    end_sec: float | None = None,
+    keep_audio: bool = False,
+    log_callback=None,
+    cancel_token: "CancelToken | None" = None,
+) -> list[Path]:
+    """Decode one time window once and write multiple transformed rect clips.
+
+    Each task must provide ``dst``, ``crop_mode`` and ``rect``. Optional
+    ``bitrate_bps`` is applied per task so differently sized rects keep the
+    caller's bitrate contract.
+    """
+    import cupy as cp
+
+    if not tasks:
+        return []
+    src = Path(src)
+    meta = probe.probe_video(src)
+    bd = 10 if meta.bit_depth > 8 else 8
+    fps = meta.source_fps or 30.0
+    start_idx = int(round(start_sec * fps)) if start_sec else 0
+    dec = PyNvThreadedSerialDecoder(src, bit_depth=bd, start_frame=start_idx)
+    states: list[dict] = []
+    raws_to_cleanup: list[Path] = []
+    dsts_to_cleanup: list[Path] = []
+    try:
+        info = dec.info
+        fps = meta.source_fps or info.fps or 30.0
+        end_idx = int(round(end_sec * fps)) if end_sec else len(dec)
+        end_idx = min(end_idx, len(dec))
+
+        crop_specs: dict[str | None, dict] = {}
+
+        def _crop_spec(mode: str | None) -> dict:
+            key = mode or None
+            cached = crop_specs.get(key)
+            if cached is not None:
+                return cached
+            if mode:
+                x, yy, eye_w, eye_h = _crop_region(mode, info.width, info.height)
+            else:
+                x = yy = 0
+                eye_w, eye_h = info.width, info.height
+            spec = {
+                "mode": key,
+                "x": x,
+                "y": yy,
+                "w": eye_w,
+                "h": eye_h,
+                "lut_y": v360_lut.make_lut("heq2fisheye", eye_w, eye_h, fov) if to_fisheye else None,
+                "lut_c": v360_lut.make_lut("heq2fisheye", eye_w // 2, eye_h // 2, fov) if to_fisheye else None,
+            }
+            crop_specs[key] = spec
+            return spec
+
+        for idx, task in enumerate(tasks):
+            dst = Path(task["dst"])
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            crop_mode = task.get("crop_mode") or None
+            spec = _crop_spec(crop_mode)
+            rx, ry, rw, rh = [int(v) for v in task["rect"]]
+            if rw <= 0 or rh <= 0:
+                raise ValueError(f"rect must be positive: {task['rect']}")
+            rx -= rx % 2
+            ry -= ry % 2
+            rw -= rw % 2
+            rh -= rh % 2
+            eye_w, eye_h = int(spec["w"]), int(spec["h"])
+            rx = max(0, min(rx, max(0, eye_w - 2)))
+            ry = max(0, min(ry, max(0, eye_h - 2)))
+            rw = max(2, min(rw, eye_w - rx))
+            rh = max(2, min(rh, eye_h - ry))
+            rw -= rw % 2
+            rh -= rh % 2
+            bitrate_bps = _resolve_bitrate(rw, rh, fps, task.get("bitrate_bps"), meta.bitrate_bps)
+            enc_kwargs = _encoder_kwargs(meta, bitrate_bps)
+            label = str(task.get("label") or dst.name)
+            _log_encoder_settings(f"extract multi rect {label}", rw, rh, bd, enc_kwargs, log_callback)
+            enc = PyNvEncoderSession(rw, rh, bit_depth=bd, codec="hevc", **enc_kwargs)
+            raw = _media_temp_path(dst, f"multi{idx}")
+            fobj = open(raw, "wb")
+            raws_to_cleanup.append(raw)
+            dsts_to_cleanup.append(dst)
+            states.append({
+                "task": task,
+                "dst": dst,
+                "raw": raw,
+                "f": fobj,
+                "sink": _EncodeSink(enc, fobj),
+                "crop_mode": crop_mode,
+                "rect": (rx, ry, rw, rh),
+                "written": 0,
+            })
+
+        if log_callback:
+            log_callback(
+                f"[gpu] extract multi-rect group: src={src}, tasks={len(states)}, "
+                f"sec={start_sec}-{end_sec}, frames={start_idx}-{end_idx}, to_fisheye={to_fisheye}"
+            )
+
+        cancelled = False
+        written_frames = 0
+        prog = _Progress(end_idx - start_idx, log_callback)
+        for i in range(start_idx, end_idx):
+            if cancel_token is not None and cancel_token.cancelled:
+                cancelled = True
+                break
+            frame = dec.frame_at(i)
+            cp.cuda.Device().synchronize()
+            y_full, uv_full = frame.y_uv_cupy()
+            eye_cache: dict[str | None, tuple] = {}
+            for state in states:
+                crop_mode = state["crop_mode"]
+                if crop_mode not in eye_cache:
+                    spec = _crop_spec(crop_mode)
+                    x = int(spec["x"])
+                    yy = int(spec["y"])
+                    eye_w = int(spec["w"])
+                    eye_h = int(spec["h"])
+                    y_eye = y_full[yy:yy + eye_h, x:x + eye_w]
+                    uv_eye = uv_full[yy // 2:(yy + eye_h) // 2, x // 2:(x + eye_w) // 2, :]
+                    if to_fisheye:
+                        y_eye = nv12_kernels.remap_y(y_eye, spec["lut_y"], eye_w, eye_h)
+                        uv_eye = nv12_kernels.remap_uv(uv_eye, spec["lut_c"], eye_w // 2, eye_h // 2)
+                    eye_cache[crop_mode] = (y_eye, uv_eye)
+                y_eye, uv_eye = eye_cache[crop_mode]
+                rx, ry, rw, rh = state["rect"]
+                y = y_eye[ry:ry + rh, rx:rx + rw]
+                uv = uv_eye[ry // 2:(ry + rh) // 2, rx // 2:(rx + rw) // 2, :]
+                app = _pack_planes(y, uv, bd)
+                state["sink"].feed(app, force_idr=(state["written"] == 0))
+                state["written"] += 1
+            written_frames += 1
+            prog.update(written_frames)
+        if not cancelled:
+            prog.finish(written_frames)
+            for state in states:
+                state["sink"].flush()
+        if cancelled:
+            raise OperationCancelled("cancelled by user")
+    except Exception:
+        for state in states:
+            try:
+                state["f"].close()
+            except Exception:
+                pass
+        for raw in raws_to_cleanup:
+            try:
+                raw.unlink()
+            except OSError:
+                pass
+        for dst in dsts_to_cleanup:
+            try:
+                dst.unlink()
+            except OSError:
+                pass
+        raise
+    finally:
+        for state in states:
+            try:
+                state["f"].close()
+            except Exception:
+                pass
+        dec.stop()
+        runtime.free_memory_pool()
+
+    audio_start = start_sec if start_sec else None
+    audio_dur = (end_sec - (start_sec or 0.0)) if end_sec else None
+    outs: list[Path] = []
+    try:
+        for state in states:
+            mux.mux_hevc_with_audio(
+                state["raw"],
+                state["dst"],
+                fps=fps,
+                color=meta.color,
+                audio_source=str(src) if keep_audio else None,
+                audio_start_sec=audio_start,
+                audio_duration=audio_dur,
+                log_callback=log_callback,
+            )
+            try:
+                state["raw"].unlink()
+            except OSError:
+                pass
+            outs.append(state["dst"])
+    except Exception:
+        for state in states:
+            try:
+                state["raw"].unlink()
+            except OSError:
+                pass
+            try:
+                state["dst"].unlink()
+            except OSError:
+                pass
+        raise
+    return outs

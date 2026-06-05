@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from gpu_engine.fallback import OperationCancelled
 from gpu_engine.probe import ColorMetadata, VideoMetadata
 from utils.keyframe_cutter import TimelineEntry
 from utils import sbs_concat
@@ -180,6 +182,7 @@ class SbsConcatTests(unittest.TestCase):
             with (
                 patch("utils.sbs_concat.shutil.which", return_value="ffmpeg"),
                 patch("utils.sbs_concat.probe.probe_video", side_effect=fake_probe),
+                patch("utils.sbs_concat._concat_timeline_hevc_demuxer", side_effect=RuntimeError("demuxer disabled")),
                 patch("utils.sbs_concat._run", side_effect=fake_run),
                 patch("gpu_engine.mux.mux_hevc_with_audio", side_effect=fake_mux) as mux,
             ):
@@ -198,6 +201,130 @@ class SbsConcatTests(unittest.TestCase):
             mux.assert_called_once()
             self.assertEqual(mux.call_args.args[1], output)
             self.assertEqual(mux.call_args.kwargs["audio_source"], str(source))
+
+    def test_extract_entry_hevc_direct_copies_raw_hevc(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "seg.restored.hevc"
+            output = root / "part.hevc"
+            source.write_bytes(b"raw-hevc")
+            entry = TimelineEntry(0.0, 1.0, source, "mosaic", 0.9)
+
+            with patch("utils.sbs_concat._run") as run_cmd:
+                sbs_concat._extract_entry_hevc(entry, output)
+
+            run_cmd.assert_not_called()
+            self.assertEqual(output.read_bytes(), b"raw-hevc")
+
+    def test_fast_hevc_merge_uses_demuxer_before_annexb_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source.mp4"
+            restored = root / "mosaic_seg000.restored.mp4"
+            output = root / "out.mp4"
+            source.write_bytes(b"source")
+            restored.write_bytes(b"restored")
+            timeline = [
+                TimelineEntry(0.0, 10.0, source, "gap", inpoint_s=0.0, outpoint_s=10.0),
+                TimelineEntry(10.0, 20.0, restored, "mosaic", 0.9),
+            ]
+            commands: list[list[str]] = []
+
+            def fake_run(cmd, **_kwargs):
+                commands.append(cmd)
+                Path(cmd[-1]).write_bytes(b"concat-video")
+
+            def fake_probe(path):
+                return _meta(Path(path), width=4096, height=4096)
+
+            def fake_mux(video_mp4, out_path, audio_source, **_kwargs):
+                self.assertTrue(Path(video_mp4).exists())
+                self.assertEqual(Path(audio_source), source)
+                Path(out_path).write_bytes(b"muxed")
+
+            with (
+                patch("utils.sbs_concat.shutil.which", return_value="ffmpeg"),
+                patch("utils.sbs_concat.probe.probe_video", side_effect=fake_probe),
+                patch("utils.sbs_concat._run", side_effect=fake_run),
+                patch("utils.sbs_concat._mux_mp4_video_with_source_audio", side_effect=fake_mux) as mux_audio,
+                patch("gpu_engine.mux.mux_hevc_with_audio") as mux_raw,
+            ):
+                sbs_concat.concat_timeline_hevc_fast(
+                    timeline,
+                    output,
+                    source_src=source,
+                    audio_source=source,
+                )
+
+            self.assertEqual(len(commands), 1)
+            self.assertIn("-f", commands[0])
+            self.assertIn("concat", commands[0])
+            self.assertNotIn("hevc_mp4toannexb", commands[0])
+            mux_audio.assert_called_once()
+            mux_raw.assert_not_called()
+
+    def test_fast_hevc_merge_falls_back_to_annexb_when_demuxer_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source.mp4"
+            restored = root / "mosaic_seg000.restored.mp4"
+            output = root / "out.mp4"
+            source.write_bytes(b"source")
+            restored.write_bytes(b"restored")
+            timeline = [
+                TimelineEntry(0.0, 10.0, source, "gap", inpoint_s=0.0, outpoint_s=10.0),
+                TimelineEntry(10.0, 20.0, restored, "mosaic", 0.9),
+            ]
+            commands: list[list[str]] = []
+
+            def fake_run(cmd, **_kwargs):
+                commands.append(cmd)
+                if len(commands) == 1:
+                    raise RuntimeError("concat failed")
+                Path(cmd[-1]).write_bytes(b"hevc-part")
+
+            def fake_probe(path):
+                return _meta(Path(path), width=4096, height=4096)
+
+            def fake_mux(raw_hevc, out_path, **_kwargs):
+                self.assertTrue(Path(raw_hevc).exists())
+                Path(out_path).write_bytes(b"muxed")
+
+            with (
+                patch("utils.sbs_concat.shutil.which", return_value="ffmpeg"),
+                patch("utils.sbs_concat.probe.probe_video", side_effect=fake_probe),
+                patch("utils.sbs_concat._run", side_effect=fake_run),
+                patch("gpu_engine.mux.mux_hevc_with_audio", side_effect=fake_mux) as mux_raw,
+            ):
+                sbs_concat.concat_timeline_hevc_fast(
+                    timeline,
+                    output,
+                    source_src=source,
+                    audio_source=source,
+                )
+
+            self.assertEqual(len(commands), 3)
+            self.assertIn("concat", commands[0])
+            self.assertIn("hevc_mp4toannexb", commands[1])
+            self.assertIn("hevc_mp4toannexb", commands[2])
+            mux_raw.assert_called_once()
+
+    def test_run_reports_cancelled_process_as_operation_cancelled(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            output = root / "out.txt"
+            cmd = [
+                sys.executable,
+                "-c",
+                "import time; time.sleep(10)",
+            ]
+
+            def cancel(proc):
+                proc.kill()
+
+            with self.assertRaises(OperationCancelled):
+                sbs_concat._run(cmd, process_callback=cancel, label="cancel probe")
+            self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

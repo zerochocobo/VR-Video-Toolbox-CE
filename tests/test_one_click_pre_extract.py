@@ -135,7 +135,13 @@ class OneClickPreExtractTests(unittest.TestCase):
                 )
 
             self.assertEqual(result, logic.PreExtractResult.OK)
-            process_lada.assert_called_once_with(str(base), str(restored), log_callback=None, process_callback=None)
+            process_lada.assert_called_once_with(
+                str(base),
+                str(restored),
+                log_callback=None,
+                process_callback=None,
+                bitrate_bps=None,
+            )
 
 
 if __name__ == "__main__":

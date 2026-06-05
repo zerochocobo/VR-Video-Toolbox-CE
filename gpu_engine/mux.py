@@ -18,6 +18,7 @@ from .probe import ColorMetadata
 _PRIMARIES_CODE = {"bt709": 1, "unspecified": 2, "bt470bg": 5, "smpte170m": 6, "bt2020": 9}
 _TRANSFER_CODE = {"bt709": 1, "unspecified": 2, "smpte170m": 6, "smpte2084": 16, "arib-std-b67": 18}
 _MATRIX_CODE = {"bt709": 1, "unspecified": 2, "bt470bg": 5, "smpte170m": 6, "bt2020nc": 9, "bt2020_ncl": 9}
+_FASTSTART_AUTO_DISABLE_BYTES = 4 * 1024 * 1024 * 1024
 
 
 def _hevc_metadata_bsf(color: ColorMetadata) -> str | None:
@@ -56,6 +57,38 @@ def _hidden_kwargs() -> dict:
     return {}
 
 
+def _cfg(key: str, default):
+    try:
+        from utils import app_config
+
+        value = app_config.get(key, default)
+        return default if value is None else value
+    except Exception:
+        return default
+
+
+def should_use_faststart(candidate_size_bytes: int | None = None, mode: object | None = None) -> bool:
+    """Resolve the mp4 faststart policy.
+
+    ``auto`` keeps faststart for small files and disables it for very large
+    local outputs, avoiding a full-file rewrite after muxing.
+    """
+    value = str(mode if mode is not None else _cfg("output_mp4_faststart", "auto") or "auto").strip().lower()
+    if value in {"always", "on", "true", "1", "yes"}:
+        return True
+    if value in {"off", "false", "0", "no", "none"}:
+        return False
+    try:
+        size = int(candidate_size_bytes or 0)
+    except (TypeError, ValueError):
+        size = 0
+    return size <= _FASTSTART_AUTO_DISABLE_BYTES
+
+
+def faststart_args(candidate_size_bytes: int | None = None, mode: object | None = None) -> list[str]:
+    return ["-movflags", "+faststart"] if should_use_faststart(candidate_size_bytes, mode) else []
+
+
 def mux_hevc_with_audio(
     raw_hevc: str | Path,
     out_path: str | Path,
@@ -66,6 +99,7 @@ def mux_hevc_with_audio(
     audio_start_sec: float | None = None,
     audio_duration: float | None = None,
     shortest: bool = True,
+    faststart: object | None = None,
     log_callback=None,
 ) -> None:
     """Package a raw HEVC bitstream into mp4, optionally copying source audio.
@@ -114,7 +148,8 @@ def mux_hevc_with_audio(
         if bsf:
             cmd += ["-bsf:v", bsf]
 
-    cmd += ["-movflags", "+faststart"]
+    raw_size = Path(raw_hevc).stat().st_size if Path(raw_hevc).exists() else 0
+    cmd += faststart_args(raw_size, faststart)
     if has_audio:
         if shortest:
             cmd += ["-shortest"]
@@ -125,7 +160,7 @@ def mux_hevc_with_audio(
     if log_callback:
         log_callback(
             f"[mux] setup: raw={raw_hevc} exists={Path(raw_hevc).exists()} "
-            f"size={Path(raw_hevc).stat().st_size if Path(raw_hevc).exists() else 0} "
+            f"size={raw_size} faststart={should_use_faststart(raw_size, faststart)} "
             f"out={out_path} parent_exists={final_out.parent.exists()} "
             f"audio={audio_source} audio_exists={Path(audio_source).exists() if audio_source is not None else False}"
         )

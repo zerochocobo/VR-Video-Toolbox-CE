@@ -142,13 +142,17 @@ def get_engine():
         return _engine
 
 
-def restore_file(input_path, output_path, *, log_callback=None, cancel_token=None,
-                 max_clip_length=180):
+def restore_file(input_path, output_path, *, bitrate_bps=None, log_callback=None,
+                 cancel_token=None, max_clip_length=180, produce_mp4: bool = True,
+                 sidecar_metadata: dict | None = None):
     """Restore one file in-process for mosaic removal."""
     return get_engine().restore_file(
         input_path, output_path,
+        bitrate_bps=bitrate_bps,
         log_callback=log_callback, cancel_token=cancel_token,
         max_clip_length=max_clip_length,
+        produce_mp4=produce_mp4,
+        sidecar_metadata=sidecar_metadata,
     )
 
 

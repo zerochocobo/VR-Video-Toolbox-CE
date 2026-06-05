@@ -3,20 +3,24 @@ import os
 import shutil
 import glob
 import json
+import queue
 import time
 import sys
+import threading
 from pathlib import Path
 
 # Import engine layer and helper methods.
 try:
     from utils import engine_runner, app_config
     from utils.ffmpeg_checker import get_startupinfo, get_video_bitrate
+    from gpu_engine.fallback import OperationCancelled
 except ImportError:
     _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _root not in sys.path:
         sys.path.insert(0, _root)
     from utils import engine_runner, app_config
     from utils.ffmpeg_checker import get_startupinfo, get_video_bitrate
+    from gpu_engine.fallback import OperationCancelled
 
 def check_dependencies():
     missing = []
@@ -100,6 +104,167 @@ def _bitrate_bps_to_kbps(bitrate_bps: int | None) -> int | None:
     if not bitrate_bps or bitrate_bps <= 0:
         return None
     return max(1, int(bitrate_bps) // 1000)
+
+
+def _pipeline_baseline_bitrate_bps(out_w: int | None, out_h: int | None, fps: float | None) -> int | None:
+    """Conservative floor for very low-bitrate sources, about 0.015 bit/px/frame."""
+    try:
+        px = int(out_w or 0) * int(out_h or 0)
+        rate = float(fps or 30.0)
+    except (TypeError, ValueError):
+        return None
+    if px <= 0:
+        return None
+    return max(1, int(px * max(1.0, rate) * 0.015))
+
+
+def _config_float(key: str, default: float) -> float:
+    try:
+        return float(app_config.get(key, default) or default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _resolve_pipeline_bitrate(stage: str,
+                              out_w: int | None,
+                              out_h: int | None,
+                              fps: float | None,
+                              source_bps: int | None,
+                              keep_original: bool = False,
+                              *,
+                              source_w: int | None = None,
+                              source_h: int | None = None,
+                              log_callback=None) -> int | None:
+    """Resolve OneClick target bitrate for intermediate and final NVENC outputs."""
+    stage_key = str(stage or "").strip().lower()
+    if stage_key not in {"intermediate", "final"}:
+        raise ValueError(f"unknown bitrate stage: {stage}")
+    # Intermediate stages are repeatedly decoded/re-encoded downstream, so we
+    # always reserve quality headroom for high-detail regions regardless of the
+    # keep-original toggle (which only governs the final-output convergence).
+    if stage_key == "intermediate":
+        multiplier = _config_float("gpu_bitrate_multiplier", 2.0)
+    else:
+        multiplier = 1.0 if keep_original else _config_float("gpu_bitrate_final_multiplier", 1.0)
+    try:
+        source = int(source_bps or 0)
+    except (TypeError, ValueError):
+        source = 0
+    try:
+        src_area = int(source_w or 0) * int(source_h or 0)
+        out_area = int(out_w or 0) * int(out_h or 0)
+    except (TypeError, ValueError):
+        src_area = 0
+        out_area = 0
+    area_scale = (out_area / src_area) if src_area > 0 and out_area > 0 else 1.0
+    baseline = _pipeline_baseline_bitrate_bps(out_w, out_h, fps)
+    target = int(source * area_scale * multiplier) if source > 0 else 0
+    pre_baseline_target = target
+    # Intermediate stages always honour the baseline floor (they feed downstream
+    # re-encodes and need quality headroom even when the user kept the original
+    # bitrate). Final-stage with keep_original strictly trusts the source so the
+    # output convergence promise holds.
+    skip_baseline = stage_key == "final" and keep_original and source > 0
+    if baseline and not skip_baseline:
+        target = max(target, baseline)
+    if target <= 0:
+        return None
+    if log_callback:
+        source_label = f"{source // 1000}kbps" if source > 0 else "unknown"
+        target_label = f"{target // 1000}kbps"
+        log_callback(
+            f"[bitrate] stage={stage_key} source={source_label} "
+            f"keep_original={bool(keep_original)} multiplier={multiplier:.2f} -> target={target_label}"
+        )
+        if baseline and target > pre_baseline_target:
+            before_label = f"{pre_baseline_target // 1000}kbps" if pre_baseline_target > 0 else "unknown"
+            log_callback(
+                f"[bitrate] baseline applied: baseline={baseline // 1000}kbps "
+                f"{before_label} -> target={target_label}"
+            )
+    return target
+
+
+def _resolve_single_eye_final_bitrate(input_file: str,
+                                      original_bitrate: int | None,
+                                      keep_original: bool,
+                                      log_callback=None) -> int | None:
+    try:
+        from gpu_engine import probe as gpu_probe
+
+        meta = gpu_probe.probe_video(input_file)
+        return _resolve_pipeline_bitrate(
+            "final",
+            max(1, int(meta.width // 2)),
+            meta.height,
+            meta.source_fps or 30.0,
+            int(original_bitrate / 2) if original_bitrate else None,
+            keep_original,
+            log_callback=log_callback,
+        )
+    except Exception:
+        return int(original_bitrate / 2) if (keep_original and original_bitrate) else None
+
+
+def _resolve_sbs_eye_intermediate_bitrate(input_file: str,
+                                          original_bitrate: int | None,
+                                          keep_original: bool,
+                                          log_callback=None) -> int | None:
+    try:
+        from gpu_engine import probe as gpu_probe
+
+        meta = gpu_probe.probe_video(input_file)
+        return _resolve_pipeline_bitrate(
+            "intermediate",
+            max(1, int(meta.width // 2)),
+            meta.height,
+            meta.source_fps or 30.0,
+            int(original_bitrate / 2) if original_bitrate else None,
+            keep_original,
+            log_callback=log_callback,
+        )
+    except Exception:
+        return None
+
+
+def _log_final_bitrate_summary(final_output: str | Path,
+                               source_bps: int | None,
+                               log_callback=None) -> None:
+    """Log final mp4 average bitrate and warn when it drifts far above source."""
+    if not log_callback:
+        return
+    try:
+        path = Path(final_output)
+        if not path.exists():
+            log_callback(f"[bitrate] final mp4 self-check skipped: missing output {path}")
+            return
+        from gpu_engine import probe as gpu_probe
+
+        meta = gpu_probe.probe_video(path)
+        duration = float(meta.duration or 0.0)
+        if duration <= 0.0:
+            log_callback(f"[bitrate] final mp4 self-check skipped: unknown duration for {path}")
+            return
+        avg_bps = int(path.stat().st_size * 8 / duration)
+        try:
+            source = int(source_bps or 0)
+        except (TypeError, ValueError):
+            source = 0
+        if source > 0:
+            ratio = avg_bps / float(source)
+            log_callback(
+                f"[bitrate] final mp4: {avg_bps // 1000} kbps avg "
+                f"(source {source // 1000} kbps, ratio {ratio:.3f}x)"
+            )
+            if ratio > 1.20:
+                log_callback(
+                    f"[bitrate] WARNING final mp4 ratio {ratio:.3f}x exceeds 1.20x; "
+                    "check final NVENC bitrate contract"
+                )
+        else:
+            log_callback(f"[bitrate] final mp4: {avg_bps // 1000} kbps avg (source unknown)")
+    except Exception as exc:
+        log_callback(f"[bitrate] final mp4 self-check failed: {type(exc).__name__}: {exc}")
 
 
 def _nvenc_vbr_or_cq_args(target_kbps: int | None, max_kbps: int | None = None) -> list[str]:
@@ -534,20 +699,34 @@ def _split_video_dual_fisheye_ffmpeg(input_file, output_left_fisheye, output_rig
     run_process(cmd, log_callback, process_callback)
 
 
-def process_lada(input_file, output_file, log_callback=None, process_callback=None):
+def process_lada(input_file, output_file, log_callback=None, process_callback=None,
+                 bitrate_bps: int | None = None, produce_mp4: bool = True,
+                 sidecar_metadata: dict | None = None) -> str:
     """Remove mosaics. engine='native_gpu' uses the in-process built-in engine; otherwise use lada/jasna CLI."""
     tool_name = engine_runner.get_mosaic_tool_name()
     if engine_runner.is_native_engine():
         from gpu_engine import native_mosaic
+        from gpu_engine import restored_sidecar
         from gpu_engine.files import CancelToken
         token = CancelToken()
         if process_callback:
             process_callback(token)
         if log_callback: log_callback(f"{tool_name} Processing: {input_file} -> {output_file}")
-        ok = native_mosaic.restore_file(input_file, output_file, log_callback=log_callback, cancel_token=token)
+        ok = native_mosaic.restore_file(
+            input_file,
+            output_file,
+            bitrate_bps=bitrate_bps,
+            log_callback=log_callback,
+            cancel_token=token,
+            produce_mp4=produce_mp4,
+            sidecar_metadata=sidecar_metadata,
+        )
         if not ok:
             raise Exception("native_gpu restore failed or was cancelled")
-        return
+        raw_path = restored_sidecar.raw_path_for_output(output_file)
+        if not produce_mp4 and _file_nonempty(raw_path):
+            return str(raw_path)
+        return str(output_file)
 
     opts = engine_runner.build_lada_encoder_options(cq=18)
     cmd = engine_runner.build_engine_cmd(
@@ -557,12 +736,14 @@ def process_lada(input_file, output_file, log_callback=None, process_callback=No
     )
     if log_callback: log_callback(f"{tool_name} Processing: {input_file} -> {output_file}")
     run_process(cmd, log_callback, process_callback)
+    return str(output_file)
 
 
 class PreExtractResult:
     OK = "ok"
     NO_MOSAIC = "no_mosaic"
     SCAN_FAILED = "scan_failed"
+    CANCELLED = "cancelled"
 
 
 def _pre_extract_supported(pre_extract, log_callback=None) -> bool:
@@ -592,7 +773,7 @@ def _release_pre_extract_detector_if_needed(pre_extract_enabled, log_callback=No
 
 def _run_pre_extract_branch(base_path, restored_path, keep_intermediate=False,
                             log_callback=None, process_callback=None,
-                            fine_conf=None) -> str:
+                            fine_conf=None, output_bitrate_bps: int | None = None) -> str:
     """Run detect/cut/restore/paste for one prepared base video.
 
     SCAN_FAILED means the detector failed and callers should fall back to full
@@ -622,7 +803,15 @@ def _run_pre_extract_branch(base_path, restored_path, keep_intermediate=False,
         if log_callback:
             log_callback(f"[pre-extract] fine detection conf filter: {fine_conf:.2f}")
         segments = scan_segments(base_path, log_callback=log_callback, cancel_token=scan_token, min_conf=fine_conf)
+    except OperationCancelled as exc:
+        if log_callback:
+            log_callback(f"[pre-extract] scan cancelled: {exc}")
+        return PreExtractResult.CANCELLED
     except Exception as exc:
+        if scan_token.cancelled:
+            if log_callback:
+                log_callback("[pre-extract] scan cancelled")
+            return PreExtractResult.CANCELLED
         if log_callback:
             log_callback(f"[pre-extract] scan failed: {type(exc).__name__}: {exc}")
         return PreExtractResult.SCAN_FAILED
@@ -654,7 +843,7 @@ def _run_pre_extract_branch(base_path, restored_path, keep_intermediate=False,
         except Exception:
             pass
     segments = align_segments(segments, keyframes, duration=meta.duration)
-    save_segments_json(segments, segments_json, source=base_path)
+    save_segments_json(segments, segments_json, source=base_path, fps=meta.source_fps)
     if log_callback:
         log_callback(f"[pre-extract] saved metadata: {segments_json}")
 
@@ -702,6 +891,7 @@ def _run_pre_extract_branch(base_path, restored_path, keep_intermediate=False,
         restored_segments,
         log_callback=log_callback,
         process_callback=process_callback,
+        bitrate_bps=output_bitrate_bps,
     )
 
     if not keep_segments:
@@ -720,9 +910,16 @@ def _run_pre_extract_branch(base_path, restored_path, keep_intermediate=False,
 
 def _process_pre_extract_or_lada(base_path, restored_path, pre_extract_enabled,
                                  keep_intermediate=False, log_callback=None,
-                                 process_callback=None, fine_conf=None) -> str:
+                                 process_callback=None, fine_conf=None,
+                                 output_bitrate_bps: int | None = None) -> str:
     if not pre_extract_enabled:
-        process_lada(base_path, restored_path, log_callback=log_callback, process_callback=process_callback)
+        process_lada(
+            base_path,
+            restored_path,
+            log_callback=log_callback,
+            process_callback=process_callback,
+            bitrate_bps=output_bitrate_bps,
+        )
         return PreExtractResult.OK
     result = _run_pre_extract_branch(
         base_path,
@@ -731,11 +928,20 @@ def _process_pre_extract_or_lada(base_path, restored_path, pre_extract_enabled,
         log_callback=log_callback,
         process_callback=process_callback,
         fine_conf=fine_conf,
+        output_bitrate_bps=output_bitrate_bps,
     )
+    if result == PreExtractResult.CANCELLED:
+        raise OperationCancelled("cancelled by user")
     if result == PreExtractResult.SCAN_FAILED:
         if log_callback:
             log_callback("[pre-extract] falling back to full-video lada/jasna after scan failure")
-        process_lada(base_path, restored_path, log_callback=log_callback, process_callback=process_callback)
+        process_lada(
+            base_path,
+            restored_path,
+            log_callback=log_callback,
+            process_callback=process_callback,
+            bitrate_bps=output_bitrate_bps,
+        )
         return PreExtractResult.OK
     return result
 
@@ -812,6 +1018,31 @@ def _paired_segment_paths(base_dir: str, stem: str, side_name: str, fish: str, s
     return f"{base}.mp4", f"{base}.restored.mp4"
 
 
+def _paired_restored_related_paths(restored_mp4: str | Path) -> list[str]:
+    from gpu_engine import restored_sidecar
+
+    raw = restored_sidecar.raw_path_for_output(restored_mp4)
+    return [str(restored_mp4), str(raw), str(restored_sidecar.sidecar_path_for(raw))]
+
+
+def _file_nonempty(path: str | Path) -> bool:
+    try:
+        return os.path.exists(path) and os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
+def _restored_raw_valid(path: str | Path) -> bool:
+    if not _file_nonempty(path):
+        return False
+    try:
+        from gpu_engine import restored_sidecar
+
+        return restored_sidecar.sidecar_path_for(path).exists()
+    except Exception:
+        return False
+
+
 def _cleanup_orphan_paired_segment_files(base_dir: str, stem: str, fish: str,
                                          valid_paths: set[str], log_callback=None) -> None:
     valid = {os.path.abspath(path) for path in valid_paths}
@@ -819,6 +1050,8 @@ def _cleanup_orphan_paired_segment_files(base_dir: str, stem: str, fish: str,
     for side_name in ("L", "R"):
         patterns.append(os.path.join(base_dir, f"{stem}_{side_name}{fish}.seg*.mp4"))
         patterns.append(os.path.join(base_dir, f"{stem}_{side_name}{fish}.f*.r*.mp4"))
+        patterns.append(os.path.join(base_dir, f"{stem}_{side_name}{fish}.f*.r*.hevc"))
+        patterns.append(os.path.join(base_dir, f"{stem}_{side_name}{fish}.f*.r*.json"))
     for pattern in patterns:
         for path in glob.glob(pattern):
             abs_path = os.path.abspath(path)
@@ -927,6 +1160,7 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
                                          fine_conf=None) -> str:
     from gpu_engine import probe as gpu_probe
     from gpu_engine import files as gpu_files
+    from gpu_engine import restored_sidecar
     from utils.mosaic_prescan import save_segments_json, scan_segments_gpu_transform
     from utils.segment_paster import build_paste_segments, paste_segments_gpu_or_fallback
 
@@ -961,7 +1195,15 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
             cancel_token=scan_token,
             min_conf=fine_conf,
         )
+    except OperationCancelled as exc:
+        if log_callback:
+            log_callback(f"[source-scan] paired fine scan cancelled: {exc}")
+        return PreExtractResult.CANCELLED
     except Exception as exc:
+        if scan_token.cancelled:
+            if log_callback:
+                log_callback("[source-scan] paired fine scan cancelled")
+            return PreExtractResult.CANCELLED
         if log_callback:
             log_callback(f"[source-scan] paired fine scan failed: {type(exc).__name__}: {exc}")
         return PreExtractResult.SCAN_FAILED
@@ -973,36 +1215,65 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
         shutil.copy2(base_clip, output_file)
         return PreExtractResult.NO_MOSAIC
 
-    save_segments_json(left_segments, os.path.join(base_dir, f"{stem}_L{'_fisheye' if use_fisheye else ''}.segments.json"), source=base_clip)
-    save_segments_json(right_segments, os.path.join(base_dir, f"{stem}_R{'_fisheye' if use_fisheye else ''}.segments.json"), source=base_clip)
-
     restored_paths = []
     segment_input_paths = []
     paste_segments = []
     meta = gpu_probe.probe_video(base_clip)
     fps = meta.source_fps or 30.0
+
+    save_segments_json(
+        left_segments,
+        os.path.join(base_dir, f"{stem}_L{'_fisheye' if use_fisheye else ''}.segments.json"),
+        source=base_clip,
+        fps=fps,
+    )
+    save_segments_json(
+        right_segments,
+        os.path.join(base_dir, f"{stem}_R{'_fisheye' if use_fisheye else ''}.segments.json"),
+        source=base_clip,
+        fps=fps,
+    )
     eye_w = int(meta.width // 2)
     rect_source_bitrate = int(original_bitrate or meta.bitrate_bps or 0)
-    bitrate_bps = int(original_bitrate) if (keep_original_bitrate and original_bitrate) else None
+    final_source_bitrate = int(original_bitrate or meta.bitrate_bps or 0)
+    bitrate_bps = _resolve_pipeline_bitrate(
+        "final",
+        meta.width,
+        meta.height,
+        fps,
+        final_source_bitrate,
+        keep_original_bitrate,
+        log_callback=log_callback,
+    )
     fish = "_fisheye" if use_fisheye else ""
+    keep_segments = bool(app_config.get("pre_extract_keep_segments", False)) or bool(keep_intermediate)
+    raw_restore_enabled = not keep_segments
     expected_cache_paths = set()
     for side_name, segments in (("L", left_segments), ("R", right_segments)):
         for seg in segments:
-            expected_cache_paths.update(_paired_segment_paths(base_dir, stem, side_name, fish, seg, fps))
+            seg_in, seg_out = _paired_segment_paths(base_dir, stem, side_name, fish, seg, fps)
+            expected_cache_paths.add(seg_in)
+            expected_cache_paths.update(_paired_restored_related_paths(seg_out))
     _cleanup_orphan_paired_segment_files(base_dir, stem, fish, expected_cache_paths, log_callback=log_callback)
 
-    def _extract_restore(side: str, segments, x_offset: int):
+    extract_tasks = []
+
+    def _add_extract_tasks(side: str, segments, x_offset: int):
         for seg in segments:
             side_name = "L" if side == "left" else "R"
             seg_in, seg_out = _paired_segment_paths(base_dir, stem, side_name, fish, seg, fps)
             cache_key = _paired_segment_cache_key(seg, fps)
-            rect_bitrate_bps = _area_scaled_bitrate_bps(
-                rect_source_bitrate,
-                meta.width,
-                meta.height,
+            start_frame, end_frame = _segment_frame_bounds(seg, fps)
+            rect_bitrate_bps = _resolve_pipeline_bitrate(
+                "intermediate",
                 seg.w,
                 seg.h,
-                2.0,
+                fps,
+                rect_source_bitrate,
+                keep_original_bitrate,
+                source_w=meta.width,
+                source_h=meta.height,
+                log_callback=log_callback,
             )
             rect_bitrate_kbps = _bitrate_bps_to_kbps(rect_bitrate_bps)
             rect_bitrate_label = f"{rect_bitrate_kbps}kbps" if rect_bitrate_kbps else "auto"
@@ -1012,32 +1283,312 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
                     f"{seg.start_s:.3f}-{seg.end_s:.3f}s rect={seg.x},{seg.y},{seg.w}x{seg.h} "
                     f"key={cache_key} bitrate={rect_bitrate_label}"
                 )
-            if not os.path.exists(seg_in):
-                token = gpu_files.CancelToken()
-                if process_callback:
-                    process_callback(token)
-                gpu_files.extract_transformed_rect_clip(
+            extract_tasks.append({
+                "order": len(extract_tasks),
+                "side": side,
+                "side_name": side_name,
+                "seg": seg,
+                "seg_in": seg_in,
+                "seg_out": seg_out,
+                "raw_seg_out": str(restored_sidecar.raw_path_for_output(seg_out)),
+                "x_offset": int(x_offset),
+                "start_frame": start_frame,
+                "end_frame": end_frame,
+                "bitrate_bps": rect_bitrate_bps,
+                "cache_key": cache_key,
+                "cached": _file_nonempty(seg_in),
+            })
+
+    _add_extract_tasks("left", left_segments, 0)
+    _add_extract_tasks("right", right_segments, eye_w)
+
+    extract_group_max = max(1, int(app_config.get("pre_extract_extract_group_max", 8) or 8))
+    pipeline_enabled = bool(app_config.get("pre_extract_pipeline_enabled", True))
+    groups: dict[tuple[int, int], list[dict]] = {}
+    for task in extract_tasks:
+        groups.setdefault((int(task["start_frame"]), int(task["end_frame"])), []).append(task)
+    group_items = [
+        (group_idx, int(start_frame), int(end_frame), group_tasks)
+        for group_idx, ((start_frame, end_frame), group_tasks) in enumerate(sorted(groups.items()), start=1)
+    ]
+
+    class _PipelineCancelGroup:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self._children = []
+            self._cancelled = False
+
+        def add(self, child) -> None:
+            should_cancel = False
+            with self._lock:
+                if child is not None and not any(existing is child for existing in self._children):
+                    self._children.append(child)
+                should_cancel = self._cancelled
+            if should_cancel:
+                self._kill_child(child)
+
+        def discard(self, child) -> None:
+            with self._lock:
+                self._children = [existing for existing in self._children if existing is not child]
+
+        def kill(self) -> None:
+            with self._lock:
+                self._cancelled = True
+                children = list(self._children)
+            for child in children:
+                self._kill_child(child)
+
+        def terminate(self) -> None:
+            self.kill()
+
+        @property
+        def cancelled(self) -> bool:
+            with self._lock:
+                return self._cancelled
+
+        @staticmethod
+        def _kill_child(child) -> None:
+            if child is None:
+                return
+            try:
+                child.kill()
+            except Exception:
+                try:
+                    child.terminate()
+                except Exception:
+                    pass
+
+    pipeline_cancel = _PipelineCancelGroup()
+
+    def _register_pipeline_child(child) -> None:
+        pipeline_cancel.add(child)
+        if process_callback:
+            process_callback(pipeline_cancel)
+
+    def _release_pipeline_child(child) -> None:
+        pipeline_cancel.discard(child)
+
+    def _new_extract_token():
+        token = gpu_files.CancelToken()
+        _register_pipeline_child(token)
+        return token
+
+    def _raise_if_pipeline_cancelled() -> None:
+        if pipeline_cancel.cancelled:
+            raise OperationCancelled("cancelled by user")
+
+    def _run_extract_group(group_idx: int, start_frame: int, end_frame: int, group_tasks: list[dict]) -> None:
+        pending_tasks = [task for task in group_tasks if not _file_nonempty(task["seg_in"])]
+        if not pending_tasks:
+            return
+        _raise_if_pipeline_cancelled()
+        if len(pending_tasks) > extract_group_max:
+            if log_callback:
+                log_callback(
+                    f"[source-scan] fine extract group {group_idx}: tasks={len(pending_tasks)} "
+                    f"exceeds max={extract_group_max}; using per-rect extract"
+                )
+        elif len(pending_tasks) > 1:
+            token = _new_extract_token()
+            if log_callback:
+                log_callback(
+                    f"[source-scan] fine extract group {group_idx}: "
+                    f"frames={start_frame}-{end_frame}, tasks={len(pending_tasks)}"
+                )
+            try:
+                gpu_files.extract_multi_rect_clip(
                     base_clip,
-                    seg_in,
-                    crop_mode=side,
-                    rect=(seg.x, seg.y, seg.w, seg.h),
+                    [
+                        {
+                            "dst": task["seg_in"],
+                            "crop_mode": task["side"],
+                            "rect": (task["seg"].x, task["seg"].y, task["seg"].w, task["seg"].h),
+                            "bitrate_bps": task["bitrate_bps"],
+                            "label": f"{task['side_name']}:{task['cache_key']}",
+                        }
+                        for task in pending_tasks
+                    ],
                     to_fisheye=use_fisheye,
-                    start_sec=seg.start_s,
-                    end_sec=seg.end_s,
-                    cq=None if rect_bitrate_bps else 18,
-                    bitrate_bps=rect_bitrate_bps,
+                    start_sec=float(start_frame) / float(fps),
+                    end_sec=float(end_frame) / float(fps),
                     keep_audio=False,
                     log_callback=log_callback,
                     cancel_token=token,
                 )
-            if not os.path.exists(seg_out):
-                process_lada(seg_in, seg_out, log_callback=log_callback, process_callback=process_callback)
-            segment_input_paths.append(seg_in)
-            paste_segments.append(_clone_segment(seg, seg_id=len(paste_segments), x_offset=x_offset))
-            restored_paths.append(seg_out)
+            finally:
+                _release_pipeline_child(token)
+            return
 
-    _extract_restore("left", left_segments, 0)
-    _extract_restore("right", right_segments, eye_w)
+        for task in pending_tasks:
+            _raise_if_pipeline_cancelled()
+            if not _file_nonempty(task["seg_in"]):
+                token = _new_extract_token()
+                try:
+                    gpu_files.extract_transformed_rect_clip(
+                        base_clip,
+                        task["seg_in"],
+                        crop_mode=task["side"],
+                        rect=(task["seg"].x, task["seg"].y, task["seg"].w, task["seg"].h),
+                        to_fisheye=use_fisheye,
+                        start_sec=task["seg"].start_s,
+                        end_sec=task["seg"].end_s,
+                        cq=None if task["bitrate_bps"] else 18,
+                        bitrate_bps=task["bitrate_bps"],
+                        keep_audio=False,
+                        log_callback=log_callback,
+                        cancel_token=token,
+                    )
+                finally:
+                    _release_pipeline_child(token)
+
+    restore_results = [None] * len(extract_tasks)
+
+    def _run_restore_task(task: dict) -> str:
+        _raise_if_pipeline_cancelled()
+        if not _file_nonempty(task["seg_in"]):
+            raise RuntimeError(f"fine segment extract produced no output: {task['seg_in']}")
+        if raw_restore_enabled and _restored_raw_valid(task["raw_seg_out"]):
+            return task["raw_seg_out"]
+        elif _file_nonempty(task["seg_out"]):
+            return task["seg_out"]
+        sidecar_metadata = {
+            "rect": {
+                "x": int(task["seg"].x),
+                "y": int(task["seg"].y),
+                "w": int(task["seg"].w),
+                "h": int(task["seg"].h),
+            },
+            "time": {
+                "start_s": float(task["seg"].start_s),
+                "end_s": float(task["seg"].end_s),
+                "start_frame": int(task["start_frame"]),
+                "end_frame": int(task["end_frame"]),
+            },
+        }
+        child_handles = []
+
+        def _restore_process_callback(child) -> None:
+            child_handles.append(child)
+            _register_pipeline_child(child)
+
+        try:
+            return process_lada(
+                task["seg_in"],
+                task["seg_out"],
+                log_callback=log_callback,
+                process_callback=_restore_process_callback,
+                produce_mp4=not raw_restore_enabled,
+                sidecar_metadata=sidecar_metadata,
+            )
+        finally:
+            for child in child_handles:
+                _release_pipeline_child(child)
+
+    def _store_restored_task(task: dict) -> None:
+        restored_actual = _run_restore_task(task)
+        restore_results[int(task["order"])] = (
+            task["seg_in"],
+            _clone_segment(task["seg"], seg_id=int(task["order"]), x_offset=task["x_offset"]),
+            restored_actual,
+        )
+
+    def _run_extract_restore_sequential() -> None:
+        for group_idx, start_frame, end_frame, group_tasks in group_items:
+            _run_extract_group(group_idx, start_frame, end_frame, group_tasks)
+        for task in extract_tasks:
+            _store_restored_task(task)
+
+    def _run_extract_restore_pipeline() -> None:
+        if log_callback:
+            log_callback(f"[source-scan] fine extract/restore pipeline enabled: groups={len(group_items)}, depth=1")
+        ready_queue: queue.Queue = queue.Queue(maxsize=1)
+        sentinel = object()
+        producer_errors = []
+
+        def _producer_put(item) -> bool:
+            while not pipeline_cancel.cancelled:
+                try:
+                    ready_queue.put(item, timeout=0.1)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def _extract_producer() -> None:
+            try:
+                for item in group_items:
+                    if pipeline_cancel.cancelled:
+                        break
+                    group_idx, start_frame, end_frame, group_tasks = item
+                    _run_extract_group(group_idx, start_frame, end_frame, group_tasks)
+                    if not _producer_put(item):
+                        break
+            except BaseException as exc:
+                producer_errors.append(exc)
+                pipeline_cancel.kill()
+            finally:
+                if not pipeline_cancel.cancelled:
+                    while True:
+                        try:
+                            ready_queue.put(sentinel, timeout=0.1)
+                            break
+                        except queue.Full:
+                            if pipeline_cancel.cancelled:
+                                break
+
+        producer = threading.Thread(target=_extract_producer, name="paired-pre-extract-producer", daemon=True)
+        producer.start()
+        try:
+            while True:
+                try:
+                    item = ready_queue.get(timeout=0.1)
+                except queue.Empty:
+                    if producer_errors:
+                        raise producer_errors[0]
+                    if pipeline_cancel.cancelled:
+                        raise OperationCancelled("cancelled by user")
+                    if not producer.is_alive():
+                        if producer_errors:
+                            raise producer_errors[0]
+                        if pipeline_cancel.cancelled:
+                            raise OperationCancelled("cancelled by user")
+                        break
+                    continue
+                if item is sentinel:
+                    if producer_errors:
+                        raise producer_errors[0]
+                    break
+                _group_idx, _start_frame, _end_frame, group_tasks = item
+                for task in group_tasks:
+                    try:
+                        _store_restored_task(task)
+                    except OperationCancelled:
+                        if producer_errors:
+                            raise producer_errors[0]
+                        raise
+                if producer_errors:
+                    raise producer_errors[0]
+        except BaseException:
+            pipeline_cancel.kill()
+            raise
+        finally:
+            producer.join(timeout=30.0)
+
+    if pipeline_enabled and len(group_items) > 1:
+        _run_extract_restore_pipeline()
+    else:
+        _run_extract_restore_sequential()
+
+    for restored in restore_results:
+        if restored is None:
+            if pipeline_cancel.cancelled:
+                raise OperationCancelled("cancelled by user")
+            raise RuntimeError("paired fine segment restore did not complete")
+        seg_in, paste_seg, restored_actual = restored
+        segment_input_paths.append(seg_in)
+        paste_seg.seg_id = len(paste_segments)
+        paste_segments.append(paste_seg)
+        restored_paths.append(restored_actual)
 
     if use_fisheye:
         if log_callback:
@@ -1067,15 +1618,24 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
             keep_audio=False,
             log_callback=log_callback,
             process_callback=process_callback,
+            bitrate_bps=bitrate_bps,
         )
         cleanup_extra = []
 
-    keep_segments = bool(app_config.get("pre_extract_keep_segments", False)) or bool(keep_intermediate)
     if not keep_segments:
         for p in segment_input_paths + restored_paths:
             try:
                 if os.path.exists(p):
                     os.remove(p)
+            except OSError:
+                pass
+            try:
+                if str(p).lower().endswith(".hevc"):
+                    from gpu_engine import restored_sidecar
+
+                    sidecar = restored_sidecar.sidecar_path_for(p)
+                    if sidecar.exists():
+                        sidecar.unlink()
             except OSError:
                 pass
         for p in cleanup_extra:
@@ -1112,6 +1672,22 @@ def _process_sbs_clip_to_output(input_file, output_file, *, use_fisheye: bool,
     file_l_fish_restored = os.path.join(directory, f"{stem}_L_fisheye.restored.mp4")
     file_r_fish_restored = os.path.join(directory, f"{stem}_R_fisheye.restored.mp4")
     pre_extract_enabled = _pre_extract_supported(pre_extract_inner, log_callback)
+    eye_intermediate_bitrate = None
+    try:
+        from gpu_engine import probe as gpu_probe
+
+        src_meta = gpu_probe.probe_video(input_file)
+        eye_intermediate_bitrate = _resolve_pipeline_bitrate(
+            "intermediate",
+            max(1, int(src_meta.width // 2)),
+            src_meta.height,
+            src_meta.source_fps or 30.0,
+            int(original_bitrate / 2) if original_bitrate else None,
+            keep_original_bitrate,
+            log_callback=log_callback,
+        )
+    except Exception:
+        eye_intermediate_bitrate = None
 
     if use_fisheye:
         if log_callback:
@@ -1126,8 +1702,8 @@ def _process_sbs_clip_to_output(input_file, output_file, *, use_fisheye: bool,
         )
         if log_callback:
             log_callback("[source-scan] Stage 3: restore fisheye eyes")
-        _process_pre_extract_or_lada(file_l_fish, file_l_fish_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf)
-        _process_pre_extract_or_lada(file_r_fish, file_r_fish_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf)
+        _process_pre_extract_or_lada(file_l_fish, file_l_fish_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf, output_bitrate_bps=eye_intermediate_bitrate)
+        _process_pre_extract_or_lada(file_r_fish, file_r_fish_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf, output_bitrate_bps=eye_intermediate_bitrate)
         if log_callback:
             log_callback("[source-scan] Stage 3: Fisheye->VR + merge")
         merge_videos_fisheye(file_l_fish_restored, file_r_fish_restored, output_file, original_bitrate, keep_original_bitrate, log_callback, process_callback)
@@ -1145,8 +1721,8 @@ def _process_sbs_clip_to_output(input_file, output_file, *, use_fisheye: bool,
         )
         if log_callback:
             log_callback("[source-scan] Stage 3: restore eyes")
-        _process_pre_extract_or_lada(file_l, file_l_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf)
-        _process_pre_extract_or_lada(file_r, file_r_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf)
+        _process_pre_extract_or_lada(file_l, file_l_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf, output_bitrate_bps=eye_intermediate_bitrate)
+        _process_pre_extract_or_lada(file_r, file_r_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf, output_bitrate_bps=eye_intermediate_bitrate)
         if log_callback:
             log_callback("[source-scan] Stage 3: merge SBS")
         merge_videos(file_l_restored, file_r_restored, output_file, original_bitrate, keep_original_bitrate, log_callback, process_callback)
@@ -1183,6 +1759,7 @@ def _process_single_eye_clip_to_output(input_file, output_file, *, eye_mode: int
     file_cut_fish = os.path.join(directory, f"{stem}{side_suffix}_fisheye.mp4")
     file_cut_fish_restored = os.path.join(directory, f"{stem}{side_suffix}_fisheye.restored.mp4")
     pre_extract_enabled = _pre_extract_supported(pre_extract_inner, log_callback)
+    final_bitrate_bps = int(final_bitrate_kbps * 1000) if final_bitrate_kbps else None
 
     if use_fisheye:
         if log_callback:
@@ -1209,7 +1786,16 @@ def _process_single_eye_clip_to_output(input_file, output_file, *, eye_mode: int
             start_time, end_time, log_callback, process_callback,
             keep_audio=split_keep_audio,
         )
-        _process_pre_extract_or_lada(file_cut, output_file, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf)
+        _process_pre_extract_or_lada(
+            file_cut,
+            output_file,
+            pre_extract_enabled,
+            keep_intermediate,
+            log_callback,
+            process_callback,
+            fine_conf=fine_conf,
+            output_bitrate_bps=final_bitrate_bps,
+        )
         cleanup = [file_cut]
 
     if not keep_intermediate:
@@ -1272,7 +1858,15 @@ def _run_source_scan_branch(input_file, final_output, *, use_fisheye: bool,
             process_callback(scan_token)
         try:
             intervals = scan_source_time_segments(scan_input, log_callback=log_callback, cancel_token=scan_token)
+        except OperationCancelled as exc:
+            if log_callback:
+                log_callback(f"[source-scan] scan cancelled: {exc}")
+            return PreExtractResult.CANCELLED
         except Exception as exc:
+            if scan_token.cancelled:
+                if log_callback:
+                    log_callback("[source-scan] scan cancelled")
+                return PreExtractResult.CANCELLED
             if log_callback:
                 log_callback(f"[source-scan] scan failed: {type(exc).__name__}: {exc}")
             return PreExtractResult.SCAN_FAILED
@@ -1332,7 +1926,16 @@ def _run_source_scan_branch(input_file, final_output, *, use_fisheye: bool,
                 log_callback(f"[source-scan] ... {len(timeline) - 30} more timeline entries")
 
         original_bitrate = get_video_bitrate(scan_input, log_callback)
-        final_bitrate_kbps = int((original_bitrate / 2) / 1000) if (keep_original_bitrate and original_bitrate) else None
+        single_eye_final_bitrate = _resolve_pipeline_bitrate(
+            "final",
+            max(1, int(meta.width // 2)),
+            meta.height,
+            meta.source_fps or 30.0,
+            int(original_bitrate / 2) if original_bitrate else None,
+            keep_original_bitrate,
+            log_callback=log_callback,
+        )
+        final_bitrate_kbps = _bitrate_bps_to_kbps(single_eye_final_bitrate)
         for entry in timeline:
             if entry.kind == "mosaic":
                 restored = entry.path.with_name(f"{entry.path.stem}.restored{entry.path.suffix}")
@@ -1362,6 +1965,8 @@ def _run_source_scan_branch(input_file, final_output, *, use_fisheye: bool,
                             process_callback=process_callback,
                             fine_conf=fine_conf,
                         )
+                        if paired_result == PreExtractResult.CANCELLED:
+                            raise OperationCancelled("cancelled by user")
                         if paired_result == PreExtractResult.SCAN_FAILED:
                             if log_callback:
                                 log_callback("[source-scan] paired fine path failed; falling back to full-eye restore")
@@ -1398,7 +2003,7 @@ def _run_source_scan_branch(input_file, final_output, *, use_fisheye: bool,
             from gpu_engine.files import extract_clip
 
             crop_mode = "left" if int(eye_mode or 1) == 1 else "right"
-            gap_bitrate = int(original_bitrate / 2) if (keep_original_bitrate and original_bitrate) else None
+            gap_bitrate = single_eye_final_bitrate
             gap_idx = 0
             for idx, entry in enumerate(timeline):
                 if entry.kind != "gap":
@@ -1435,9 +2040,18 @@ def _run_source_scan_branch(input_file, final_output, *, use_fisheye: bool,
 
         if log_callback:
             log_callback("[source-scan] Stage 4 merge timeline")
-        concat_bitrate = None
-        if keep_original_bitrate and original_bitrate:
-            concat_bitrate = int(original_bitrate / 2) if mode == "single_eye" else int(original_bitrate)
+        if mode == "single_eye":
+            concat_bitrate = single_eye_final_bitrate
+        else:
+            concat_bitrate = _resolve_pipeline_bitrate(
+                "final",
+                meta.width,
+                meta.height,
+                meta.source_fps or 30.0,
+                original_bitrate or meta.bitrate_bps,
+                keep_original_bitrate,
+                log_callback=log_callback,
+            )
         if mode == "sbs":
             from gpu_engine.files import replace_timeline_segments_gpu
             from utils.sbs_concat import concat_timeline_hevc_fast
@@ -1455,7 +2069,10 @@ def _run_source_scan_branch(input_file, final_output, *, use_fisheye: bool,
                         log_callback=log_callback,
                         process_callback=process_callback,
                     )
+                    _log_final_bitrate_summary(final_path, concat_bitrate, log_callback)
                     return PreExtractResult.OK
+                except OperationCancelled:
+                    raise
                 except Exception as exc:
                     if log_callback:
                         log_callback(
@@ -1491,6 +2108,7 @@ def _run_source_scan_branch(input_file, final_output, *, use_fisheye: bool,
                 cq=None if concat_bitrate else 18,
                 bitrate_bps=concat_bitrate,
             )
+        _log_final_bitrate_summary(final_path, concat_bitrate, log_callback)
         return PreExtractResult.OK
     finally:
         if not keep_segments:
@@ -1502,12 +2120,45 @@ def _run_source_scan_branch(input_file, final_output, *, use_fisheye: bool,
             _remove_file_quiet(source_detections_jsonl, log_callback=log_callback)
 
 
+def _resolve_merge_final_bitrate(left_file, right_file, original_bitrate, keep_original_bitrate,
+                                 log_callback=None) -> int | None:
+    try:
+        from gpu_engine import probe as gpu_probe
+
+        left_meta = gpu_probe.probe_video(left_file)
+        right_meta = gpu_probe.probe_video(right_file)
+        out_w = int(left_meta.width) + int(right_meta.width)
+        out_h = max(int(left_meta.height), int(right_meta.height))
+        fps = left_meta.source_fps or right_meta.source_fps or 30.0
+        source_bps = int(original_bitrate or 0)
+        if source_bps <= 0:
+            source_bps = int(left_meta.bitrate_bps or 0) + int(right_meta.bitrate_bps or 0)
+        return _resolve_pipeline_bitrate(
+            "final",
+            out_w,
+            out_h,
+            fps,
+            source_bps,
+            keep_original_bitrate,
+            log_callback=log_callback,
+        )
+    except Exception:
+        return int(original_bitrate) if (keep_original_bitrate and original_bitrate) else None
+
+
 def merge_videos(left_file, right_file, output_file, original_bitrate, keep_original_bitrate=False, log_callback=None, process_callback=None):
     """Merge left and right eyes into SBS. Prefer GPU and fall back to ffmpeg on failure."""
     try:
         from gpu_engine import probe as gpu_probe, fallback as gpu_fallback, files as gpu_files
         _, d1 = gpu_probe.route(left_file)
         _, d2 = gpu_probe.route(right_file)
+        target_bitrate_bps = _resolve_merge_final_bitrate(
+            left_file,
+            right_file,
+            original_bitrate,
+            keep_original_bitrate,
+            log_callback=log_callback,
+        )
 
         def _gpu_fn():
             token = gpu_files.CancelToken()
@@ -1515,14 +2166,23 @@ def merge_videos(left_file, right_file, output_file, original_bitrate, keep_orig
                 process_callback(token)
             gpu_files.combine_video(
                 left_file, right_file, output_file, "left_right", from_fisheye=False,
-                cq=None if (keep_original_bitrate and original_bitrate) else 18,
-                bitrate_bps=int(original_bitrate) if (keep_original_bitrate and original_bitrate) else None,
+                cq=None if target_bitrate_bps else 18,
+                bitrate_bps=target_bitrate_bps,
                 keep_audio=True, log_callback=log_callback, cancel_token=token,
             )
             return True
 
         def _ffmpeg_fn():
-            return _merge_videos_ffmpeg(left_file, right_file, output_file, original_bitrate, keep_original_bitrate, log_callback, process_callback)
+            return _merge_videos_ffmpeg(
+                left_file,
+                right_file,
+                output_file,
+                original_bitrate,
+                keep_original_bitrate,
+                log_callback,
+                process_callback,
+                bitrate_bps=target_bitrate_bps,
+            )
 
         if log_callback: log_callback(f"Merging: {left_file} + {right_file} -> {output_file}")
         return gpu_fallback.run_with_fallback(
@@ -1534,7 +2194,7 @@ def merge_videos(left_file, right_file, output_file, original_bitrate, keep_orig
         raise
 
 
-def _merge_videos_ffmpeg(left_file, right_file, output_file, original_bitrate, keep_original_bitrate=False, log_callback=None, process_callback=None):
+def _merge_videos_ffmpeg(left_file, right_file, output_file, original_bitrate, keep_original_bitrate=False, log_callback=None, process_callback=None, bitrate_bps: int | None = None):
     cmd = [
         "ffmpeg",
         "-hide_banner", "-loglevel", "error","-stats",
@@ -1545,9 +2205,8 @@ def _merge_videos_ffmpeg(left_file, right_file, output_file, original_bitrate, k
         "-c:a", "copy"
     ]
     
-    if keep_original_bitrate and original_bitrate:
-        # Use original bitrate for output
-        target_kbps = int(original_bitrate / 1000)
+    if bitrate_bps and bitrate_bps > 0:
+        target_kbps = max(1, int(bitrate_bps / 1000))
         target_bitrate = f"{target_kbps}k"
         max_rate = f"{int(target_kbps * 1.2)}k"
         buf_size = f"{int(target_kbps * 2)}k"
@@ -1577,6 +2236,13 @@ def merge_videos_fisheye(left_fisheye_file, right_fisheye_file, output_file, ori
         from gpu_engine import probe as gpu_probe, fallback as gpu_fallback, files as gpu_files
         _, d1 = gpu_probe.route(left_fisheye_file)
         _, d2 = gpu_probe.route(right_fisheye_file)
+        target_bitrate_bps = _resolve_merge_final_bitrate(
+            left_fisheye_file,
+            right_fisheye_file,
+            original_bitrate,
+            keep_original_bitrate,
+            log_callback=log_callback,
+        )
 
         def _gpu_fn():
             token = gpu_files.CancelToken()
@@ -1585,14 +2251,23 @@ def merge_videos_fisheye(left_fisheye_file, right_fisheye_file, output_file, ori
             gpu_files.combine_video(
                 left_fisheye_file, right_fisheye_file, output_file, "left_right",
                 from_fisheye=True,
-                cq=None if (keep_original_bitrate and original_bitrate) else 18,
-                bitrate_bps=int(original_bitrate) if (keep_original_bitrate and original_bitrate) else None,
+                cq=None if target_bitrate_bps else 18,
+                bitrate_bps=target_bitrate_bps,
                 keep_audio=True, log_callback=log_callback, cancel_token=token,
             )
             return True
 
         def _ffmpeg_fn():
-            return _merge_videos_fisheye_ffmpeg(left_fisheye_file, right_fisheye_file, output_file, original_bitrate, keep_original_bitrate, log_callback, process_callback)
+            return _merge_videos_fisheye_ffmpeg(
+                left_fisheye_file,
+                right_fisheye_file,
+                output_file,
+                original_bitrate,
+                keep_original_bitrate,
+                log_callback,
+                process_callback,
+                bitrate_bps=target_bitrate_bps,
+            )
 
         if log_callback: log_callback(f"Fisheye->VR + Merging: {left_fisheye_file} + {right_fisheye_file} -> {output_file}")
         return gpu_fallback.run_with_fallback(
@@ -1604,7 +2279,7 @@ def merge_videos_fisheye(left_fisheye_file, right_fisheye_file, output_file, ori
         raise
 
 
-def _merge_videos_fisheye_ffmpeg(left_fisheye_file, right_fisheye_file, output_file, original_bitrate, keep_original_bitrate=False, log_callback=None, process_callback=None):
+def _merge_videos_fisheye_ffmpeg(left_fisheye_file, right_fisheye_file, output_file, original_bitrate, keep_original_bitrate=False, log_callback=None, process_callback=None, bitrate_bps: int | None = None):
     """Convert fisheye to VR and merge left/right videos in a single ffmpeg call."""
     cmd = [
         "ffmpeg",
@@ -1616,9 +2291,8 @@ def _merge_videos_fisheye_ffmpeg(left_fisheye_file, right_fisheye_file, output_f
         "-c:a", "copy"
     ]
     
-    if keep_original_bitrate and original_bitrate:
-        # Use original bitrate for output
-        target_kbps = int(original_bitrate / 1000)
+    if bitrate_bps and bitrate_bps > 0:
+        target_kbps = max(1, int(bitrate_bps / 1000))
         target_bitrate = f"{target_kbps}k"
         max_rate = f"{int(target_kbps * 1.2)}k"
         buf_size = f"{int(target_kbps * 2)}k"
@@ -1752,7 +2426,21 @@ def _run_native_sbs_stream(input_file, output_file, start_time, end_time, use_fi
         token = CancelToken()
         if process_callback:
             process_callback(token)
-        bitrate_bps = int(original_bitrate) if (keep_original_bitrate and original_bitrate) else None
+        try:
+            from gpu_engine import probe as gpu_probe
+
+            meta = gpu_probe.probe_video(input_file)
+            bitrate_bps = _resolve_pipeline_bitrate(
+                "final",
+                meta.width,
+                meta.height,
+                meta.source_fps or 30.0,
+                original_bitrate or meta.bitrate_bps,
+                keep_original_bitrate,
+                log_callback=log_callback,
+            )
+        except Exception:
+            bitrate_bps = int(original_bitrate) if (keep_original_bitrate and original_bitrate) else None
         if log_callback:
             stage = "fisheye/process/defisheye" if use_fisheye else "process"
             log_callback(f"--- NativeGPU SBS fused stream: {stage} without intermediate files ---")
@@ -1794,7 +2482,12 @@ def _run_native_single_eye_stream(input_file, output_file, eye_mode, start_time,
         if process_callback:
             process_callback(token)
         side = "left" if eye_mode == 1 else "right"
-        bitrate_bps = int(original_bitrate / 2) if (keep_original_bitrate and original_bitrate) else None
+        bitrate_bps = _resolve_single_eye_final_bitrate(
+            input_file,
+            original_bitrate,
+            keep_original_bitrate,
+            log_callback=log_callback,
+        )
         if log_callback:
             stage = "fisheye/process" if use_fisheye else "process"
             log_callback(f"--- NativeGPU single-eye stream: {side}/{stage} without intermediate files ---")
@@ -1856,12 +2549,12 @@ def run_single_file_pipeline(input_file, start_time, end_time, use_fisheye, keep
             return
 
         original_bitrate = get_video_bitrate(input_file, log_callback)
-        final_bitrate_kbps = None
-        if keep_original_bitrate and original_bitrate:
-            final_bitrate_kbps = int((original_bitrate / 2) / 1000)
-        split_bitrate_bps, split_max_bps = _single_eye_split_vbr_bps(original_bitrate)
-        split_bitrate_kbps = _bitrate_bps_to_kbps(split_bitrate_bps)
-        split_max_kbps = _bitrate_bps_to_kbps(split_max_bps)
+        eye_intermediate_bitrate = _resolve_sbs_eye_intermediate_bitrate(
+            input_file,
+            original_bitrate,
+            keep_original_bitrate,
+            log_callback=log_callback,
+        )
         pre_extract_enabled = _pre_extract_supported(pre_extract, log_callback)
         source_scan_enabled = _source_scan_supported(source_scan, log_callback)
 
@@ -1886,6 +2579,8 @@ def run_single_file_pipeline(input_file, start_time, end_time, use_fisheye, keep
                 _release_pre_extract_detector_if_needed(pre_extract_enabled or source_scan_enabled, log_callback)
                 cleanup_success_artifacts = True
                 return
+            if result == PreExtractResult.CANCELLED:
+                raise OperationCancelled("cancelled by user")
             if log_callback:
                 log_callback("[source-scan] falling back to the normal OneClick path")
 
@@ -1893,6 +2588,7 @@ def run_single_file_pipeline(input_file, start_time, end_time, use_fisheye, keep
             input_file, file_final, start_time, end_time, use_fisheye,
             original_bitrate, keep_original_bitrate, log_callback, process_callback,
         ):
+            _log_final_bitrate_summary(file_final, original_bitrate, log_callback)
             if log_callback: log_callback(f"Done! Output: {file_final}")
             cleanup_success_artifacts = True
             return
@@ -1905,8 +2601,8 @@ def run_single_file_pipeline(input_file, start_time, end_time, use_fisheye, keep
             
             # Step 2: LADA processing (2 commands)
             if log_callback: log_callback("--- Step 2/3: Processing ---")
-            _process_pre_extract_or_lada(file_l_fish, file_l_fish_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf)
-            _process_pre_extract_or_lada(file_r_fish, file_r_fish_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf)
+            _process_pre_extract_or_lada(file_l_fish, file_l_fish_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf, output_bitrate_bps=eye_intermediate_bitrate)
+            _process_pre_extract_or_lada(file_r_fish, file_r_fish_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf, output_bitrate_bps=eye_intermediate_bitrate)
             
             # Step 3: Fisheye->VR + Merge in one pass
             if log_callback: log_callback("--- Step 3/3: Fisheye->VR + Merging ---")
@@ -1926,8 +2622,8 @@ def run_single_file_pipeline(input_file, start_time, end_time, use_fisheye, keep
             
             # Step 2: Process
             if log_callback: log_callback("--- Step 2/3: Processing ---")
-            _process_pre_extract_or_lada(file_l, file_l_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf)
-            _process_pre_extract_or_lada(file_r, file_r_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf)
+            _process_pre_extract_or_lada(file_l, file_l_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf, output_bitrate_bps=eye_intermediate_bitrate)
+            _process_pre_extract_or_lada(file_r, file_r_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf, output_bitrate_bps=eye_intermediate_bitrate)
             
             # Step 3: Merge
             if log_callback: log_callback("--- Step 3/3: Merging ---")
@@ -1941,6 +2637,7 @@ def run_single_file_pipeline(input_file, start_time, end_time, use_fisheye, keep
                     if os.path.exists(f): os.remove(f)
         
         _release_pre_extract_detector_if_needed(pre_extract_enabled or source_scan_enabled, log_callback)
+        _log_final_bitrate_summary(file_final, original_bitrate, log_callback)
         if log_callback: log_callback(f"Done! Output: {file_final}")
         cleanup_success_artifacts = True
         
@@ -1990,9 +2687,16 @@ def run_single_eye_pipeline(input_file, eye_mode, start_time, end_time, use_fish
             return
 
         original_bitrate = get_video_bitrate(input_file, log_callback)
-        final_bitrate_kbps = None
-        if keep_original_bitrate and original_bitrate:
-            final_bitrate_kbps = int((original_bitrate / 2) / 1000)
+        final_bitrate_bps = _resolve_single_eye_final_bitrate(
+            input_file,
+            original_bitrate,
+            keep_original_bitrate,
+            log_callback=log_callback,
+        )
+        final_bitrate_kbps = _bitrate_bps_to_kbps(final_bitrate_bps)
+        split_bitrate_bps, split_max_bps = _single_eye_split_vbr_bps(original_bitrate)
+        split_bitrate_kbps = _bitrate_bps_to_kbps(split_bitrate_bps)
+        split_max_kbps = _bitrate_bps_to_kbps(split_max_bps)
         pre_extract_enabled = _pre_extract_supported(pre_extract, log_callback)
         source_scan_enabled = _source_scan_supported(source_scan, log_callback)
 
@@ -2018,6 +2722,8 @@ def run_single_eye_pipeline(input_file, eye_mode, start_time, end_time, use_fish
                 _release_pre_extract_detector_if_needed(pre_extract_enabled or source_scan_enabled, log_callback)
                 cleanup_success_artifacts = True
                 return
+            if result == PreExtractResult.CANCELLED:
+                raise OperationCancelled("cancelled by user")
             if log_callback:
                 log_callback("[source-scan] falling back to the normal OneClick path")
 
@@ -2025,6 +2731,7 @@ def run_single_eye_pipeline(input_file, eye_mode, start_time, end_time, use_fish
             input_file, file_final, eye_mode, start_time, end_time, use_fisheye,
             original_bitrate, keep_original_bitrate, log_callback, process_callback,
         ):
+            _log_final_bitrate_summary(file_final, final_bitrate_bps, log_callback)
             if log_callback: log_callback(f"Done! Output: {file_final}")
             cleanup_success_artifacts = True
             return
@@ -2062,7 +2769,16 @@ def run_single_eye_pipeline(input_file, eye_mode, start_time, end_time, use_fish
                 if log_callback: log_callback(f"Intermediate file exists: {file_cut}. Skipping split.")
             # Step 2: Process (lada/jasna)
             if log_callback: log_callback("--- Step 2/2: Processing ---")
-            _process_pre_extract_or_lada(file_cut, file_final, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf)
+            _process_pre_extract_or_lada(
+                file_cut,
+                file_final,
+                pre_extract_enabled,
+                keep_intermediate,
+                log_callback,
+                process_callback,
+                fine_conf=fine_conf,
+                output_bitrate_bps=final_bitrate_bps,
+            )
             cleanup_list = [file_cut]
 
         # Cleanup
@@ -2072,6 +2788,7 @@ def run_single_eye_pipeline(input_file, eye_mode, start_time, end_time, use_fish
                 if os.path.exists(f): os.remove(f)
 
         _release_pre_extract_detector_if_needed(pre_extract_enabled or source_scan_enabled, log_callback)
+        _log_final_bitrate_summary(file_final, final_bitrate_bps, log_callback)
         if log_callback: log_callback(f"Done! Output: {file_final}")
         cleanup_success_artifacts = True
 
@@ -2127,6 +2844,12 @@ def run_batch_pipeline(directory, use_fisheye, keep_original_bitrate=False, log_
                 continue
             
             original_bitrate = get_video_bitrate(input_file, log_callback)
+            eye_intermediate_bitrate = _resolve_sbs_eye_intermediate_bitrate(
+                input_file,
+                original_bitrate,
+                keep_original_bitrate,
+                log_callback=log_callback,
+            )
 
             if source_scan_enabled:
                 result = _run_source_scan_branch(
@@ -2146,6 +2869,8 @@ def run_batch_pipeline(directory, use_fisheye, keep_original_bitrate=False, log_
                         log_callback(f"Done! Output: {file_final}")
                     cleanup_success_artifacts = True
                     continue
+                if result == PreExtractResult.CANCELLED:
+                    raise OperationCancelled("cancelled by user")
                 if log_callback:
                     log_callback("[source-scan] falling back to the normal OneClick path")
 
@@ -2153,6 +2878,7 @@ def run_batch_pipeline(directory, use_fisheye, keep_original_bitrate=False, log_
                 input_file, file_final, None, None, use_fisheye,
                 original_bitrate, keep_original_bitrate, log_callback, process_callback,
             ):
+                _log_final_bitrate_summary(file_final, original_bitrate, log_callback)
                 if log_callback: log_callback(f"Done! Output: {file_final}")
                 cleanup_success_artifacts = True
                 continue
@@ -2175,7 +2901,7 @@ def run_batch_pipeline(directory, use_fisheye, keep_original_bitrate=False, log_
                         split_video(input_file, file_l, "crop=iw/2:ih:0:0", None, None, log_callback, process_callback)
                         convert_projection(file_l, file_l_fish, "hequirect:fisheye", log_callback, process_callback)
                         if os.path.exists(file_l): os.remove(file_l)
-                    _process_pre_extract_or_lada(file_l_fish, file_l_fish_restored, pre_extract_enabled, False, log_callback, process_callback, fine_conf=fine_conf)
+                    _process_pre_extract_or_lada(file_l_fish, file_l_fish_restored, pre_extract_enabled, False, log_callback, process_callback, fine_conf=fine_conf, output_bitrate_bps=eye_intermediate_bitrate)
                 
                 if not skip_r:
                     if not os.path.exists(file_r_fish):
@@ -2183,7 +2909,7 @@ def run_batch_pipeline(directory, use_fisheye, keep_original_bitrate=False, log_
                         split_video(input_file, file_r, "crop=iw/2:ih:iw/2:0", None, None, log_callback, process_callback)
                         convert_projection(file_r, file_r_fish, "hequirect:fisheye", log_callback, process_callback)
                         if os.path.exists(file_r): os.remove(file_r)
-                    _process_pre_extract_or_lada(file_r_fish, file_r_fish_restored, pre_extract_enabled, False, log_callback, process_callback, fine_conf=fine_conf)
+                    _process_pre_extract_or_lada(file_r_fish, file_r_fish_restored, pre_extract_enabled, False, log_callback, process_callback, fine_conf=fine_conf, output_bitrate_bps=eye_intermediate_bitrate)
                 
                 # Step 3: Fisheye->VR + Merge in one pass
                 merge_videos_fisheye(file_l_fish_restored, file_r_fish_restored, file_final, original_bitrate, keep_original_bitrate, log_callback, process_callback)
@@ -2209,9 +2935,9 @@ def run_batch_pipeline(directory, use_fisheye, keep_original_bitrate=False, log_
                     
                 # Step 2: Process
                 if not skip_l:
-                    _process_pre_extract_or_lada(file_l, file_l_restored, pre_extract_enabled, False, log_callback, process_callback, fine_conf=fine_conf)
+                    _process_pre_extract_or_lada(file_l, file_l_restored, pre_extract_enabled, False, log_callback, process_callback, fine_conf=fine_conf, output_bitrate_bps=eye_intermediate_bitrate)
                 if not skip_r:
-                    _process_pre_extract_or_lada(file_r, file_r_restored, pre_extract_enabled, False, log_callback, process_callback, fine_conf=fine_conf)
+                    _process_pre_extract_or_lada(file_r, file_r_restored, pre_extract_enabled, False, log_callback, process_callback, fine_conf=fine_conf, output_bitrate_bps=eye_intermediate_bitrate)
                     
                 # Step 3: Merge
                 merge_videos(file_l_restored, file_r_restored, file_final, original_bitrate, keep_original_bitrate, log_callback, process_callback)
@@ -2220,8 +2946,13 @@ def run_batch_pipeline(directory, use_fisheye, keep_original_bitrate=False, log_
                 cleanup_list = [file_l, file_r, file_l_restored, file_r_restored]
                 for f in cleanup_list:
                     if os.path.exists(f): os.remove(f)
+            _log_final_bitrate_summary(file_final, original_bitrate, log_callback)
             cleanup_success_artifacts = True
                 
+        except OperationCancelled:
+            if log_callback:
+                log_callback("Cancelled by user")
+            raise
         except Exception as e:
             if log_callback: log_callback(f"Error processing {os.path.basename(input_file)}: {e}")
         finally:
@@ -2269,9 +3000,13 @@ def run_batch_eye_pipeline(directory, eye_mode, use_fisheye, keep_original_bitra
                 continue
                 
             original_bitrate = get_video_bitrate(input_file, log_callback)
-            final_bitrate_kbps = None
-            if keep_original_bitrate and original_bitrate:
-                final_bitrate_kbps = int((original_bitrate / 2) / 1000)
+            final_bitrate_bps = _resolve_single_eye_final_bitrate(
+                input_file,
+                original_bitrate,
+                keep_original_bitrate,
+                log_callback=log_callback,
+            )
+            final_bitrate_kbps = _bitrate_bps_to_kbps(final_bitrate_bps)
             split_bitrate_bps, split_max_bps = _single_eye_split_vbr_bps(original_bitrate)
             split_bitrate_kbps = _bitrate_bps_to_kbps(split_bitrate_bps)
             split_max_kbps = _bitrate_bps_to_kbps(split_max_bps)
@@ -2295,6 +3030,8 @@ def run_batch_eye_pipeline(directory, eye_mode, use_fisheye, keep_original_bitra
                         log_callback(f"Done! Output: {file_final}")
                     cleanup_success_artifacts = True
                     continue
+                if result == PreExtractResult.CANCELLED:
+                    raise OperationCancelled("cancelled by user")
                 if log_callback:
                     log_callback("[source-scan] falling back to the normal OneClick path")
 
@@ -2302,6 +3039,7 @@ def run_batch_eye_pipeline(directory, eye_mode, use_fisheye, keep_original_bitra
                 input_file, file_final, eye_mode, None, None, use_fisheye,
                 original_bitrate, keep_original_bitrate, log_callback, process_callback,
             ):
+                _log_final_bitrate_summary(file_final, final_bitrate_bps, log_callback)
                 if log_callback: log_callback(f"Done! Output: {file_final}")
                 cleanup_success_artifacts = True
                 continue
@@ -2327,10 +3065,24 @@ def run_batch_eye_pipeline(directory, eye_mode, use_fisheye, keep_original_bitra
                         final_bitrate_kbps=split_bitrate_kbps,
                         max_bitrate_kbps=split_max_kbps,
                     )
-                _process_pre_extract_or_lada(file_cut, file_final, pre_extract_enabled, False, log_callback, process_callback, fine_conf=fine_conf)
+                _process_pre_extract_or_lada(
+                    file_cut,
+                    file_final,
+                    pre_extract_enabled,
+                    False,
+                    log_callback,
+                    process_callback,
+                    fine_conf=fine_conf,
+                    output_bitrate_bps=final_bitrate_bps,
+                )
                 if os.path.exists(file_cut): os.remove(file_cut)
+            _log_final_bitrate_summary(file_final, final_bitrate_bps, log_callback)
             cleanup_success_artifacts = True
 
+        except OperationCancelled:
+            if log_callback:
+                log_callback("Cancelled by user")
+            raise
         except Exception as e:
             if log_callback: log_callback(f"Error processing {os.path.basename(input_file)}: {e}")
         finally:
@@ -2366,6 +3118,7 @@ def run_merge_tool(left_file, right_file, keep_original_bitrate=True, log_callba
                 target_original_bitrate = b_left * 2
 
         merge_videos(left_file, right_file, output_file, target_original_bitrate, keep_original_bitrate, log_callback, process_callback)
+        _log_final_bitrate_summary(output_file, target_original_bitrate, log_callback)
         if log_callback: log_callback(f"Done! Output: {output_file}")
         
     except Exception as e:

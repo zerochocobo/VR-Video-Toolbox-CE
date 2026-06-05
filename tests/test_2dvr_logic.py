@@ -31,6 +31,12 @@ def test_default_flat_fov_is_80_degrees():
     assert logic.DEFAULT_FLAT_FOV_DEG == pytest.approx(80.0)
 
 
+def test_da3_vendor_root_uses_correct_vendor_dir():
+    root = logic.da3_vendor_root()
+    assert root.parts[-2:] == ("_vendor", "da3")
+    assert (root / "depth_anything_3").exists()
+
+
 def test_extract_depth_accepts_da3_prediction_object():
     class PredictionLike:
         def __init__(self, depth):

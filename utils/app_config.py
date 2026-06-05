@@ -31,12 +31,16 @@ _DEFAULTS = {
     'transcode_backend': 'auto',  # auto | gpu | ffmpeg
     'mosaic_engine': 'lada',      # lada | jasna | native_gpu placeholder, not implemented.
     'gpu_log_verbose': False,
-    'gpu_bitrate_multiplier': 2.0,  # Intermediate/converted target bitrate = source bitrate times this value.
+    'gpu_bitrate_multiplier': 2.0,  # Intermediate target bitrate = source bitrate * this. Decoupled from keep_original_bitrate so downstream re-encodes always keep headroom for high-detail regions.
+    'gpu_bitrate_final_multiplier': 1.0,  # Final OneClick outputs converge to source bitrate by default.
     'gpu_encode_preset': 'P7',      # NVENC presets P1 fast/low quality through P7 slow/high quality; frontend may expose P4-P7.
+    'progress_log_interval_s': 5.0,
+    'progress_log_min_pct': 5.0,
+    'output_mp4_faststart': 'auto',  # auto | always | off. Auto disables faststart for very large muxes.
     # OneClick pre-extract: detect/crop mosaic time ranges and regions before sending them to lada/jasna.
     'pre_extract_detection_model': 'lada_vr_mosaic_detection_model_v2_fast.pt',
     'pre_extract_sample_stride_s': 0.5,
-    'pre_extract_yolo_batch': 4,
+    'pre_extract_yolo_batch': 8,
     'pre_extract_head_tail_pad_s': 2.0,
     'pre_extract_merge_gap_s': 1.5,
     'pre_extract_min_gap_s': 2.0,
@@ -60,12 +64,19 @@ _DEFAULTS = {
     'pre_extract_spatial_cluster_high_conf': 0.70,
     'pre_extract_spatial_cluster_min_boxes': 2,
     'pre_extract_far_box_min_conf': 0.50,
+    'pre_extract_empty_scan_cache': True,
     'pre_extract_pair_min_overlap_s': 0.25,
     'pre_extract_pair_min_spatial_overlap': 0.05,
+    'pre_extract_extract_group_max': 8,
+    'pre_extract_pipeline_enabled': True,
     'pre_extract_save_detection_debug': True,
     'pre_extract_keep_segments': False,
     'pre_extract_inject_keyframes': 'auto',
     'pre_extract_inject_gop_sec': 2.0,
+    'pre_extract_keyframe_scan_backend': 'auto',  # auto | gpu | cpu. Source keyframe scan uses GPU when safe.
+    'paste_passthrough_enabled': True,
+    'paste_passthrough_min_frames': 60,
+    'paste_passthrough_max_subseg': 32,
     # OneClick source-scan: scan the source SBS first and process only time ranges containing mosaics.
     'source_scan_enabled': True,
     'source_scan_strategy': 'keyframes',

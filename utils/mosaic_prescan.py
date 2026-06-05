@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import subprocess
@@ -85,6 +86,78 @@ def _model_path() -> str:
     except Exception:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         return os.path.join(root, "models", name)
+
+
+def _path_identity(path: str | Path) -> dict:
+    p = Path(path)
+    st = p.stat()
+    return {
+        "path": str(p.resolve()),
+        "size": int(st.st_size),
+        "mtime_ns": int(st.st_mtime_ns),
+    }
+
+
+def _empty_scan_cache_path(video_path: str | Path, *, mode: str,
+                           min_conf: float | None,
+                           crop_mode: str = "",
+                           to_fisheye: bool = False) -> Path | None:
+    if min_conf is None or not bool(_cfg("pre_extract_empty_scan_cache", True)):
+        return None
+    try:
+        source = _path_identity(video_path)
+    except OSError:
+        return None
+    model_path = Path(_model_path())
+    try:
+        model = _path_identity(model_path)
+    except OSError:
+        model = {"path": str(model_path), "size": 0, "mtime_ns": 0}
+    payload = {
+        "format_version": 1,
+        "source": source,
+        "model": model,
+        "mode": str(mode),
+        "crop_mode": str(crop_mode or ""),
+        "to_fisheye": bool(to_fisheye),
+        "min_conf": float(min_conf),
+        "sample_stride_s": float(_cfg("pre_extract_sample_stride_s", 0.5) or 0.5),
+        "yolo_imgsz": int(_cfg("pre_extract_yolo_imgsz", 2048) or 0),
+        "use_mask_boxes": bool(_cfg("pre_extract_use_mask_boxes", True)),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
+    p = Path(video_path)
+    return p.with_name(f"{p.stem}.fine_empty_cache") / f"{mode}.{digest}.json"
+
+
+def _load_empty_scan_cache(path: Path | None, log_callback=None) -> bool:
+    if path is None or not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return False
+    if not bool(data.get("empty")):
+        return False
+    if log_callback:
+        log_callback(f"[pre-extract] fine empty-scan cache hit: {path}")
+    return True
+
+
+def _write_empty_scan_cache(path: Path | None, log_callback=None) -> None:
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps({"empty": True}, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+        if log_callback:
+            log_callback(f"[pre-extract] fine empty-scan cache saved: {path}")
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[pre-extract] fine empty-scan cache save skipped: {type(exc).__name__}: {exc}")
 
 
 def _align_down(value: int, align: int) -> int:
@@ -541,6 +614,38 @@ def _get_detector(log_callback=None, *, frame_w: int | None = None, frame_h: int
         return _DETECTOR
 
 
+def _is_detector_oom(exc: BaseException) -> bool:
+    if isinstance(exc, MemoryError):
+        return True
+    text = str(exc).lower()
+    return "out of memory" in text or "cuda oom" in text or "cublas_status_alloc_failed" in text
+
+
+def _run_detector_batch(detector, frames: list, log_callback=None):
+    try:
+        preprocessed = detector.preprocess(frames)
+        return list(detector.inference_and_postprocess(preprocessed, frames))
+    except (RuntimeError, MemoryError) as exc:
+        if len(frames) <= 1 or not _is_detector_oom(exc):
+            raise
+        mid = max(1, len(frames) // 2)
+        if log_callback:
+            log_callback(
+                f"[pre-extract] detector batch OOM at batch={len(frames)}; "
+                f"retrying as {mid}+{len(frames) - mid}"
+            )
+        try:
+            import torch
+
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        return (
+            _run_detector_batch(detector, frames[:mid], log_callback=log_callback)
+            + _run_detector_batch(detector, frames[mid:], log_callback=log_callback)
+        )
+
+
 def release_detector(log_callback=None) -> None:
     """Release the cached YOLO detector and return its VRAM to CUDA."""
     global _DETECTOR, _DETECTOR_CONFIG
@@ -577,7 +682,7 @@ def _scan_hits(video_path: str | Path, log_callback=None, cancel_token=None,
 
     stride_s = max(0.05, float(_cfg("pre_extract_sample_stride_s", 0.5) or 0.5))
     stride_frames = max(1, int(round(stride_s * fps)))
-    batch_size = max(1, int(_cfg("pre_extract_yolo_batch", 4) or 4))
+    batch_size = max(1, int(_cfg("pre_extract_yolo_batch", 8) or 8))
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -597,8 +702,7 @@ def _scan_hits(video_path: str | Path, log_callback=None, cancel_token=None,
         nonlocal batch_frames, batch_times, batch_indices
         if not batch_frames:
             return
-        preprocessed = detector.preprocess(batch_frames)
-        results = detector.inference_and_postprocess(preprocessed, batch_frames)
+        results = _run_detector_batch(detector, batch_frames, log_callback=log_callback)
         for frame_idx, ts, result in zip(batch_indices, batch_times, results):
             boxes, detections = _extract_boxes_with_debug(result, min_conf=min_conf)
             if detections:
@@ -649,6 +753,38 @@ def _scan_hits(video_path: str | Path, log_callback=None, cancel_token=None,
     return hits, meta, debug_records
 
 
+def _keyframe_left_eye_geometry(meta: probe.VideoMetadata, video_path: str | Path) -> tuple[int, int, int, int]:
+    src_w = max(2, int(meta.width or 0))
+    src_h = max(2, int(meta.height or 0))
+    if src_w <= 2 or src_h <= 2:
+        raise RuntimeError(f"cannot determine source size for keyframe scan: {video_path}")
+    out_w = max(2, src_w // 2)
+    out_h = src_h
+    out_w -= out_w % 2
+    out_h -= out_h % 2
+    return src_w, src_h, out_w, out_h
+
+
+def _keyframe_scan_meta(video_path: str | Path, src_meta: probe.VideoMetadata,
+                        out_w: int, out_h: int) -> probe.VideoMetadata:
+    return probe.VideoMetadata(
+        path=str(video_path),
+        codec_name=src_meta.codec_name,
+        profile=src_meta.profile,
+        pix_fmt=src_meta.pix_fmt,
+        width=int(out_w),
+        height=int(out_h),
+        bit_depth=src_meta.bit_depth,
+        duration=src_meta.duration,
+        nb_frames=src_meta.nb_frames,
+        source_fps=src_meta.source_fps,
+        is_cfr=src_meta.is_cfr,
+        bitrate_bps=src_meta.bitrate_bps,
+        color=src_meta.color,
+        audio_codec="",
+    )
+
+
 def _scan_hits_keyframes_lowres(video_path: str | Path, log_callback=None,
                                 cancel_token=None,
                                 min_conf: float | None = None) -> tuple[list[dict], probe.VideoMetadata, list[dict]]:
@@ -664,14 +800,7 @@ def _scan_hits_keyframes_lowres(video_path: str | Path, log_callback=None,
             log_callback("[source-scan] no keyframe list available; falling back to normal scan")
         return _scan_hits(video_path, log_callback=log_callback, cancel_token=cancel_token, min_conf=min_conf)
 
-    src_w = max(2, int(meta.width or 0))
-    src_h = max(2, int(meta.height or 0))
-    if src_w <= 2 or src_h <= 2:
-        raise RuntimeError(f"cannot determine source size for keyframe scan: {video_path}")
-    out_w = max(2, src_w // 2)
-    out_h = src_h
-    out_w -= out_w % 2
-    out_h -= out_h % 2
+    src_w, src_h, out_w, out_h = _keyframe_left_eye_geometry(meta, video_path)
     frame_bytes = out_w * out_h * 3
 
     ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
@@ -706,7 +835,7 @@ def _scan_hits_keyframes_lowres(video_path: str | Path, log_callback=None,
     batch_frames = []
     batch_times = []
     batch_indices = []
-    batch_size = max(1, int(_cfg("pre_extract_yolo_batch", 4) or 4))
+    batch_size = max(1, int(_cfg("pre_extract_yolo_batch", 8) or 8))
     sampled = 0
     t0 = time.perf_counter()
     last_log = 0.0
@@ -715,8 +844,7 @@ def _scan_hits_keyframes_lowres(video_path: str | Path, log_callback=None,
         nonlocal batch_frames, batch_times, batch_indices
         if not batch_frames:
             return
-        preprocessed = detector.preprocess(batch_frames)
-        results = detector.inference_and_postprocess(preprocessed, batch_frames)
+        results = _run_detector_batch(detector, batch_frames, log_callback=log_callback)
         for frame_idx, ts, result in zip(batch_indices, batch_times, results):
             boxes, detections = _extract_boxes_with_debug(result, min_conf=min_conf)
             if detections:
@@ -771,23 +899,184 @@ def _scan_hits_keyframes_lowres(video_path: str | Path, log_callback=None,
         raise RuntimeError(f"source keyframe scan ffmpeg failed with code {proc.returncode}")
     if log_callback:
         log_callback(f"[source-scan] detector hits: {len(hits)} keyframes")
-    out_meta = probe.VideoMetadata(
-        path=str(video_path),
-        codec_name=meta.codec_name,
-        profile=meta.profile,
-        pix_fmt=meta.pix_fmt,
-        width=int(out_w),
-        height=int(out_h),
-        bit_depth=meta.bit_depth,
-        duration=meta.duration,
-        nb_frames=meta.nb_frames,
-        source_fps=meta.source_fps,
-        is_cfr=meta.is_cfr,
-        bitrate_bps=meta.bitrate_bps,
-        color=meta.color,
-        audio_codec="",
-    )
-    return hits, out_meta, debug_records
+    return hits, _keyframe_scan_meta(video_path, meta, out_w, out_h), debug_records
+
+
+def _scan_hits_keyframes_gpu(video_path: str | Path, log_callback=None,
+                             cancel_token=None,
+                             min_conf: float | None = None) -> tuple[list[dict], probe.VideoMetadata, list[dict]]:
+    from gpu_engine.fallback import OperationCancelled
+    from gpu_engine.pynv_io import PyNvSimpleDecoder
+    from utils.keyframe_cutter import list_keyframes
+
+    src_meta, decision = probe.route(video_path)
+    if not decision.is_gpu:
+        raise RuntimeError(f"source keyframe GPU scan is not available: {decision.reason}")
+
+    keyframes = list_keyframes(video_path)
+    if not keyframes:
+        if log_callback:
+            log_callback("[source-scan] no keyframe list available; falling back to normal scan")
+        return _scan_hits(video_path, log_callback=log_callback, cancel_token=cancel_token, min_conf=min_conf)
+
+    src_w, src_h, out_w, out_h = _keyframe_left_eye_geometry(src_meta, video_path)
+    bd = 10 if src_meta.bit_depth > 8 else 8
+    dec = PyNvSimpleDecoder(Path(video_path), bit_depth=bd)
+    try:
+        total_frames = max(1, len(dec))
+        samples: list[tuple[float, int]] = []
+        seen_indices: set[int] = set()
+        for ts in keyframes:
+            idx = int(dec.index_at_time(float(ts)))
+            idx = max(0, min(idx, total_frames - 1))
+            if idx in seen_indices:
+                continue
+            seen_indices.add(idx)
+            samples.append((float(ts), idx))
+
+        if not samples:
+            samples = [(float(keyframes[0]), 0)]
+
+        if log_callback:
+            log_callback(
+                f"[source-scan] GPU keyframe scan: {len(samples)} keyframes, "
+                f"left-eye original-size crop {src_w}x{src_h} -> {out_w}x{out_h}, "
+                f"route={decision.backend}"
+            )
+
+        detector = _get_detector(log_callback, frame_w=out_w, frame_h=out_h)
+        hits: list[dict] = []
+        debug_records: list[dict] = []
+        batch_frames = []
+        batch_times = []
+        batch_indices = []
+        batch_size = max(1, int(_cfg("pre_extract_yolo_batch", 8) or 8))
+        sampled = 0
+        t0 = time.perf_counter()
+        last_log = 0.0
+
+        def _flush_batch():
+            nonlocal batch_frames, batch_times, batch_indices
+            if not batch_frames:
+                return
+            results = _run_detector_batch(detector, batch_frames, log_callback=log_callback)
+            for frame_idx, ts, result in zip(batch_indices, batch_times, results):
+                boxes, detections = _extract_boxes_with_debug(result, min_conf=min_conf)
+                if detections:
+                    debug_records.append({
+                        "frame_idx": int(frame_idx),
+                        "t": round(float(ts), 6),
+                        "frame_size": [int(out_w), int(out_h)],
+                        "detections": detections,
+                        "accepted_boxes_xyxy": [_box_to_list(b[:4]) for b in boxes],
+                    })
+                if boxes:
+                    hits.append({"t": ts, "boxes": boxes})
+            batch_frames = []
+            batch_times = []
+            batch_indices = []
+
+        for keyframe_pos, (ts, frame_idx) in enumerate(samples, start=1):
+            if cancel_token is not None and getattr(cancel_token, "cancelled", False):
+                raise OperationCancelled("cancelled by user")
+            frame = dec.frame_at(frame_idx)
+            y_plane, uv_plane = frame.y_uv_cupy()
+            y_plane = y_plane[0:out_h, 0:out_w]
+            uv_plane = uv_plane[0:out_h // 2, 0:out_w // 2, :]
+            batch_frames.append(_cupy_to_torch_bgr(y_plane, uv_plane, bit_depth=bd))
+            batch_times.append(float(ts))
+            batch_indices.append(int(frame_idx))
+            sampled += 1
+            if len(batch_frames) >= batch_size:
+                _flush_batch()
+            now = time.perf_counter()
+            if log_callback and now - last_log >= 5.0:
+                last_log = now
+                pct = 100.0 * keyframe_pos / max(1, len(samples))
+                elapsed = max(0.001, now - t0)
+                log_callback(
+                    f"[source-scan] scanned {sampled} GPU keyframes ({pct:.1f}%) "
+                    f"at {sampled / elapsed:.1f} samples/s"
+                )
+        _flush_batch()
+        if log_callback:
+            log_callback(f"[source-scan] detector hits: {len(hits)} GPU keyframes")
+        return hits, _keyframe_scan_meta(video_path, src_meta, out_w, out_h), debug_records
+    finally:
+        dec.stop()
+        try:
+            import torch
+
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+def _scan_hits_keyframes(video_path: str | Path, log_callback=None,
+                         cancel_token=None,
+                         min_conf: float | None = None) -> tuple[list[dict], probe.VideoMetadata, list[dict]]:
+    from gpu_engine.fallback import OperationCancelled
+
+    backend = str(_cfg("pre_extract_keyframe_scan_backend", "auto") or "auto").strip().lower()
+    if backend not in {"auto", "gpu", "cpu"}:
+        backend = "auto"
+    if backend == "cpu":
+        return _scan_hits_keyframes_lowres(
+            video_path,
+            log_callback=log_callback,
+            cancel_token=cancel_token,
+            min_conf=min_conf,
+        )
+    if backend == "gpu":
+        return _scan_hits_keyframes_gpu(
+            video_path,
+            log_callback=log_callback,
+            cancel_token=cancel_token,
+            min_conf=min_conf,
+        )
+
+    try:
+        _meta, decision = probe.route(video_path)
+    except OperationCancelled:
+        raise
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[source-scan] keyframe scan GPU route check failed; falling back to CPU: {type(exc).__name__}: {exc}")
+        return _scan_hits_keyframes_lowres(
+            video_path,
+            log_callback=log_callback,
+            cancel_token=cancel_token,
+            min_conf=min_conf,
+        )
+
+    if not decision.is_gpu:
+        if log_callback:
+            log_callback(f"[source-scan] keyframe scan backend: cpu ({decision.reason})")
+        return _scan_hits_keyframes_lowres(
+            video_path,
+            log_callback=log_callback,
+            cancel_token=cancel_token,
+            min_conf=min_conf,
+        )
+
+    try:
+        return _scan_hits_keyframes_gpu(
+            video_path,
+            log_callback=log_callback,
+            cancel_token=cancel_token,
+            min_conf=min_conf,
+        )
+    except OperationCancelled:
+        raise
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[source-scan] GPU keyframe scan failed; falling back to CPU: {type(exc).__name__}: {exc}")
+        return _scan_hits_keyframes_lowres(
+            video_path,
+            log_callback=log_callback,
+            cancel_token=cancel_token,
+            min_conf=min_conf,
+        )
 
 
 def _cupy_to_torch_bgr(y_plane, uv_plane, bit_depth: int = 8):
@@ -830,7 +1119,7 @@ def _scan_hits_gpu_transform(video_path: str | Path, *, crop_mode: str,
         total_frames = len(dec)
         stride_s = max(0.05, float(_cfg("pre_extract_sample_stride_s", 0.5) or 0.5))
         stride_frames = max(1, int(round(stride_s * fps)))
-        batch_size = max(1, int(_cfg("pre_extract_yolo_batch", 4) or 4))
+        batch_size = max(1, int(_cfg("pre_extract_yolo_batch", 8) or 8))
         detector = _get_detector(log_callback, frame_w=out_w, frame_h=out_h)
 
         hits: list[dict] = []
@@ -863,8 +1152,7 @@ def _scan_hits_gpu_transform(video_path: str | Path, *, crop_mode: str,
             nonlocal batch_frames, batch_times, batch_indices
             if not batch_frames:
                 return
-            preprocessed = detector.preprocess(batch_frames)
-            results = detector.inference_and_postprocess(preprocessed, batch_frames)
+            results = _run_detector_batch(detector, batch_frames, log_callback=log_callback)
             for frame_idx, ts, result in zip(batch_indices, batch_times, results):
                 boxes, detections = _extract_boxes_with_debug(result, min_conf=min_conf)
                 if detections:
@@ -1016,8 +1304,11 @@ def scan_segments(video_path: str | Path, log_callback=None, cancel_token=None,
                   scan_strategy: str | None = None,
                   min_conf: float | None = None) -> list[MosaicSegment]:
     strategy = str(scan_strategy or "normal").lower()
+    cache_path = _empty_scan_cache_path(video_path, mode=f"scan_{strategy}", min_conf=min_conf)
+    if _load_empty_scan_cache(cache_path, log_callback=log_callback):
+        return []
     if strategy in {"keyframes", "keyframe", "source_keyframes"}:
-        hits, meta, debug_records = _scan_hits_keyframes_lowres(video_path, log_callback=log_callback, cancel_token=cancel_token, min_conf=min_conf)
+        hits, meta, debug_records = _scan_hits_keyframes(video_path, log_callback=log_callback, cancel_token=cancel_token, min_conf=min_conf)
     else:
         hits, meta, debug_records = _scan_hits(video_path, log_callback=log_callback, cancel_token=cancel_token, min_conf=min_conf)
     if bool(_cfg("pre_extract_save_detection_debug", True)):
@@ -1031,6 +1322,8 @@ def scan_segments(video_path: str | Path, log_callback=None, cancel_token=None,
         dur = meta.duration or 0.0
         pct = (100.0 * covered / dur) if dur > 0 else 0.0
         log_callback(f"[pre-extract] aggregated {len(segments)} segments, {covered:.1f}s ({pct:.1f}% of video)")
+    if not segments:
+        _write_empty_scan_cache(cache_path, log_callback=log_callback)
     return segments
 
 
@@ -1038,6 +1331,15 @@ def scan_segments_gpu_transform(video_path: str | Path, *, crop_mode: str,
                                 to_fisheye: bool = False,
                                 log_callback=None, cancel_token=None,
                                 min_conf: float | None = None) -> list[MosaicSegment]:
+    cache_path = _empty_scan_cache_path(
+        video_path,
+        mode="gpu_transform",
+        min_conf=min_conf,
+        crop_mode=crop_mode,
+        to_fisheye=to_fisheye,
+    )
+    if _load_empty_scan_cache(cache_path, log_callback=log_callback):
+        return []
     hits, meta, debug_records = _scan_hits_gpu_transform(
         video_path,
         crop_mode=crop_mode,
@@ -1059,14 +1361,51 @@ def scan_segments_gpu_transform(video_path: str | Path, *, crop_mode: str,
         dur = meta.duration or 0.0
         pct = (100.0 * covered / dur) if dur > 0 else 0.0
         log_callback(f"[pre-extract] aggregated {len(segments)} transformed segments, {covered:.1f}s ({pct:.1f}% of video)")
+    if not segments:
+        _write_empty_scan_cache(cache_path, log_callback=log_callback)
     return segments
 
 
-def save_segments_json(segments: list[MosaicSegment], path: str | Path, source: str | Path | None = None) -> None:
+def _format_hms(seconds: float) -> str:
+    """Format seconds as HH:MM:SS.mmm for human reading."""
+    try:
+        s = max(0.0, float(seconds))
+    except (TypeError, ValueError):
+        s = 0.0
+    h, rem = divmod(s, 3600.0)
+    m, sec = divmod(rem, 60.0)
+    return f"{int(h):02d}:{int(m):02d}:{sec:06.3f}"
+
+
+def _segment_view_dict(seg: MosaicSegment, fps: float | None) -> dict:
+    """Serialize a MosaicSegment with extra human/analysis fields appended."""
+    data = seg.to_dict()
+    start_s = float(seg.start_s)
+    end_s = float(seg.end_s)
+    start_kf = float(seg.start_s_kf)
+    end_kf = float(seg.end_s_kf)
+    data["duration_s"] = round(max(0.0, end_s - start_s), 6)
+    data["start_hms"] = _format_hms(start_s)
+    data["end_hms"] = _format_hms(end_s)
+    if fps and fps > 0:
+        data["fps"] = float(fps)
+        data["start_frame"] = max(0, int(round(start_s * fps)))
+        data["end_frame"] = max(0, int(round(end_s * fps)))
+        data["start_frame_kf"] = max(0, int(round(start_kf * fps)))
+        data["end_frame_kf"] = max(0, int(round(end_kf * fps)))
+        data["frame_count"] = max(0, data["end_frame"] - data["start_frame"])
+    return data
+
+
+def save_segments_json(segments: list[MosaicSegment], path: str | Path,
+                       source: str | Path | None = None,
+                       fps: float | None = None) -> None:
     data = {
         "source": str(source) if source else "",
-        "segments": [seg.to_dict() for seg in segments],
+        "segments": [_segment_view_dict(seg, fps) for seg in segments],
     }
+    if fps and fps > 0:
+        data["fps"] = float(fps)
     Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 

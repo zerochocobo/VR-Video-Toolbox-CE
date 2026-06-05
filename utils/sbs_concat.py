@@ -8,7 +8,10 @@ import sys
 import tempfile
 from pathlib import Path
 
+from gpu_engine import mux
 from gpu_engine import probe
+from gpu_engine import restored_sidecar
+from gpu_engine.fallback import OperationCancelled
 
 _SIGNATURE_FIELDS = (
     "codec",
@@ -22,6 +25,26 @@ _SIGNATURE_FIELDS = (
     "color_transfer",
     "color_primaries",
 )
+
+
+class _TrackedProcess:
+    def __init__(self, proc: subprocess.Popen):
+        self._proc = proc
+        self.cancelled = False
+
+    def kill(self):
+        self.cancelled = True
+        return self._proc.kill()
+
+    def terminate(self):
+        self.cancelled = True
+        return self._proc.terminate()
+
+    def poll(self):
+        return self._proc.poll()
+
+    def __getattr__(self, name: str):
+        return getattr(self._proc, name)
 
 
 def _hidden_kwargs() -> dict:
@@ -45,8 +68,9 @@ def _run(cmd: list[str], log_callback=None, process_callback=None, label: str = 
         errors="replace",
         **_hidden_kwargs(),
     )
+    tracked = _TrackedProcess(proc)
     if process_callback:
-        process_callback(proc)
+        process_callback(tracked)
     try:
         if proc.stdout:
             for line in proc.stdout:
@@ -57,6 +81,8 @@ def _run(cmd: list[str], log_callback=None, process_callback=None, label: str = 
             proc.stdout.close()
         proc.wait()
     if proc.returncode != 0:
+        if tracked.cancelled:
+            raise OperationCancelled("cancelled by user")
         raise RuntimeError(f"ffmpeg {label} failed with code {proc.returncode}")
 
 
@@ -103,7 +129,7 @@ def _write_concat_list(entries: list, directory: str | Path | None = None) -> Pa
 
 
 def _video_signature(path: Path) -> tuple:
-    meta = probe.probe_video(path)
+    meta = restored_sidecar.metadata_from_sidecar(path) or probe.probe_video(path)
     color = meta.color
     return (
         meta.codec_name.lower(),
@@ -182,6 +208,9 @@ def _extract_entry_hevc(
     input_path = Path(entry.path)
     inpoint = _entry_inpoint(entry)
     outpoint = _entry_outpoint(entry)
+    if input_path.suffix.lower() == ".hevc" and inpoint is None and outpoint is None:
+        shutil.copyfile(input_path, output)
+        return
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-stats", "-y"]
     if inpoint is not None and inpoint > 0.0:
         cmd += ["-ss", f"{inpoint:.6f}"]
@@ -229,6 +258,75 @@ def _validate_fast_output(output: Path, source_meta: probe.VideoMetadata,
         )
 
 
+def _concat_timeline_hevc_demuxer(
+    entries: list,
+    output: Path,
+    *,
+    source_meta: probe.VideoMetadata,
+    audio_source: str | Path | None = None,
+    log_callback=None,
+    process_callback=None,
+) -> None:
+    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    list_file = _write_concat_list(entries, output.parent)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f"{output.stem}.hevc_demuxer_",
+        suffix=output.suffix,
+        dir=str(output.parent),
+    )
+    os.close(fd)
+    temp_video = Path(temp_name)
+    try:
+        try:
+            temp_video.unlink()
+        except OSError:
+            pass
+        paths = [Path(entry.path) for entry in entries]
+        size_hint = sum(path.stat().st_size for path in paths if path.exists())
+        if log_callback:
+            log_callback(
+                f"[source-scan] Stage 4 fast HEVC demuxer attempt: "
+                f"entries={len(entries)}, audio_source={audio_source or 'none'}, list={list_file}"
+            )
+        cmd = [
+            ffmpeg,
+            "-hide_banner", "-loglevel", "error", "-stats", "-y",
+            "-f", "concat", "-safe", "0", "-i", str(list_file),
+            "-map", "0:v:0",
+            "-c:v", "copy",
+            "-an",
+            "-avoid_negative_ts", "make_zero",
+        ]
+        cmd += mux.faststart_args(size_hint)
+        cmd += [str(temp_video)]
+        _run(cmd, log_callback=log_callback, process_callback=process_callback, label="fast hevc demuxer concat")
+
+        if audio_source is not None:
+            _mux_mp4_video_with_source_audio(
+                temp_video,
+                output,
+                audio_source,
+                log_callback=log_callback,
+                process_callback=process_callback,
+            )
+        else:
+            try:
+                output.unlink()
+            except OSError:
+                pass
+            temp_video.replace(output)
+        _validate_fast_output(output, source_meta, log_callback=log_callback)
+    finally:
+        try:
+            list_file.unlink()
+        except OSError:
+            pass
+        try:
+            temp_video.unlink()
+        except OSError:
+            pass
+
+
 def concat_timeline_hevc_fast(
     timeline: list,
     output: str | Path,
@@ -244,8 +342,6 @@ def concat_timeline_hevc_fast(
     Mosaic entries should point to full restored clips. Each entry is converted to
     AnnexB HEVC, concatenated as a raw stream, then muxed once with source audio.
     """
-    from gpu_engine import mux
-
     entries = sorted(timeline, key=lambda entry: (float(entry.start_s), float(entry.end_s), str(entry.kind)))
     if not entries:
         raise ValueError("concat_timeline_hevc_fast requires at least one timeline entry")
@@ -267,6 +363,29 @@ def concat_timeline_hevc_fast(
         raise RuntimeError("fast merge signature probe failed: " + "; ".join(signature_errors[:3]))
     if mismatch_messages:
         raise RuntimeError("fast merge parameter mismatch: " + "; ".join(mismatch_messages[:3]))
+
+    try:
+        _concat_timeline_hevc_demuxer(
+            entries,
+            output,
+            source_meta=source_meta,
+            audio_source=audio_source,
+            log_callback=log_callback,
+            process_callback=process_callback,
+        )
+        return
+    except OperationCancelled:
+        raise
+    except Exception as exc:
+        if log_callback:
+            log_callback(
+                f"[source-scan] fast HEVC demuxer concat failed; "
+                f"falling back to annex-b stream merge: {type(exc).__name__}: {exc}"
+            )
+        try:
+            output.unlink()
+        except OSError:
+            pass
 
     temp_dir = Path(tempfile.mkdtemp(prefix=f"{output.stem}.fast_hevc_", dir=str(output.parent)))
     raw_parts: list[Path] = []
@@ -422,7 +541,12 @@ def concat_timeline(
             if first_meta.color is not None:
                 cmd += first_meta.color.ffmpeg_args()
             cmd += ["-an"]
-        cmd += ["-movflags", "+faststart", str(concat_output)]
+        if copy_mode:
+            size_hint = sum(path.stat().st_size for path in paths if path.exists())
+        else:
+            size_hint = int(bitrate_bps * max(0.0, sum(float(e.end_s) - float(e.start_s) for e in entries)) / 8) if bitrate_bps else None
+        cmd += mux.faststart_args(size_hint)
+        cmd += [str(concat_output)]
         _run(cmd, log_callback=log_callback, process_callback=process_callback, label="concat")
 
         if audio_source is not None:
@@ -462,6 +586,7 @@ def _mux_mp4_video_with_source_audio(
     ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
+    size_hint = Path(video_mp4).stat().st_size if Path(video_mp4).exists() else None
     cmd = [
         ffmpeg,
         "-hide_banner", "-loglevel", "error", "-stats", "-y",
@@ -471,7 +596,7 @@ def _mux_mp4_video_with_source_audio(
         "-map", "1:a:0",
         "-c:v", "copy",
         "-c:a", "copy",
-        "-movflags", "+faststart",
-        str(output),
     ]
+    cmd += mux.faststart_args(size_hint)
+    cmd += [str(output)]
     _run(cmd, log_callback=log_callback, process_callback=process_callback, label="audio mux")

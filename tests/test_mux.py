@@ -10,6 +10,12 @@ from gpu_engine import mux
 
 
 class MuxPathTests(unittest.TestCase):
+    def test_faststart_policy_auto_disables_large_outputs(self) -> None:
+        self.assertTrue(mux.should_use_faststart(1024, "auto"))
+        self.assertFalse(mux.should_use_faststart(5 * 1024 * 1024 * 1024, "auto"))
+        self.assertTrue(mux.should_use_faststart(5 * 1024 * 1024 * 1024, "always"))
+        self.assertFalse(mux.should_use_faststart(1024, "off"))
+
     def test_mux_passes_unicode_paths_directly_and_creates_output_parent(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

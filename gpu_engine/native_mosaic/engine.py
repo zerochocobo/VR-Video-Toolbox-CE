@@ -90,7 +90,10 @@ class NativeMosaicEngine:
         return "hevc_nvenc", "-preset p5 -rc vbr -cq 20"
 
     def restore_file(self, input_path, output_path, *, max_clip_length=180,
-                     log_callback=None, cancel_token=None) -> bool:
+                     bitrate_bps: int | None = None,
+                     log_callback=None, cancel_token=None,
+                     produce_mp4: bool = True,
+                     sidecar_metadata: dict | None = None) -> bool:
         """Remove mosaics and write the output file.
 
         Plan A from 2026-05-31: prefer our GPU NVENC for output encoding. This
@@ -127,6 +130,8 @@ class NativeMosaicEngine:
             gpu_ok = bool(decision.is_gpu and not src_meta.is_hdr and not src_meta.is_bt2020)
             if not gpu_ok:
                 _log(f"[native] GPU NVENC unavailable ({decision.reason or 'non-SDR/10-bit'}); using VideoWriter")
+                if not produce_mp4:
+                    _log("[native] raw HEVC restore requested but GPU NVENC path is unavailable; writing mp4")
         except Exception as e:
             _log(f"[native] probe failed, using VideoWriter: {type(e).__name__}: {e}")
             gpu_ok = False
@@ -135,7 +140,10 @@ class NativeMosaicEngine:
             try:
                 return self._restore_file_gpu_nvenc(
                     _make_restorer(), input_path, output_path, meta, src_meta,
+                    bitrate_bps=bitrate_bps,
                     log_callback=log_callback, cancel_token=cancel_token,
+                    produce_mp4=produce_mp4,
+                    sidecar_metadata=sidecar_metadata,
                 )
             except _GpuEncodeSetupError as e:
                 _log(f"[native] GPU NVENC setup failed ({e}); fallback to VideoWriter")
@@ -146,7 +154,10 @@ class NativeMosaicEngine:
         )
 
     def _restore_file_gpu_nvenc(self, frame_restorer, input_path, output_path, meta, src_meta,
-                                *, log_callback=None, cancel_token=None) -> bool:
+                                *, bitrate_bps: int | None = None,
+                                log_callback=None, cancel_token=None,
+                                produce_mp4: bool = True,
+                                sidecar_metadata: dict | None = None) -> bool:
         """Plan A: encode restored frames directly from GPU through PyNv NVENC.
 
         Restored BGR frames from the file path, currently CPU torch, are uploaded
@@ -173,7 +184,7 @@ class NativeMosaicEngine:
         try:
             out_w, out_h = int(meta.video_width), int(meta.video_height)
             fps = float(meta.video_fps_exact)
-            bitrate = _resolve_bitrate(out_w, out_h, fps, None, getattr(src_meta, "bitrate_bps", None))
+            bitrate = _resolve_bitrate(out_w, out_h, fps, bitrate_bps, getattr(src_meta, "bitrate_bps", None))
             enc_kwargs = _encoder_kwargs(src_meta, bitrate)
             _log_encoder_settings("native restore", out_w, out_h, 8, enc_kwargs, log_callback)
             enc = PyNvEncoderSession(
@@ -232,6 +243,45 @@ class NativeMosaicEngine:
             except OSError:
                 pass
             return False
+
+        if not produce_mp4:
+            from gpu_engine import restored_sidecar
+
+            raw_output = restored_sidecar.raw_path_for_output(output_path)
+            raw_output.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                if raw_output.exists():
+                    raw_output.unlink()
+                raw_path.replace(raw_output)
+                sidecar_metadata = sidecar_metadata or {}
+                restored_sidecar.write_restored_sidecar(
+                    raw_output,
+                    width=out_w,
+                    height=out_h,
+                    bit_depth=8,
+                    fps=fps,
+                    frame_count=written,
+                    color=getattr(src_meta, "color", None),
+                    source=input_path,
+                    rect=sidecar_metadata.get("rect"),
+                    time_range=sidecar_metadata.get("time"),
+                    encoder=(
+                        f"hevc_nvenc {enc_kwargs.get('preset')} {enc_kwargs.get('rc')} "
+                        f"{int(enc_kwargs.get('bitrate', 0)) // 1000}kbps"
+                    ),
+                )
+            except Exception as exc:
+                try:
+                    if raw_path.exists():
+                        raw_path.unlink()
+                    if raw_output.exists():
+                        raw_output.unlink()
+                except OSError:
+                    pass
+                _log(f"[native] raw sidecar write failed: {type(exc).__name__}: {exc}")
+                return False
+            _log(f"[native] done raw -> {raw_output}")
+            return True
 
         _log("[native] muxing audio...")
         mux.mux_hevc_with_audio(

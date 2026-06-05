@@ -128,7 +128,7 @@ def default_da3_dir() -> Path:
 
 
 def da3_vendor_root() -> Path:
-    return Path(__file__).resolve().parent / "_vender" / "da3"
+    return Path(__file__).resolve().parent / "_vendor" / "da3"
 
 
 def check_dependencies() -> list[str]:
@@ -356,7 +356,7 @@ def _extract_depths(prediction: Any) -> np.ndarray:
 class DA3DepthEstimator:
     """Local Depth Anything 3 Small adapter.
 
-    DA3 code is vendored under tool_2dvr/_vender/da3. Model weights are
+    DA3 code is vendored under tool_2dvr/_vendor/da3. Model weights are
     resolved locally from models/DA3/Small and are not downloaded by this adapter.
     """
 
@@ -368,7 +368,7 @@ class DA3DepthEstimator:
         except Exception as exc:
             raise TwoDVRRuntimeError(
                 "Vendored Depth Anything 3 is not importable. Check "
-                "tool_2dvr/_vender/da3 and install omegaconf/einops/safetensors."
+                "tool_2dvr/_vendor/da3 and install omegaconf/einops/safetensors."
             ) from exc
 
         model_path = resolve_da3_model_path(self.model_root)

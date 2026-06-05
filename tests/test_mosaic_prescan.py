@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import types
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from gpu_engine.probe import VideoMetadata
@@ -49,6 +51,22 @@ class MosaicPrescanAggregationTests(unittest.TestCase):
 
     def test_large_boxes_are_not_rejected_by_area(self) -> None:
         self.assertIsNone(mosaic_prescan._box_limit_reason((0.0, 0.0, 4096.0, 4096.0), 4096, 4096))
+
+    def test_detector_batch_oom_fallback_splits_and_preserves_order(self) -> None:
+        class Detector:
+            def preprocess(self, frames):
+                if len(frames) > 2:
+                    raise RuntimeError("CUDA out of memory")
+                return frames
+
+            def inference_and_postprocess(self, preprocessed, frames):
+                return [f"result-{frame}" for frame in frames]
+
+        messages = []
+        results = mosaic_prescan._run_detector_batch(Detector(), [1, 2, 3, 4, 5], log_callback=messages.append)
+
+        self.assertEqual(results, ["result-1", "result-2", "result-3", "result-4", "result-5"])
+        self.assertTrue(any("detector batch OOM" in item for item in messages))
 
     def test_low_conf_far_boxes_do_not_expand_segment_rect_to_full_frame(self) -> None:
         hits = []
@@ -177,6 +195,204 @@ class MosaicPrescanAggregationTests(unittest.TestCase):
         self.assertNotIn("scale=4:4", seen["cmd"])
         self.assertEqual(get_detector.call_args.kwargs["frame_w"], 4)
         self.assertEqual(get_detector.call_args.kwargs["frame_h"], 4)
+
+    def test_keyframe_backend_cpu_uses_ffmpeg_scan(self) -> None:
+        meta = VideoMetadata(path="source.mp4", width=4, height=4, duration=1.0, source_fps=30.0)
+
+        def cfg(key, default=None):
+            if key == "pre_extract_keyframe_scan_backend":
+                return "cpu"
+            return default
+
+        with (
+            patch("utils.mosaic_prescan._cfg", side_effect=cfg),
+            patch("utils.mosaic_prescan._scan_hits_keyframes_lowres", return_value=([], meta, [])) as scan_cpu,
+            patch("utils.mosaic_prescan._scan_hits_keyframes_gpu") as scan_gpu,
+        ):
+            hits, out_meta, debug = mosaic_prescan._scan_hits_keyframes("source.mp4")
+
+        self.assertEqual(hits, [])
+        self.assertEqual(out_meta, meta)
+        self.assertEqual(debug, [])
+        scan_cpu.assert_called_once()
+        scan_gpu.assert_not_called()
+
+    def test_keyframe_backend_auto_falls_back_to_cpu_on_gpu_error(self) -> None:
+        meta = VideoMetadata(path="source.mp4", codec_name="hevc", pix_fmt="nv12", width=4, height=4, duration=1.0, source_fps=30.0)
+        messages = []
+
+        def cfg(key, default=None):
+            if key == "pre_extract_keyframe_scan_backend":
+                return "auto"
+            return default
+
+        with (
+            patch("utils.mosaic_prescan._cfg", side_effect=cfg),
+            patch("utils.mosaic_prescan.probe.route", return_value=(meta, mosaic_prescan.probe.BackendDecision("gpu_nv12", "ok"))),
+            patch("utils.mosaic_prescan._scan_hits_keyframes_gpu", side_effect=RuntimeError("decoder failed")) as scan_gpu,
+            patch("utils.mosaic_prescan._scan_hits_keyframes_lowres", return_value=([], meta, [])) as scan_cpu,
+        ):
+            mosaic_prescan._scan_hits_keyframes("source.mp4", log_callback=messages.append)
+
+        scan_gpu.assert_called_once()
+        scan_cpu.assert_called_once()
+        self.assertTrue(any("GPU keyframe scan failed; falling back to CPU" in item for item in messages))
+
+    def test_keyframe_backend_gpu_uses_gpu_scan(self) -> None:
+        meta = VideoMetadata(path="source.mp4", width=4, height=4, duration=1.0, source_fps=30.0)
+
+        def cfg(key, default=None):
+            if key == "pre_extract_keyframe_scan_backend":
+                return "gpu"
+            return default
+
+        with (
+            patch("utils.mosaic_prescan._cfg", side_effect=cfg),
+            patch("utils.mosaic_prescan._scan_hits_keyframes_gpu", return_value=([], meta, [])) as scan_gpu,
+            patch("utils.mosaic_prescan._scan_hits_keyframes_lowres") as scan_cpu,
+        ):
+            hits, out_meta, debug = mosaic_prescan._scan_hits_keyframes("source.mp4")
+
+        self.assertEqual(hits, [])
+        self.assertEqual(out_meta, meta)
+        self.assertEqual(debug, [])
+        scan_gpu.assert_called_once()
+        scan_cpu.assert_not_called()
+
+    def test_keyframe_gpu_scan_uses_simple_decoder_time_indices(self) -> None:
+        import numpy as np
+
+        class FakeFrame:
+            def y_uv_cupy(self):
+                return np.zeros((4, 8), dtype=np.uint8), np.zeros((2, 4, 2), dtype=np.uint8)
+
+        class FakeDecoder:
+            info = types.SimpleNamespace(width=8, height=4)
+
+            def __init__(self, _path, bit_depth=8):
+                self.bit_depth = bit_depth
+                self.indices = []
+
+            def __len__(self):
+                return 100
+
+            def index_at_time(self, seconds):
+                return int(round(float(seconds) * 30.0)) + 1
+
+            def frame_at(self, index):
+                seen["indices"].append(index)
+                return FakeFrame()
+
+            def stop(self):
+                seen["stopped"] = True
+
+        class Detector:
+            def preprocess(self, frames):
+                seen["batch_frames"] = list(frames)
+                return frames
+
+            def inference_and_postprocess(self, preprocessed, frames):
+                class Result:
+                    boxes = None
+                    masks = None
+                    orig_shape = (4, 4, 3)
+
+                return [Result() for _ in frames]
+
+        seen = {"indices": []}
+        meta = VideoMetadata(
+            path="source.mp4",
+            codec_name="hevc",
+            pix_fmt="nv12",
+            width=8,
+            height=4,
+            duration=2.0,
+            source_fps=30.0,
+        )
+
+        with (
+            patch("utils.mosaic_prescan.probe.route", return_value=(meta, mosaic_prescan.probe.BackendDecision("gpu_nv12", "ok"))),
+            patch("utils.keyframe_cutter.list_keyframes", return_value=[0.0, 1.0]),
+            patch("gpu_engine.pynv_io.PyNvSimpleDecoder", FakeDecoder),
+            patch("utils.mosaic_prescan._cupy_to_torch_bgr", side_effect=lambda *_args, **_kwargs: "frame"),
+            patch("utils.mosaic_prescan._get_detector", return_value=Detector()) as get_detector,
+        ):
+            hits, out_meta, _debug = mosaic_prescan._scan_hits_keyframes_gpu("source.mp4")
+
+        self.assertEqual(hits, [])
+        self.assertEqual(seen["indices"], [1, 31])
+        self.assertTrue(seen["stopped"])
+        self.assertEqual((out_meta.width, out_meta.height), (4, 4))
+        self.assertEqual(get_detector.call_args.kwargs["frame_w"], 4)
+        self.assertEqual(get_detector.call_args.kwargs["frame_h"], 4)
+
+    def test_fine_empty_scan_cache_skips_second_gpu_transform_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            video = root / "clip.mp4"
+            model = root / "model.pt"
+            video.write_bytes(b"video")
+            model.write_bytes(b"model")
+            meta = VideoMetadata(path=str(video), width=8, height=4, duration=1.0, source_fps=30.0)
+
+            def cfg(key, default=None):
+                values = {
+                    "pre_extract_empty_scan_cache": True,
+                    "pre_extract_save_detection_debug": False,
+                    "pre_extract_sample_stride_s": 0.5,
+                    "pre_extract_yolo_imgsz": 2048,
+                    "pre_extract_use_mask_boxes": True,
+                }
+                return values.get(key, default)
+
+            with (
+                patch("utils.mosaic_prescan._cfg", side_effect=cfg),
+                patch("utils.mosaic_prescan._model_path", return_value=str(model)),
+                patch("utils.mosaic_prescan._scan_hits_gpu_transform", return_value=([], meta, [])) as scan_gpu,
+            ):
+                first = mosaic_prescan.scan_segments_gpu_transform(
+                    video,
+                    crop_mode="left",
+                    min_conf=0.5,
+                )
+                second = mosaic_prescan.scan_segments_gpu_transform(
+                    video,
+                    crop_mode="left",
+                    min_conf=0.5,
+                )
+
+            self.assertEqual(first, [])
+            self.assertEqual(second, [])
+            scan_gpu.assert_called_once()
+
+    def test_fine_empty_scan_cache_key_includes_min_conf(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            video = root / "clip.mp4"
+            model = root / "model.pt"
+            video.write_bytes(b"video")
+            model.write_bytes(b"model")
+            meta = VideoMetadata(path=str(video), width=8, height=4, duration=1.0, source_fps=30.0)
+
+            def cfg(key, default=None):
+                values = {
+                    "pre_extract_empty_scan_cache": True,
+                    "pre_extract_save_detection_debug": False,
+                    "pre_extract_sample_stride_s": 0.5,
+                    "pre_extract_yolo_imgsz": 2048,
+                    "pre_extract_use_mask_boxes": True,
+                }
+                return values.get(key, default)
+
+            with (
+                patch("utils.mosaic_prescan._cfg", side_effect=cfg),
+                patch("utils.mosaic_prescan._model_path", return_value=str(model)),
+                patch("utils.mosaic_prescan._scan_hits_gpu_transform", return_value=([], meta, [])) as scan_gpu,
+            ):
+                mosaic_prescan.scan_segments_gpu_transform(video, crop_mode="left", min_conf=0.5)
+                mosaic_prescan.scan_segments_gpu_transform(video, crop_mode="left", min_conf=0.6)
+
+            self.assertEqual(scan_gpu.call_count, 2)
 
 
 if __name__ == "__main__":
