@@ -160,18 +160,35 @@ class SourceTimeScannerTests(unittest.TestCase):
     def test_pair_eye_segments_skips_one_sided_groups(self) -> None:
         left = [
             MosaicSegment(0, 10.0, 20.0, 10.0, 20.0, 100, 100, 512, 512, 0.91),
-            MosaicSegment(1, 40.0, 45.0, 40.0, 45.0, 120, 120, 512, 512, 0.88),
+            MosaicSegment(1, 40.0, 45.0, 40.0, 45.0, 120, 120, 512, 512, 0.55),
         ]
         right = [
-            MosaicSegment(0, 10.4, 19.8, 10.4, 19.8, 200, 100, 512, 512, 0.90),
+            MosaicSegment(0, 10.0, 20.0, 10.0, 20.0, 200, 100, 512, 512, 0.90),
         ]
 
         paired_left, paired_right = logic._pair_eye_segments_by_time(left, right)
 
         self.assertEqual(len(paired_left), 1)
         self.assertEqual(len(paired_right), 1)
-        self.assertAlmostEqual(paired_left[0].start_s, 10.4)
-        self.assertAlmostEqual(paired_right[0].end_s, 19.8)
+        self.assertAlmostEqual(paired_left[0].start_s, 10.0)
+        self.assertAlmostEqual(paired_right[0].end_s, 20.0)
+
+    def test_pair_eye_segments_keeps_high_confidence_one_sided_groups(self) -> None:
+        left = [
+            MosaicSegment(0, 10.0, 20.0, 10.0, 20.0, 100, 100, 512, 512, 0.91),
+            MosaicSegment(1, 40.0, 45.0, 40.0, 45.0, 120, 120, 512, 512, 0.88),
+        ]
+        right = [
+            MosaicSegment(0, 10.0, 20.0, 10.0, 20.0, 200, 100, 512, 512, 0.90),
+        ]
+
+        paired_left, paired_right = logic._pair_eye_segments_by_time(left, right)
+
+        self.assertEqual(len(paired_left), 2)
+        self.assertEqual(len(paired_right), 1)
+        self.assertAlmostEqual(paired_left[0].start_s, 10.0)
+        self.assertAlmostEqual(paired_left[1].start_s, 40.0)
+        self.assertAlmostEqual(paired_left[1].end_s, 45.0)
 
     def test_pair_eye_segments_reindexes_by_start_time_after_score_matching(self) -> None:
         left = [
@@ -180,20 +197,38 @@ class SourceTimeScannerTests(unittest.TestCase):
         ]
         right = [
             MosaicSegment(0, 100.0, 110.0, 100.0, 110.0, 100, 100, 512, 512, 0.94),
-            MosaicSegment(1, 12.0, 18.0, 12.0, 18.0, 300, 100, 512, 512, 0.79),
+            MosaicSegment(1, 10.0, 20.0, 10.0, 20.0, 300, 100, 512, 512, 0.79),
         ]
 
         paired_left, paired_right = logic._pair_eye_segments_by_time(left, right)
 
         self.assertEqual([seg.seg_id for seg in paired_left], [0, 1])
         self.assertEqual([seg.seg_id for seg in paired_right], [0, 1])
-        self.assertEqual([seg.start_s for seg in paired_left], [12.0, 100.0])
-        self.assertEqual([seg.start_s for seg in paired_right], [12.0, 100.0])
+        self.assertEqual([seg.start_s for seg in paired_left], [10.0, 100.0])
+        self.assertEqual([seg.start_s for seg in paired_right], [10.0, 100.0])
+
+    def test_pair_eye_segments_reuses_spanning_segment_for_non_overlapping_windows(self) -> None:
+        left = [
+            MosaicSegment(0, 10.0, 20.0, 10.0, 20.0, 100, 2400, 1200, 600, 0.90),
+            MosaicSegment(1, 30.0, 40.0, 30.0, 40.0, 120, 2400, 1200, 600, 0.91),
+        ]
+        right = [
+            MosaicSegment(0, 10.0, 40.0, 10.0, 40.0, 0, 2380, 1400, 640, 0.92),
+        ]
+
+        paired_left, paired_right = logic._pair_eye_segments_by_time(left, right)
+
+        self.assertEqual(len(paired_left), 2)
+        self.assertEqual(len(paired_right), 1)
+        self.assertEqual([seg.start_s for seg in paired_left], [10.0, 30.0])
+        self.assertEqual([seg.end_s for seg in paired_left], [20.0, 40.0])
+        self.assertEqual([seg.start_s for seg in paired_right], [10.0])
+        self.assertEqual([seg.end_s for seg in paired_right], [40.0])
 
     def test_pair_eye_segments_requires_spatial_overlap_inside_same_time_group(self) -> None:
         left = [
             MosaicSegment(0, 5.5, 175.2, 5.5, 175.2, 1072, 2288, 2208, 1808, 0.82),
-            MosaicSegment(1, 5.5, 175.2, 5.5, 175.2, 2032, 0, 2064, 1056, 0.69),
+            MosaicSegment(1, 5.5, 175.2, 5.5, 175.2, 2032, 0, 2064, 1056, 0.55),
             MosaicSegment(2, 192.2, 400.1, 192.2, 400.1, 1072, 2768, 2064, 1328, 0.94),
         ]
         right = [
@@ -417,6 +452,53 @@ class SourceTimeScannerTests(unittest.TestCase):
             self.assertEqual(extract_rect.call_count, 2)
             extract_multi.assert_not_called()
             paste_fallback.assert_called_once()
+
+    def test_paired_pre_extract_processes_high_confidence_unmatched_eye_segment(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            base = root / "mosaic_seg000.mp4"
+            out = root / "mosaic_seg000.restored.mp4"
+            base.write_bytes(b"base")
+            meta = VideoMetadata(path=str(base), width=4096, height=4096, duration=20.0, source_fps=30.0, bitrate_bps=2000000)
+            left = [MosaicSegment(0, 3.0, 5.0, 3.0, 5.0, 100, 200, 512, 512, 0.88)]
+            cfg = {
+                "pre_extract_keep_segments": False,
+                "pre_extract_pair_keep_unmatched_conf": 0.60,
+            }
+
+            def fake_extract_rect(_src, dst, **_kwargs):
+                Path(dst).write_bytes(b"segment")
+
+            def fake_process_lada(_src, dst, **_kwargs):
+                Path(dst).write_bytes(b"restored")
+                return str(dst)
+
+            with (
+                patch("utils.app_config.get", side_effect=lambda key, default=None: cfg.get(key, default)),
+                patch("gpu_engine.probe.probe_video", return_value=meta),
+                patch("utils.mosaic_prescan.scan_segments_gpu_transform", side_effect=[left, []]),
+                patch("gpu_engine.files.extract_transformed_rect_clip", side_effect=fake_extract_rect) as extract_rect,
+                patch("gpu_engine.files.extract_multi_rect_clip") as extract_multi,
+                patch("one_click.logic.process_lada", side_effect=fake_process_lada) as process_lada,
+                patch("utils.segment_paster.paste_segments_gpu_or_fallback") as paste_fallback,
+            ):
+                result = logic._process_sbs_paired_pre_extract_clip(
+                    str(base),
+                    str(out),
+                    use_fisheye=False,
+                    keep_intermediate=False,
+                    original_bitrate=2000000,
+                    keep_original_bitrate=True,
+                )
+
+            self.assertEqual(result, logic.PreExtractResult.OK)
+            extract_rect.assert_called_once()
+            extract_multi.assert_not_called()
+            process_lada.assert_called_once()
+            paste_fallback.assert_called_once()
+            paste_segments = paste_fallback.call_args.args[2]
+            self.assertEqual(len(paste_segments), 1)
+            self.assertEqual(paste_segments[0].x, 100)
 
     def test_paired_pre_extract_pipelines_next_group_extract_during_restore(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

@@ -1068,6 +1068,7 @@ def _cleanup_orphan_paired_segment_files(base_dir: str, stem: str, fish: str,
 def _pair_eye_segments_by_time(left_segments, right_segments, log_callback=None):
     min_overlap_s = max(0.0, float(app_config.get("pre_extract_pair_min_overlap_s", 0.25) or 0.25))
     min_spatial = max(0.0, float(app_config.get("pre_extract_pair_min_spatial_overlap", 0.05) or 0.05))
+    keep_unmatched_conf = max(0.0, float(app_config.get("pre_extract_pair_keep_unmatched_conf", 0.60) or 0.60))
     candidates = []
     time_rejected = 0
     spatial_rejected = 0
@@ -1092,18 +1093,31 @@ def _pair_eye_segments_by_time(left_segments, right_segments, log_callback=None)
                 "spatial": spatial,
             })
 
-    paired_left = []
-    paired_right = []
+    paired_left_items = []
+    paired_right_items = []
     paired_items = []
-    used_left = set()
-    used_right = set()
+    used_left_windows: dict[int, list[tuple[float, float]]] = {}
+    used_right_windows: dict[int, list[tuple[float, float]]] = {}
+    conflict_rejected = 0
+
+    def _has_time_conflict(windows: dict[int, list[tuple[float, float]]],
+                           idx: int, start: float, end: float) -> bool:
+        for used_start, used_end in windows.get(idx, []):
+            if max(float(used_start), float(start)) < min(float(used_end), float(end)) - 1e-6:
+                return True
+        return False
+
     for item in sorted(candidates, key=lambda c: (c["spatial"], c["overlap_s"]), reverse=True):
-        if item["li"] in used_left or item["ri"] in used_right:
+        if (
+            _has_time_conflict(used_left_windows, item["li"], item["start"], item["end"])
+            or _has_time_conflict(used_right_windows, item["ri"], item["start"], item["end"])
+        ):
+            conflict_rejected += 1
             continue
         left = item["left"]
         right = item["right"]
-        used_left.add(item["li"])
-        used_right.add(item["ri"])
+        used_left_windows.setdefault(item["li"], []).append((item["start"], item["end"]))
+        used_right_windows.setdefault(item["ri"], []).append((item["start"], item["end"]))
         paired_items.append(item)
 
     paired_items.sort(key=lambda item: (
@@ -1115,38 +1129,130 @@ def _pair_eye_segments_by_time(left_segments, right_segments, log_callback=None)
         int(item["right"].x),
     ))
     for item in paired_items:
-        left = item["left"]
-        right = item["right"]
-        seg_id = len(paired_left)
-        paired_left.append(_clone_segment(left, seg_id=seg_id, start_s=item["start"], end_s=item["end"]))
-        paired_right.append(_clone_segment(right, seg_id=seg_id, start_s=item["start"], end_s=item["end"]))
+        paired_left_items.append(item)
+        paired_right_items.append(item)
         if log_callback:
             log_callback(
-                f"[source-scan] pair fine segment {seg_id}: L{left.seg_id}<->R{right.seg_id}, "
+                f"[source-scan] pair fine segment {len(paired_left_items) - 1}: "
+                f"L{item['left'].seg_id}<->R{item['right'].seg_id}, "
                 f"{item['start']:.3f}-{item['end']:.3f}s, spatial_overlap={item['spatial']:.2f}"
             )
+
+    used_left = set(used_left_windows)
+    used_right = set(used_right_windows)
+
+    def _uncovered_windows(seg, used_windows: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        start = float(seg.start_s)
+        end = float(seg.end_s)
+        if end <= start:
+            return []
+        clipped = []
+        for used_start, used_end in used_windows:
+            s = max(start, float(used_start))
+            e = min(end, float(used_end))
+            if e > s:
+                clipped.append((s, e))
+        clipped.sort()
+        out = []
+        cursor = start
+        for used_start, used_end in clipped:
+            if used_start - cursor >= min_overlap_s:
+                out.append((cursor, used_start))
+            cursor = max(cursor, used_end)
+        if end - cursor >= min_overlap_s:
+            out.append((cursor, end))
+        return out
+
+    def _append_unmatched(side_name: str, source_segments, used_windows_by_idx, out_items) -> tuple[int, int]:
+        kept = 0
+        skipped_low_conf = 0
+        for idx, seg in enumerate(source_segments):
+            conf = float(getattr(seg, "conf_max", 0.0))
+            windows = _uncovered_windows(seg, used_windows_by_idx.get(idx, []))
+            if not windows:
+                continue
+            if conf < keep_unmatched_conf:
+                skipped_low_conf += 1
+                continue
+            for start, end in windows:
+                out_items.append({"segment": seg, "start": start, "end": end, "unmatched": True})
+                kept += 1
+                if log_callback:
+                    log_callback(
+                        f"[source-scan] keep unmatched {side_name} fine segment {seg.seg_id}: "
+                        f"{start:.3f}-{end:.3f}s rect={seg.x},{seg.y},{seg.w}x{seg.h} "
+                        f"conf={conf:.3f}>={keep_unmatched_conf:.2f}"
+                    )
+        return kept, skipped_low_conf
+
+    kept_unmatched_left, low_unmatched_left = _append_unmatched(
+        "left", left_segments, used_left_windows, paired_left_items
+    )
+    kept_unmatched_right, low_unmatched_right = _append_unmatched(
+        "right", right_segments, used_right_windows, paired_right_items
+    )
+
+    def _materialize(items: list[dict], side: str):
+        items.sort(key=lambda item: (
+            float(item["start"]),
+            float(item["end"]),
+            int(item["segment"].y if item.get("unmatched") else item[side].y),
+            int(item["segment"].x if item.get("unmatched") else item[side].x),
+        ))
+        out = []
+        for item in items:
+            seg = item["segment"] if item.get("unmatched") else item[side]
+            out.append(_clone_segment(seg, seg_id=len(out), start_s=item["start"], end_s=item["end"]))
+        merged = []
+        for seg in out:
+            if (
+                merged
+                and int(merged[-1].x) == int(seg.x)
+                and int(merged[-1].y) == int(seg.y)
+                and int(merged[-1].w) == int(seg.w)
+                and int(merged[-1].h) == int(seg.h)
+                and float(seg.start_s) <= float(merged[-1].end_s) + 1e-6
+            ):
+                merged[-1].end_s = max(float(merged[-1].end_s), float(seg.end_s))
+                merged[-1].end_s_kf = max(float(merged[-1].end_s_kf), float(seg.end_s_kf))
+                merged[-1].conf_max = max(float(merged[-1].conf_max), float(seg.conf_max))
+            else:
+                seg.seg_id = len(merged)
+                merged.append(seg)
+        for idx, seg in enumerate(merged):
+            seg.seg_id = idx
+        return merged
+
+    paired_left = _materialize(paired_left_items, "left")
+    paired_right = _materialize(paired_right_items, "right")
 
     skipped_left = len(left_segments) - len(used_left)
     skipped_right = len(right_segments) - len(used_right)
     if log_callback:
         for idx, seg in enumerate(left_segments):
-            if idx not in used_left:
+            if idx not in used_left and float(getattr(seg, "conf_max", 0.0)) < keep_unmatched_conf:
                 log_callback(
                     f"[source-scan] skip unmatched left fine segment {seg.seg_id}: "
-                    f"{seg.start_s:.3f}-{seg.end_s:.3f}s rect={seg.x},{seg.y},{seg.w}x{seg.h}"
+                    f"{seg.start_s:.3f}-{seg.end_s:.3f}s rect={seg.x},{seg.y},{seg.w}x{seg.h} "
+                    f"conf={float(getattr(seg, 'conf_max', 0.0)):.3f}<{keep_unmatched_conf:.2f}"
                 )
         for idx, seg in enumerate(right_segments):
-            if idx not in used_right:
+            if idx not in used_right and float(getattr(seg, "conf_max", 0.0)) < keep_unmatched_conf:
                 log_callback(
                     f"[source-scan] skip unmatched right fine segment {seg.seg_id}: "
-                    f"{seg.start_s:.3f}-{seg.end_s:.3f}s rect={seg.x},{seg.y},{seg.w}x{seg.h}"
+                    f"{seg.start_s:.3f}-{seg.end_s:.3f}s rect={seg.x},{seg.y},{seg.w}x{seg.h} "
+                    f"conf={float(getattr(seg, 'conf_max', 0.0)):.3f}<{keep_unmatched_conf:.2f}"
                 )
     if log_callback:
         log_callback(
-            f"[source-scan] paired fine segments: pairs={len(paired_left)}, "
-            f"left={len(paired_left)}/{len(left_segments)}, right={len(paired_right)}/{len(right_segments)}, "
-            f"skipped_left={skipped_left}, skipped_right={skipped_right}, "
-            f"rejected_time={time_rejected}, rejected_spatial={spatial_rejected}"
+            f"[source-scan] paired fine segments: pairs={len(paired_items)}, "
+            f"left_paired={len(used_left)}/{len(left_segments)}, right_paired={len(used_right)}/{len(right_segments)}, "
+            f"unmatched_left={skipped_left}, unmatched_right={skipped_right}, "
+            f"output_left={len(paired_left)}, output_right={len(paired_right)}, "
+            f"rejected_time={time_rejected}, rejected_spatial={spatial_rejected}, "
+            f"rejected_conflict={conflict_rejected}, "
+            f"kept_unmatched_left={kept_unmatched_left}, kept_unmatched_right={kept_unmatched_right}, "
+            f"low_conf_unmatched_left={low_unmatched_left}, low_conf_unmatched_right={low_unmatched_right}"
         )
     return paired_left, paired_right
 
@@ -1209,9 +1315,9 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
         return PreExtractResult.SCAN_FAILED
 
     left_segments, right_segments = _pair_eye_segments_by_time(left_segments, right_segments, log_callback=log_callback)
-    if not left_segments or not right_segments:
+    if not left_segments and not right_segments:
         if log_callback:
-            log_callback("[source-scan] no paired fine segments; keeping interval unchanged")
+            log_callback("[source-scan] no fine segments to process; keeping interval unchanged")
         shutil.copy2(base_clip, output_file)
         return PreExtractResult.NO_MOSAIC
 

@@ -67,6 +67,7 @@ _DEFAULTS = {
     'pre_extract_empty_scan_cache': True,
     'pre_extract_pair_min_overlap_s': 0.25,
     'pre_extract_pair_min_spatial_overlap': 0.05,
+    'pre_extract_pair_keep_unmatched_conf': 0.60,
     'pre_extract_extract_group_max': 8,
     'pre_extract_pipeline_enabled': True,
     'pre_extract_save_detection_debug': True,
