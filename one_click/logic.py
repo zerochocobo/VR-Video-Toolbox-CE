@@ -1353,7 +1353,7 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
     )
     fish = "_fisheye" if use_fisheye else ""
     keep_segments = bool(app_config.get("pre_extract_keep_segments", False)) or bool(keep_intermediate)
-    raw_restore_enabled = not keep_segments
+    raw_restore_enabled = (not keep_segments) and not use_fisheye
     expected_cache_paths = set()
     for side_name, segments in (("L", left_segments), ("R", right_segments)):
         for seg in segments:

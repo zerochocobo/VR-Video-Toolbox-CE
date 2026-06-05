@@ -258,6 +258,29 @@ def _media_temp_path(dst: str | Path, label: str, suffix: str = ".raw.hevc") -> 
     return dst.with_name(f"{dst.stem}.{safe_label}.{os.getpid()}.{time.time_ns()}{suffix}")
 
 
+def _materialize_restored_raw_for_pynv(path: str | Path, *, parent: str | Path | None = None,
+                                       log_callback=None) -> tuple[Path, Path | None]:
+    """Defensive fallback: wrap restored raw HEVC in mp4 for PyNv decode."""
+    src = Path(path)
+    if src.suffix.lower() != ".hevc":
+        return src, None
+    meta = restored_sidecar.metadata_from_sidecar(src)
+    if meta is None:
+        return src, None
+    out_parent = Path(parent) if parent is not None else src.parent
+    out_parent.mkdir(parents=True, exist_ok=True)
+    wrapped = _media_temp_path(out_parent / f"{src.stem}.wrapped.mp4", "pynvwrap", suffix=".mp4")
+    mux.mux_hevc_with_audio(
+        src,
+        wrapped,
+        fps=meta.source_fps or 30.0,
+        color=meta.color,
+        audio_source=None,
+        log_callback=log_callback,
+    )
+    return wrapped, wrapped
+
+
 class _EncodeSink:
     """Lifetime-safe encode sink that synchronizes before encode and delays input-buffer release afterward.
 
@@ -1004,11 +1027,19 @@ def paste_fisheye_eye_rects_to_sbs_gpu(
     lut_h2f_c = v360_lut.make_lut("heq2fisheye", eye_cw, eye_ch, fov)
     lut_f2h_y = v360_lut.make_lut("fisheye2heq", eye_w, eye_h, fov)
     lut_f2h_c = v360_lut.make_lut("fisheye2heq", eye_cw, eye_ch, fov)
+    temp_inputs: list[Path] = []
 
     def _open_state(seg):
-        seg_meta = restored_sidecar.metadata_from_sidecar(seg.path) or probe.probe_video(seg.path)
+        decoder_path, temp_path = _materialize_restored_raw_for_pynv(
+            seg.path,
+            parent=dst.parent,
+            log_callback=log_callback,
+        )
+        if temp_path is not None:
+            temp_inputs.append(temp_path)
+        seg_meta = restored_sidecar.metadata_from_sidecar(seg.path) or probe.probe_video(decoder_path)
         seg_bd = 10 if seg_meta.bit_depth > 8 else 8
-        dec = PyNvThreadedSerialDecoder(seg.path, bit_depth=seg_bd)
+        dec = PyNvThreadedSerialDecoder(decoder_path, bit_depth=seg_bd)
         sx = int(seg.x)
         sy = int(seg.y)
         sw = int(seg.w)
@@ -1039,6 +1070,7 @@ def paste_fisheye_eye_rects_to_sbs_gpu(
             "dec": dec,
             "bd": seg_bd,
             "frames": restored_sidecar.frame_count_from_sidecar(seg.path) or len(dec),
+            "decoder_path": decoder_path,
             "side": side,
             "x": local_x,
             "y": sy,
@@ -1210,6 +1242,11 @@ def paste_fisheye_eye_rects_to_sbs_gpu(
                 pass
         base_dec.stop()
         runtime.free_memory_pool()
+        for path in temp_inputs:
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
     if cancelled:
         try:

@@ -390,7 +390,7 @@ class SourceTimeScannerTests(unittest.TestCase):
                 self.assertEqual(task["bitrate_bps"], expected_rect_bitrate)
             self.assertEqual(process_lada.call_count, 2)
             for call in process_lada.call_args_list:
-                self.assertFalse(call.kwargs["produce_mp4"])
+                self.assertTrue(call.kwargs["produce_mp4"])
                 self.assertIn("rect", call.kwargs["sidecar_metadata"])
                 self.assertIn("time", call.kwargs["sidecar_metadata"])
             extract_names = [Path(task["dst"]).name for task in multi_tasks]
