@@ -46,7 +46,7 @@ import subprocess
 from tkinter import filedialog
 from tkinter import messagebox
 
-ver_name = "v1.0 beta.1 (build 2026-06-04)"
+ver_name = "v1.0 beta.2 (build 2026-06-05)"
 DLNA_SERVER_EXE_NAME = "vr_dlna_server.exe"
 
 
