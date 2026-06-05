@@ -12,6 +12,11 @@ configuration coupling removed and these additions:
 """
 from __future__ import annotations
 
+import functools
+import json
+import shutil
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Union
@@ -42,6 +47,98 @@ def cuda_device_summary(gpu_id: int = 0) -> str:
         )
     except Exception as exc:
         return f"gpu_id={gpu_id} unavailable: {type(exc).__name__}: {exc}"
+
+
+def _hidden_subprocess_kwargs() -> dict:
+    if sys.platform.startswith("win"):
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0
+        return {"startupinfo": startupinfo}
+    return {}
+
+
+@functools.lru_cache(maxsize=64)
+def _ffprobe_keyframe_times_cached(path: str, mtime_ns: int, size: int) -> tuple[float, ...]:
+    ffprobe = shutil.which("ffprobe") or "ffprobe"
+    cmd = [
+        ffprobe,
+        "-hide_banner", "-v", "error",
+        "-select_streams", "v:0",
+        "-skip_frame", "nokey",
+        "-show_frames",
+        "-show_entries", "frame=pts_time,best_effort_timestamp_time",
+        "-of", "json",
+        path,
+    ]
+    try:
+        raw = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, **_hidden_subprocess_kwargs())
+        data = json.loads(raw)
+    except Exception:
+        return ()
+    out: list[float] = []
+    for frame in data.get("frames", []):
+        value = frame.get("pts_time") or frame.get("best_effort_timestamp_time")
+        try:
+            ts = float(value)
+        except Exception:
+            continue
+        if ts >= 0:
+            out.append(ts)
+    return tuple(sorted(set(out)))
+
+
+def _keyframe_times_for_path(src: Path) -> tuple[float, ...]:
+    try:
+        path = Path(src).resolve()
+        stat = path.stat()
+    except OSError:
+        return ()
+    return _ffprobe_keyframe_times_cached(str(path), int(stat.st_mtime_ns), int(stat.st_size))
+
+
+def _threaded_decoder_preroll_frame(
+    src: Path,
+    target_frame: int,
+    fps: float,
+    total_frames: int,
+    *,
+    index_at_time=None,
+) -> int:
+    """Return the keyframe frame that ThreadedDecoder should start from.
+
+    PyNv ThreadedDecoder can return frames from the previous keyframe when
+    started at an arbitrary inter frame. We start at the preceding keyframe and
+    let frame_at(target_frame) discard the preroll frames explicitly.
+    """
+    target = max(0, int(target_frame))
+    total = max(0, int(total_frames))
+    if target <= 0:
+        return 0
+    if total > 0:
+        target = min(target, total - 1)
+    keyframes = _keyframe_times_for_path(Path(src))
+    if not keyframes:
+        return target
+    fps = float(fps or 0.0)
+    if fps <= 0:
+        return target
+
+    best: int | None = None
+    for ts in keyframes:
+        try:
+            idx = int(index_at_time(float(ts))) if index_at_time is not None else int(round(float(ts) * fps))
+        except Exception:
+            idx = int(round(float(ts) * fps))
+        if total > 0:
+            idx = max(0, min(idx, total - 1))
+        else:
+            idx = max(0, idx)
+        if idx <= target:
+            best = idx
+        else:
+            break
+    return target if best is None else best
 
 
 @dataclass(frozen=True)
@@ -370,10 +467,43 @@ class PyNvThreadedSerialDecoder:
         self.batch_size = max(1, int(batch_size))
         self.buffer_size = max(1, int(buffer_size))
         self.start_frame = max(0, int(start_frame))
+        # Self-check: when start_frame > 0 we record the PTS that a fresh random-
+        # access decoder reports for that exact frame. ThreadedDecoder itself is
+        # started from a keyframe preroll point; after frame_at() discards preroll
+        # frames, this PTS check catches any remaining seek/state mismatch before
+        # wrong content is encoded downstream.
+        self._expected_first_pts: int | None = None
+        self._preroll_pts_to_frame: dict[int, int] = {}
         probe = PyNvSimpleDecoder(self.src, gpu_id=self.gpu_id, bit_depth=self.bit_depth)
         try:
             self.info = probe.info
             self._len = len(probe)
+            self._decode_start_frame = self.start_frame
+            if 0 < self.start_frame < self._len:
+                try:
+                    probe_frame = probe.frame_at(self.start_frame)
+                    pts_value = int(getattr(probe_frame, "pts", -1))
+                    if pts_value >= 0:
+                        self._expected_first_pts = pts_value
+                except Exception:
+                    self._expected_first_pts = None
+                self._decode_start_frame = _threaded_decoder_preroll_frame(
+                    self.src,
+                    self.start_frame,
+                    self.info.fps,
+                    self._len,
+                    index_at_time=probe.index_at_time,
+                )
+                if self._decode_start_frame < self.start_frame:
+                    probe_end = min(self._len, self._decode_start_frame + 32)
+                    for frame_idx in range(self._decode_start_frame, probe_end):
+                        try:
+                            preroll_frame = probe.frame_at(frame_idx)
+                            pts_value = int(getattr(preroll_frame, "pts", -1))
+                        except Exception:
+                            continue
+                        if pts_value >= 0:
+                            self._preroll_pts_to_frame.setdefault(pts_value, frame_idx)
         finally:
             probe.stop()
         self._decoder = nvc.ThreadedDecoder(
@@ -382,13 +512,15 @@ class PyNvThreadedSerialDecoder:
             gpu_id=self.gpu_id,
             use_device_memory=True,
             output_color_type=nvc.OutputColorType.NATIVE,
-            start_frame=self.start_frame,
+            start_frame=self._decode_start_frame,
         )
         self._batch: list = []
         self._batch_pos = 0
-        self._batch_start_idx = self.start_frame
-        self._next_source_idx = self.start_frame
+        self._batch_start_idx = self._decode_start_frame
+        self._next_source_idx = self._decode_start_frame
         self._ended = False
+        self._first_frame_verified = (self.start_frame == 0)
+        self._initial_batch_calibrated = False
 
     def __len__(self) -> int:
         return self._len
@@ -411,6 +543,7 @@ class PyNvThreadedSerialDecoder:
                 if not batch:
                     raise RuntimeError(f"ThreadedDecoder returned no frames at idx={self._next_source_idx}")
                 self._batch = list(batch)
+                self._calibrate_initial_batch()
             current = self._batch_start_idx + self._batch_pos
             raw = self._batch[self._batch_pos]
             self._batch_pos += 1
@@ -420,8 +553,62 @@ class PyNvThreadedSerialDecoder:
             if current > target:
                 raise RuntimeError(f"ThreadedDecoder skipped target: target={target} current={current}")
             if self.bit_depth > 8:
-                return GpuP016Frame.from_decoded_frame(raw, self.info.width, self.info.height)
-            return GpuNv12Frame.from_decoded_frame(raw, self.info.width, self.info.height)
+                frame = GpuP016Frame.from_decoded_frame(raw, self.info.width, self.info.height)
+            else:
+                frame = GpuNv12Frame.from_decoded_frame(raw, self.info.width, self.info.height)
+            if not self._first_frame_verified:
+                self._verify_first_frame_pts(frame)
+                self._first_frame_verified = True
+            return frame
+
+    def _calibrate_initial_batch(self) -> None:
+        if self._initial_batch_calibrated:
+            return
+        self._initial_batch_calibrated = True
+        if not self._batch or self._batch_pos != 0 or not self._preroll_pts_to_frame:
+            return
+        raw = self._batch[0]
+        get_pts = getattr(raw, "getPTS", None)
+        if not callable(get_pts):
+            return
+        try:
+            actual_pts = int(get_pts())
+        except Exception:
+            return
+        actual_frame = self._preroll_pts_to_frame.get(actual_pts)
+        if actual_frame is None:
+            return
+        if actual_frame < self._decode_start_frame:
+            return
+        self._batch_start_idx = actual_frame
+        self._next_source_idx = actual_frame
+
+    def _verify_first_frame_pts(self, frame: GpuFrame) -> None:
+        """Compare the first delivered frame's PTS with the SimpleDecoder probe.
+
+        Mismatch means the decoded target frame does not match the random-access
+        probe. Raise so the caller surfaces the bad content instead of encoding
+        garbage downstream.
+        """
+        if self._expected_first_pts is None:
+            return
+        actual = int(getattr(frame, "pts", -1))
+        if actual < 0:
+            return
+        if actual == self._expected_first_pts:
+            return
+        # PTS diff can hint at the keyframe distance (90kHz timebase: 1s = 90000;
+        # ms timebase: 1s = 1000). Surface the raw delta and let logs disambiguate.
+        delta = actual - self._expected_first_pts
+        raise RuntimeError(
+            "PyNvThreadedSerialDecoder NVDEC seek check failed: "
+            f"start_frame={self.start_frame}, expected_pts={self._expected_first_pts}, "
+            f"got_pts={actual} (delta={delta}), decode_start_frame="
+            f"{getattr(self, '_decode_start_frame', self.start_frame)}. "
+            "Likely decoder seek/pre-roll mismatch or concurrent NVDEC/CUDA "
+            "pollution; serialize NVDEC use and keep threaded decode starts "
+            "keyframe-aligned."
+        )
 
     def iter_frames(self, start: int = 0, stop: int | None = None):
         n = len(self)

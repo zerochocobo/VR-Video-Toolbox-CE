@@ -227,11 +227,20 @@ class SegmentPasterTests(unittest.TestCase):
             "paste_passthrough_min_frames": 1,
             "paste_passthrough_max_subseg": 32,
         }
+        # Expected plan parts for 4s clip @ 30fps with active rect [30, 60]:
+        # 0000 passthrough [0, 30], 0001 paste [30, 60], 0002 passthrough [60, 120].
+        # Probe returns exact expected counts so source_cursor advances cleanly.
+        expected_passthrough_frames = [30, 60]
+
+        def fake_probe(_path):
+            return expected_passthrough_frames.pop(0)
+
         with (
             patch("utils.app_config.get", side_effect=lambda key, default=None: cfg.get(key, default)),
             patch("gpu_engine.probe.probe_video", return_value=meta),
             patch("utils.keyframe_cutter.list_keyframes", return_value=[0.0, 1.0, 2.0, 4.0]),
             patch("utils.keyframe_cutter._cut_copy", side_effect=fake_cut) as cut_copy,
+            patch("utils.segment_paster._probe_video_frame_count", side_effect=fake_probe),
             patch("gpu_engine.files.paste_segments_gpu", side_effect=fake_gpu) as paste_gpu,
             patch("utils.sbs_concat.concat_timeline_hevc_fast", side_effect=fake_concat) as concat_fast,
         ):
@@ -248,6 +257,70 @@ class SegmentPasterTests(unittest.TestCase):
         self.assertEqual(paste_gpu.call_args.kwargs["start_frame"], 30)
         self.assertEqual(paste_gpu.call_args.kwargs["end_frame"], 60)
         concat_fast.assert_called_once()
+
+    def test_passthrough_overshoot_shifts_next_paste_start(self) -> None:
+        """`-c copy` cuts often overshoot by a few frames at GOP boundaries.
+        The following paste subsegment must resume from the actual cursor so the
+        concatenated output stays the same length as the source and does not
+        double-encode the overshoot frames.
+        """
+        segment = MosaicSegment(0, 1.0, 2.0, 1.0, 2.0, 10, 20, 128, 128, 0.9)
+        meta = VideoMetadata(
+            path="base.mp4",
+            codec_name="hevc",
+            width=1920,
+            height=1080,
+            duration=4.0,
+            nb_frames=120,
+            source_fps=30.0,
+        )
+
+        def fake_cut(_src, dst, _start, _end, **_kwargs):
+            Path(dst).write_bytes(b"copy")
+
+        def fake_gpu(_src, _dst, _segments, **_kwargs):
+            return None
+
+        def fake_concat(_timeline, _output, **_kwargs):
+            return None
+
+        # First passthrough requested 30 frames but stream-copy returned 32
+        # (overshot 2). The next passthrough requested 60 (frames 60..120)
+        # also overshoots by 1 → 61 frames, but it's the trailing part so
+        # the paste before it absorbs the prior overshoot.
+        actual_passthrough_frames = [32, 61]
+
+        def fake_probe(_path):
+            return actual_passthrough_frames.pop(0)
+
+        cfg = {
+            "paste_passthrough_enabled": True,
+            "paste_passthrough_min_frames": 1,
+            "paste_passthrough_max_subseg": 32,
+        }
+        with (
+            patch("utils.app_config.get", side_effect=lambda key, default=None: cfg.get(key, default)),
+            patch("gpu_engine.probe.probe_video", return_value=meta),
+            patch("utils.keyframe_cutter.list_keyframes", return_value=[0.0, 1.0, 2.0, 4.0]),
+            patch("utils.keyframe_cutter._cut_copy", side_effect=fake_cut),
+            patch("utils.segment_paster._probe_video_frame_count", side_effect=fake_probe),
+            patch("gpu_engine.files.paste_segments_gpu", side_effect=fake_gpu) as paste_gpu,
+            patch("utils.sbs_concat.concat_timeline_hevc_fast", side_effect=fake_concat),
+        ):
+            paste_segments_gpu_or_fallback(
+                "base.mp4",
+                "out.mp4",
+                [segment],
+                ["restored.mp4"],
+                keep_audio=False,
+            )
+
+        paste_gpu.assert_called_once()
+        # Paste subsegment was planned at frames [30, 60]; the first passthrough
+        # actually delivered 32 frames so paste must now resume at 32, not 30.
+        # End stays at the planned 60 — paste itself is frame-accurate.
+        self.assertEqual(paste_gpu.call_args.kwargs["start_frame"], 32)
+        self.assertEqual(paste_gpu.call_args.kwargs["end_frame"], 60)
 
     def test_passthrough_failure_retries_full_gpu_paste(self) -> None:
         segment = MosaicSegment(0, 1.0, 2.0, 1.0, 2.0, 10, 20, 128, 128, 0.9)
