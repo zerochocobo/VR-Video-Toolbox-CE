@@ -38,7 +38,7 @@ _DEFAULTS = {
     'progress_log_min_pct': 5.0,
     'output_mp4_faststart': 'auto',  # auto | always | off. Auto disables faststart for very large muxes.
     # OneClick pre-extract: detect/crop mosaic time ranges and regions before sending them to lada/jasna.
-    'pre_extract_detection_model': 'lada_vr_mosaic_detection_model_v2_fast.pt',
+    'pre_extract_detection_model': 'lada_vr_mosaic_detection_model_v2_accurate.pt',#'lada_vr_mosaic_detection_model_v2_fast.pt',
     'pre_extract_sample_stride_s': 0.5,
     'pre_extract_yolo_batch': 8,
     'pre_extract_head_tail_pad_s': 2.0,
