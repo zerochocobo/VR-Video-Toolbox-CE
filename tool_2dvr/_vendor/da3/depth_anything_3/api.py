@@ -20,6 +20,7 @@ models/DA3/Small and runs depth inference only.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Sequence
 
@@ -86,16 +87,20 @@ class DepthAnything3(nn.Module):
         infer_gs: bool = False,
         use_ray_pose: bool = False,
         ref_view_strategy: str = "middle",
+        skip_camera: bool = False,
+        skip_sky: bool = False,
     ) -> dict[str, torch.Tensor]:
         export_feat_layers = export_feat_layers or []
         if image.device.type == "cuda":
             dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
             with torch.autocast(device_type="cuda", dtype=dtype):
                 return self.model(
-                    image, extrinsics, intrinsics, export_feat_layers, infer_gs, use_ray_pose, ref_view_strategy
+                    image, extrinsics, intrinsics, export_feat_layers, infer_gs, use_ray_pose, ref_view_strategy,
+                    skip_camera=skip_camera, skip_sky=skip_sky,
                 )
         return self.model(
-            image, extrinsics, intrinsics, export_feat_layers, infer_gs, use_ray_pose, ref_view_strategy
+            image, extrinsics, intrinsics, export_feat_layers, infer_gs, use_ray_pose, ref_view_strategy,
+            skip_camera=skip_camera, skip_sky=skip_sky,
         )
 
     def inference(
@@ -132,6 +137,71 @@ class DepthAnything3(nn.Module):
         )
         prediction.processed_images = self._processed_images_to_numpy(imgs_cpu)
         return prediction
+
+    def inference_depth_only(
+        self,
+        image,
+        process_res: int = 504,
+        process_res_method: str = "upper_bound_resize",
+        use_gpu_preprocess: bool | None = None,
+    ) -> torch.Tensor:
+        """Return DA3 depth maps on the model device without CPU post-processing.
+
+        ``image`` may be either a ``list[np.ndarray]`` of CPU RGB frames or a
+        ``torch.Tensor`` of shape ``(B, H, W, 3)`` uint8 already on CUDA (PyNv
+        zero-copy path).
+        """
+        device = self._get_model_device()
+
+        is_tensor_batch = isinstance(image, torch.Tensor)
+        batch_count = int(image.shape[0]) if is_tensor_batch else len(image)
+        if batch_count <= 0:
+            return torch.empty((0, 0, 0), device=device, dtype=torch.float32)
+
+        if use_gpu_preprocess is None:
+            raw = os.environ.get("TOOL_2DVR_GPU_PREPROCESS", "1").strip().lower()
+            use_gpu_preprocess = raw not in {"0", "false", "no", "off", "cpu"}
+        imgs = None
+        cpu_list_path = isinstance(image, list) and all(isinstance(item, np.ndarray) for item in image)
+        if use_gpu_preprocess and device.type == "cuda" and (is_tensor_batch or cpu_list_path):
+            try:
+                from depth_anything_3.utils.io.input_processor_gpu import gpu_preprocess
+
+                imgs = gpu_preprocess(
+                    image,
+                    device=device,
+                    target_res=process_res,
+                    process_res_method=process_res_method,
+                )
+            except Exception:
+                imgs = None
+
+        if imgs is None:
+            if is_tensor_batch:
+                # Fallback for tensor input when GPU preprocess fails: go through CPU pipeline.
+                cpu_frames = [np.ascontiguousarray(frame.detach().cpu().numpy()) for frame in image]
+            else:
+                cpu_frames = list(image)
+            imgs_cpu, ex_t, in_t = self._preprocess_inputs(
+                cpu_frames, None, None, process_res, process_res_method
+            )
+            imgs, _, _ = self._prepare_model_inputs(imgs_cpu, ex_t, in_t)
+
+        raw_output = self.forward(
+            imgs,
+            None,
+            None,
+            [],
+            False,
+            False,
+            "middle",
+            skip_camera=True,
+            skip_sky=True,
+        )
+        depth = self._depth_tensor_from_output(raw_output)
+        if depth.shape[0] != batch_count:
+            raise RuntimeError(f"DA3 returned {depth.shape[0]} depth maps for {batch_count} inputs")
+        return depth.contiguous()
 
     def _preprocess_inputs(
         self,
@@ -203,6 +273,25 @@ class DepthAnything3(nn.Module):
         std = np.array([0.229, 0.224, 0.225])
         imgs = np.clip(imgs * std + mean, 0, 1)
         return (imgs * 255).astype(np.uint8)
+
+    @staticmethod
+    def _depth_tensor_from_output(model_output: dict[str, torch.Tensor]) -> torch.Tensor:
+        depth = model_output["depth"]
+        if depth.ndim == 5 and depth.shape[2] == 1:
+            depth = depth[:, :, 0]
+        if depth.ndim == 5 and depth.shape[-1] == 1:
+            depth = depth[..., 0]
+        if depth.ndim == 4 and depth.shape[0] == 1:
+            depth = depth[0]
+        if depth.ndim == 4 and depth.shape[1] == 1:
+            depth = depth[:, 0]
+        if depth.ndim == 4 and depth.shape[-1] == 1:
+            depth = depth[..., 0]
+        if depth.ndim == 2:
+            depth = depth.unsqueeze(0)
+        if depth.ndim != 3:
+            raise RuntimeError(f"Unexpected DA3 depth shape: {tuple(depth.shape)}")
+        return depth.float()
 
     def _get_model_device(self) -> torch.device:
         if self.device is not None:

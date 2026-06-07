@@ -51,6 +51,7 @@ class TwoDToVRApp:
         self.end_var = tk.StringVar(value="00:00:60")
         self.projection_var = tk.StringVar(value=logic.DEFAULT_PROJECTION)
         self.hole_fill_var = tk.StringVar()
+        self.stabilize_var = tk.StringVar()
         self.eye_distance_var = tk.StringVar(value=str(int(logic.DEFAULT_EYE_DISTANCE_MM)))
 
         ttk.Label(form, text=get_text("lbl_input")).grid(row=0, column=0, sticky="w", padx=4, pady=4)
@@ -92,15 +93,26 @@ class TwoDToVRApp:
             value=logic.PROJECTION_FISHEYE,
         ).pack(side="left")
 
+        # Visible UI options are limited to the two production-quality modes.
+        # The rest (shift_fill / background / inpaint / e2fgvi / none) remain
+        # selectable via the TOOL_2DVR_HOLE_FILL env var for debugging, but are
+        # hidden from the GUI because their stereo output is either too slow
+        # or visibly inferior to soft_shift / inverse_warp.
         self.hole_fill_options = [
             (get_text("opt_hole_soft_shift"), "soft_shift"),
-            (get_text("opt_hole_shift_fill"), "shift_fill"),
-            (get_text("opt_hole_background"), "background"),
-            (get_text("opt_hole_inpaint"), "inpaint"),
-            (get_text("opt_hole_e2fgvi"), "e2fgvi"),
-            (get_text("opt_hole_none"), "none"),
+            (get_text("opt_hole_inverse_warp"), "inverse_warp"),
         ]
-        self.hole_fill_display_to_value = {label: value for label, value in self.hole_fill_options}
+        # Keep label->value lookup complete so an env-selected mode still maps
+        # back to a display label without raising.
+        self.hole_fill_display_to_value = {
+            get_text("opt_hole_soft_shift"): "soft_shift",
+            get_text("opt_hole_inverse_warp"): "inverse_warp",
+            get_text("opt_hole_shift_fill"): "shift_fill",
+            get_text("opt_hole_background"): "background",
+            get_text("opt_hole_inpaint"): "inpaint",
+            get_text("opt_hole_e2fgvi"): "e2fgvi",
+            get_text("opt_hole_none"): "none",
+        }
         default_hole_label = next(
             label for label, value in self.hole_fill_options
             if value == logic.DEFAULT_HOLE_FILL_MODE
@@ -115,14 +127,34 @@ class TwoDToVRApp:
             width=24,
         ).grid(row=4, column=1, sticky="w", padx=4, pady=4)
 
-        ttk.Label(form, text=get_text("lbl_eye_distance")).grid(row=5, column=0, sticky="w", padx=4, pady=4)
+        self.stabilize_options = [
+            (get_text("opt_stabilize_auto"), "auto"),
+            (get_text("opt_stabilize_off"), "off"),
+            (get_text("opt_stabilize_full"), "full"),
+        ]
+        self.stabilize_display_to_value = {label: value for label, value in self.stabilize_options}
+        default_stabilize_label = next(
+            label for label, value in self.stabilize_options
+            if value == logic.DEFAULT_STABILIZE_MODE
+        )
+        self.stabilize_var.set(default_stabilize_label)
+        ttk.Label(form, text=get_text("lbl_stabilize")).grid(row=5, column=0, sticky="w", padx=4, pady=4)
+        ttk.Combobox(
+            form,
+            textvariable=self.stabilize_var,
+            values=[label for label, _ in self.stabilize_options],
+            state="readonly",
+            width=24,
+        ).grid(row=5, column=1, sticky="w", padx=4, pady=4)
+
+        ttk.Label(form, text=get_text("lbl_eye_distance")).grid(row=6, column=0, sticky="w", padx=4, pady=4)
         eye_frame = ttk.Frame(form)
-        eye_frame.grid(row=5, column=1, sticky="w", padx=4, pady=4)
+        eye_frame.grid(row=6, column=1, sticky="w", padx=4, pady=4)
         ttk.Entry(eye_frame, textvariable=self.eye_distance_var, width=10).pack(side="left")
         ttk.Label(eye_frame, text="mm").pack(side="left", padx=(4, 0))
 
-        ttk.Label(form, text=get_text("lbl_model")).grid(row=6, column=0, sticky="w", padx=4, pady=4)
-        ttk.Label(form, text=str(logic.default_da3_dir()), foreground="gray").grid(row=6, column=1, columnspan=2, sticky="w", padx=4, pady=4)
+        ttk.Label(form, text=get_text("lbl_model")).grid(row=7, column=0, sticky="w", padx=4, pady=4)
+        ttk.Label(form, text=str(logic.default_da3_dir()), foreground="gray").grid(row=7, column=1, columnspan=2, sticky="w", padx=4, pady=4)
 
         btn_frame = ttk.Frame(self.main_frame)
         btn_frame.pack(fill="x", pady=10)
@@ -193,6 +225,10 @@ class TwoDToVRApp:
         label = self.hole_fill_var.get()
         return self.hole_fill_display_to_value.get(label, logic.DEFAULT_HOLE_FILL_MODE)
 
+    def _read_stabilize_mode(self):
+        label = self.stabilize_var.get()
+        return self.stabilize_display_to_value.get(label, logic.DEFAULT_STABILIZE_MODE)
+
     def _validate_form(self):
         input_path = self.input_var.get().strip()
         if not input_path or not os.path.exists(input_path):
@@ -210,11 +246,12 @@ class TwoDToVRApp:
             end,
             self._read_eye_distance(),
             self._read_hole_fill_mode(),
+            self._read_stabilize_mode(),
         )
 
     def run_conversion(self):
         try:
-            input_path, output_dir, start, end, eye_distance, hole_fill_mode = self._validate_form()
+            input_path, output_dir, start, end, eye_distance, hole_fill_mode, stabilize_mode = self._validate_form()
         except Exception as exc:
             messagebox.showerror(get_text("title_error"), str(exc))
             return
@@ -243,6 +280,7 @@ class TwoDToVRApp:
                     projection=self.projection_var.get(),
                     eye_distance_mm=eye_distance,
                     hole_fill_mode=hole_fill_mode,
+                    stabilize_mode=stabilize_mode,
                     log_callback=self.log,
                     process_callback=_on_proc,
                 )

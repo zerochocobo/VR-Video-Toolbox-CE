@@ -18,6 +18,8 @@ from lada.utils.box_utils import box_overlap
 from lada.utils.scene_utils import crop_to_box_v3
 from lada.utils.threading_utils import EOF_MARKER, STOP_MARKER, PipelineQueue, StopMarker, PipelineThread, ErrorMarker
 from lada.utils.ultralytics_utils import convert_yolo_box, convert_yolo_mask_tensor, UltralyticsResults
+from gpu_engine import vram_offload
+from gpu_engine.native_mosaic import _gpu_ops
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=LOG_LEVEL)
@@ -110,13 +112,21 @@ class Clip:
             crop_shape = cropped_img.shape
 
             resize_shape = (int(crop_shape[0] * scale_height), int(crop_shape[1] * scale_width))
-            cropped_img = image_utils.resize(cropped_img, resize_shape, interpolation=cv2.INTER_LINEAR)
-            cropped_mask = image_utils.resize(cropped_mask, resize_shape, interpolation=cv2.INTER_NEAREST)
+            if _gpu_ops.is_cuda_hwc_tensor(cropped_img):
+                cropped_img = _gpu_ops.resize_hwc_gpu(cropped_img, resize_shape, interpolation=cv2.INTER_LINEAR)
+                cropped_mask = _gpu_ops.resize_hwc_gpu(cropped_mask, resize_shape, interpolation=cv2.INTER_NEAREST)
+            else:
+                cropped_img = image_utils.resize(cropped_img, resize_shape, interpolation=cv2.INTER_LINEAR)
+                cropped_mask = image_utils.resize(cropped_mask, resize_shape, interpolation=cv2.INTER_NEAREST)
             assert cropped_mask.shape[:2] == cropped_img.shape[:2], f"{cropped_mask.shape[:2]}, {cropped_img.shape[:2]}"
             assert cropped_img.shape[0] <= size or cropped_img.shape[1] <= size
 
-            cropped_img, pad_after_resize = image_utils.pad_image(cropped_img, size, size, mode=self.pad_mode)
-            cropped_mask, _ = image_utils.pad_image(cropped_mask, size, size, mode='zero')
+            if _gpu_ops.is_cuda_hwc_tensor(cropped_img):
+                cropped_img, pad_after_resize = _gpu_ops.pad_hwc_gpu(cropped_img, size, size, mode=self.pad_mode)
+                cropped_mask, _ = _gpu_ops.pad_hwc_gpu(cropped_mask, size, size, mode='zero')
+            else:
+                cropped_img, pad_after_resize = image_utils.pad_image(cropped_img, size, size, mode=self.pad_mode)
+                cropped_mask, _ = image_utils.pad_image(cropped_mask, size, size, mode='zero')
 
             self.frames[i] = cropped_img
             self.masks[i] = cropped_mask
@@ -142,7 +152,13 @@ class Clip:
             self.frame_start = None
             self.frame_end = None
 
-        return self.frames.pop(0), self.masks.pop(0), self.boxes.pop(0), self.crop_shapes.pop(0), self.pad_after_resizes.pop(0)
+        return (
+            vram_offload.restore_tensor(self.frames.pop(0)),
+            vram_offload.restore_tensor(self.masks.pop(0)),
+            self.boxes.pop(0),
+            self.crop_shapes.pop(0),
+            self.pad_after_resizes.pop(0),
+        )
 
     def __len__(self):
         return len(self.frames)
@@ -152,14 +168,20 @@ class Clip:
 
     def __next__(self):
         if self._index < len(self):
-            item = self.frames[self._index], self.masks[self._index], self.boxes[self._index], self.crop_shapes[self._index], self.pad_after_resizes[self._index]
+            item = (
+                vram_offload.restore_tensor(self.frames[self._index]),
+                vram_offload.restore_tensor(self.masks[self._index]),
+                self.boxes[self._index],
+                self.crop_shapes[self._index],
+                self.pad_after_resizes[self._index],
+            )
             self._index += 1
             return item
         else:
             raise StopIteration
 
     def __getitem__(self, item):
-        return self.frames[item], self.masks[item], self.boxes[item]
+        return vram_offload.restore_tensor(self.frames[item]), vram_offload.restore_tensor(self.masks[item]), self.boxes[item]
 
 class MosaicDetector:
     def __init__(self, model: Yolo11SegmentationModel, video_metadata: VideoMetadata, frame_detection_queue: PipelineQueue, mosaic_clip_queue: PipelineQueue, error_handler: Callable[[ErrorMarker], None], max_clip_length=30, clip_size=256, device: torch.device | None = None, pad_mode='reflect', batch_size=4, frame_source_factory=None):
@@ -294,6 +316,7 @@ class MosaicDetector:
             except StopIteration:
                 eof = True
             if len(frames) > 0:
+                _gpu_ops.wait_decode_events(frames)
                 frames_batch = self.model.preprocess(frames)
                 data = (frames_batch, frames, frame_num)
                 self.frame_feeder_queue.put(data)

@@ -114,7 +114,7 @@ python main.py
 - `Area Selection Direct Crop Mode`：选区直接裁剪处理
 - `Area Selection VR to Flat Mode`：VR 转平面选区处理
 - **VR 视频 DLNA 服务器**：一键开启/停止局域网 DLNA 共享，提供独立的配置窗口（管理共享目录、端口及字幕关联）
-- `JAV Subtitle Tools`：字幕生成与翻译相关工具
+- `日语批量字幕工具`：字幕生成与翻译相关工具
 - `VR Hard Subtitle Embed Tool`：VR 硬字幕嵌入
 - 其他按钮：VR 拆分合并、投影转换、小工具箱
 

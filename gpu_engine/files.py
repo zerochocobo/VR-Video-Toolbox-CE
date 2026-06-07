@@ -59,8 +59,8 @@ class _Progress:
     """
 
     def __init__(self, total: int, log_callback, min_interval: float | None = None,
-                 min_pct: float | None = None, window_sec: float = 60.0):
-        from collections import deque
+                 min_pct: float | None = None, window_sec: float = 60.0,
+                 fps_smoothing_sec: float | None = None):
         self.total = max(0, int(total))
         self.log = log_callback
         if min_interval is None:
@@ -69,18 +69,18 @@ class _Progress:
             min_pct = _cfg("progress_log_min_pct", 5.0)
         self.min_interval = max(0.0, float(min_interval))
         self.min_pct = max(0.0, float(min_pct))
-        # Use the rolling rate over the most recent window_sec seconds for fps/ETA
-        # instead of a cumulative average. Otherwise, one-time startup costs before
-        # the first frame, such as pipeline construction and cudnn autotune, can
-        # hold the cumulative average down for a long time, making fps look like it
-        # only rises and initial ETA jump to dozens of hours. The rolling window
-        # reflects recent speed quickly and smooths Lada's batch-restore stalls
-        # every 180 frames.
-        self.window_sec = float(window_sec)
+        if fps_smoothing_sec is None:
+            fps_smoothing_sec = _cfg("progress_fps_smoothing_s", 12.0)
+        self.fps_smoothing_sec = max(0.001, float(fps_smoothing_sec))
+        # Report current throughput from adjacent progress samples, smoothed by
+        # EMA. The old rolling-window display dropped warmup samples over time,
+        # making FPS rise monotonically even when current throughput was stable.
         self.t0 = time.perf_counter()
         self._last = 0.0
         self._last_pct = 0.0
-        self._samples = deque()  # (t, done)
+        self._sample_t: float | None = None
+        self._sample_done = 0
+        self._fps_ema = 0.0
 
     @staticmethod
     def _fmt(sec: float) -> str:
@@ -105,17 +105,21 @@ class _Progress:
         self._last = now
         self._last_pct = pct
         el = now - self.t0
-        # Rolling-window rate: keep the earliest sample still inside window_sec and measure from it to now.
-        self._samples.append((now, done))
-        while len(self._samples) > 2 and (now - self._samples[0][0]) > self.window_sec:
-            self._samples.popleft()
-        t_old, done_old = self._samples[0]
-        dt = now - t_old
-        dn = done - done_old
-        if dt >= 1.0 and dn > 0:
-            fps = dn / dt
+        if self._sample_t is None:
+            fps = done / el if el > 0 else 0.0
+            self._fps_ema = fps
         else:
-            fps = done / el if el > 0 else 0.0  # Not enough warmup samples yet; fall back to cumulative speed.
+            dt = now - self._sample_t
+            dn = done - self._sample_done
+            if dt > 0.0 and dn > 0:
+                instant_fps = dn / dt
+                alpha = min(1.0, dt / self.fps_smoothing_sec)
+                self._fps_ema = instant_fps if self._fps_ema <= 0.0 else (
+                    self._fps_ema + alpha * (instant_fps - self._fps_ema)
+                )
+            fps = self._fps_ema
+        self._sample_t = now
+        self._sample_done = done
         eta = ((self.total - done) / fps) if fps > 0 else 0.0
         self.log(f"[GPU] {done}/{self.total} ({pct:.1f}%) | {fps:.1f} fps | "
                  f"elapsed {self._fmt(el)} | ETA {self._fmt(eta)}")

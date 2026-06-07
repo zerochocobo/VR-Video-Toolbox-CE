@@ -101,7 +101,7 @@ From the launcher, choose the tool you need:
 - `Area Selection Direct Crop Mode`: local crop-based mosaic processing
 - `Area Selection VR to Flat Mode`: VR-to-flat area processing
 - **VR Video DLNA Server**: One-click startup/shutdown for LAN DLNA sharing, providing an independent config window for directories, port, and subtitles.
-- `JAV Subtitle Tools`: subtitle generation, translation, and batch tools
+- `Japanese Batch Subtitle Tools`: subtitle generation, translation, and batch tools
 - `VR Hard Subtitle Embed Tool`: hard subtitle embedding for VR video
 - Other buttons: split/combine, projection conversion, flat conversion, and small utilities
 

@@ -67,6 +67,28 @@ def get_mask_area(mask: Mask) -> float:
 def smooth_mask(mask: Mask, kernel_size: int) -> Mask:
     return cv2.medianBlur(mask, kernel_size).reshape(mask.shape)
 
+# Separable box-blur kernel cache.
+# Ported from jasna v0.6.1 (commit f4b57d7 "separable conv"):
+# a uniform KxK box kernel = (1xK) then (Kx1), cost O(K^2) -> O(2K).
+# Fixes the dense-conv O(n^2) regression flagged upstream by sh202603.
+_BLEND_KERNEL_CACHE: dict[tuple[str, torch.dtype, int], tuple[torch.Tensor, torch.Tensor]] = {}
+
+def _box_blur_separable(x4d: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    # x4d: (1, 1, H, W); kernel_size is odd.
+    cache_key = (str(x4d.device), x4d.dtype, kernel_size)
+    kernels = _BLEND_KERNEL_CACHE.get(cache_key)
+    if kernels is None:
+        kh = torch.ones((1, 1, 1, kernel_size), device=x4d.device, dtype=x4d.dtype) / kernel_size
+        kv = torch.ones((1, 1, kernel_size, 1), device=x4d.device, dtype=x4d.dtype) / kernel_size
+        kernels = (kh, kv)
+        _BLEND_KERNEL_CACHE[cache_key] = kernels
+    kh, kv = kernels
+    pad = kernel_size // 2
+    x4d = F.pad(x4d, (pad, pad, pad, pad), mode='reflect')
+    x4d = F.conv2d(x4d, kh)
+    x4d = F.conv2d(x4d, kv)
+    return x4d
+
 def create_blend_mask(crop_mask: torch.Tensor):
     mask = crop_mask.squeeze()
     h, w = mask.shape
@@ -87,8 +109,11 @@ def create_blend_mask(crop_mask: torch.Tensor):
     blend = F.pad(inner, (pad_left, pad_right, pad_top, pad_bottom), value=0.0)
     mask4 = (mask > 0)
     blend = torch.maximum(mask4, blend)
-    kernel = torch.tensor(1.0 / (blur_size**2), device=blend.device, dtype=blend.dtype).expand(1, blur_size, blur_size)
-    blend = image_utils.filter2D(blend.unsqueeze(0).unsqueeze(0), kernel).squeeze(0).squeeze(0)
+    # Separable box blur (jasna v0.6.1): replaces the original KxK dense conv
+    # `image_utils.filter2D(..., kernel=ones(1,K,K)/K**2)` with 1xK then Kx1.
+    # Reflect padding + odd K matches the original filter2D semantics, so the
+    # output mask is numerically equivalent within float rounding.
+    blend = _box_blur_separable(blend.unsqueeze(0).unsqueeze(0), blur_size).squeeze(0).squeeze(0)
     assert blend.shape == mask.shape
     return blend
 

@@ -16,6 +16,12 @@ dependencies = [
     "huggingface-hub>=1.8.0",
     "keyring>=25.7.0",
     "requests>=2.32.5",
+    # tool_si vendors Qwen3-TTS source instead of depending on qwen-tts.
+    # Keep Transformers on a branch compatible with huggingface-hub 1.x.
+    "transformers>=5.9.0",
+    "accelerate>=1.12.0",
+    "librosa>=0.11.0",
+    "soundfile>=0.13.1",
     "av>=17.0.1",
     "fastapi>=0.100.0",
     "uvicorn>=0.20.0",
@@ -39,6 +45,7 @@ dependencies = [
     "omegaconf>=2.3.0",
     "einops>=0.8.0",
     "safetensors>=0.4.5",
+    "opencv-python>=4.13.0.92",
 ]
 
 [tool.uv]

@@ -1,7 +1,7 @@
-"""CUDA/CuPy/PyNv runtime: device probing, memory pool management, startup warmup, and capability checks.
+"""CUDA/CuPy/PyNv runtime: device probing, memory pool management, warmup, and capability checks.
 
-main.py calls warmup() at startup. On failure, the app globally degrades to
-ffmpeg-only mode.
+GPU tools call warmup() on demand. On failure, callers can degrade to ffmpeg-only
+mode.
 """
 from __future__ import annotations
 

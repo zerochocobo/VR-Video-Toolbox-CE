@@ -18,6 +18,8 @@ from lada.utils import visualization_utils
 from lada.restorationpipeline.mosaic_detector import MosaicDetector
 from lada.restorationpipeline.mosaic_detector import Clip
 from lada.models.yolo.yolo11_segmentation_model import Yolo11SegmentationModel
+from gpu_engine import vram_offload
+from gpu_engine.native_mosaic import _gpu_ops
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=LOG_LEVEL)
@@ -261,6 +263,7 @@ class FrameRestorer:
                     break
             else:
                 self._restore_clip(clip)
+                vram_offload.maybe_offload_clip(clip)
                 # Release MPS driver cached memory to prevent unbounded growth
                 if self.device.type == 'mps' and hasattr(torch.mps, 'empty_cache'):
                     torch.mps.empty_cache()
@@ -283,6 +286,7 @@ class FrameRestorer:
                 return STOP_MARKER
             assert elem is EOF_MARKER, f"Illegal state: Expected to read EOF_MARKER from detection queue but received f{elem}"
             return EOF_MARKER
+        _gpu_ops.wait_decode_event(frame)
         elem = self.frame_detection_queue.get()
         if self.stop_requested or elem is STOP_MARKER:
             logger.debug("frame restoration worker: frame_detection_queue consumer unblocked")

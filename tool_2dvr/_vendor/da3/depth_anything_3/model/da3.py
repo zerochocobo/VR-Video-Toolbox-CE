@@ -106,6 +106,8 @@ class DepthAnything3Net(nn.Module):
         infer_gs: bool = False,
         use_ray_pose: bool = False,
         ref_view_strategy: str = "saddle_balanced",
+        skip_camera: bool = False,
+        skip_sky: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass through the network.
@@ -138,14 +140,23 @@ class DepthAnything3Net(nn.Module):
         # Process features through depth head
         with torch.autocast(device_type=x.device.type, enabled=False):
             output = self._process_depth_head(feats, H, W)
-            if use_ray_pose:
+            if skip_camera and not infer_gs:
+                if "ray" in output:
+                    del output.ray
+                if "ray_conf" in output:
+                    del output.ray_conf
+            elif use_ray_pose:
                 output = self._process_ray_pose_estimation(output, H, W)
             else:
                 output = self._process_camera_estimation(feats, H, W, output)
             if infer_gs:
                 output = self._process_gs_head(feats, H, W, output, x, extrinsics, intrinsics)
         
-        output = self._process_mono_sky_estimation(output)    
+        if skip_sky:
+            if "sky" in output:
+                del output.sky
+        else:
+            output = self._process_mono_sky_estimation(output)
 
         # Extract auxiliary features if requested
         output.aux = self._extract_auxiliary_features(aux_feats, export_feat_layers, H, W)
@@ -342,6 +353,8 @@ class NestedDepthAnything3Net(nn.Module):
         infer_gs: bool = False,
         use_ray_pose: bool = False,
         ref_view_strategy: str = "saddle_balanced",
+        skip_camera: bool = False,
+        skip_sky: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass through both branches with metric scaling alignment.
@@ -360,7 +373,13 @@ class NestedDepthAnything3Net(nn.Module):
         """
         # Get predictions from both branches
         output = self.da3(
-            x, extrinsics, intrinsics, export_feat_layers=export_feat_layers, infer_gs=infer_gs, use_ray_pose=use_ray_pose, ref_view_strategy=ref_view_strategy
+            x, extrinsics, intrinsics,
+            export_feat_layers=export_feat_layers,
+            infer_gs=infer_gs,
+            use_ray_pose=use_ray_pose,
+            ref_view_strategy=ref_view_strategy,
+            skip_camera=skip_camera,
+            skip_sky=skip_sky,
         )
         metric_output = self.da3_metric(x)
 

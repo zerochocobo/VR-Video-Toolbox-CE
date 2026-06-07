@@ -97,18 +97,15 @@ def _resize_masks(masks: np.ndarray, size: tuple[int, int], dilation: int) -> np
 
 
 def _alpha_from_mask(mask: np.ndarray) -> np.ndarray:
-    # Light feather only INSIDE the binary mask. Previously the Gaussian also
-    # extended outside the mask, which dragged contaminated `fill` colours into
-    # the surrounding image as visible dark fringes along every streak.
+    # Keep the mask core opaque even for 1px forward-warp holes, then apply only
+    # a light edge feather so the inpainted fill does not hard-step into source.
     import cv2
 
     core = mask.astype(np.float32)
     if not np.any(core):
         return core[:, :, None]
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    eroded = cv2.erode(core, kernel, iterations=1)
-    feather = cv2.GaussianBlur(eroded, (0, 0), sigmaX=0.6, sigmaY=0.6)
-    alpha = np.minimum(core, np.maximum(eroded, feather))
+    feather = cv2.GaussianBlur(core, (0, 0), sigmaX=0.6, sigmaY=0.6)
+    alpha = np.maximum(core, feather)
     return np.clip(alpha, 0.0, 1.0)[:, :, None]
 
 

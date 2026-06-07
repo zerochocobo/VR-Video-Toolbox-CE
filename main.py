@@ -32,16 +32,6 @@ if hasattr(os, 'add_dll_directory'):
     except Exception:
         pass
 
-from one_click import main as one_click_main
-from area_selection_vr2flat import main as area_selection_main
-from area_selection_rect_crop import main as area_selection_rect_crop_main
-from tool_vr2flat import main as vr2flat_main
-from tool_split_combine import main as split_combine_main
-from tool_v360_trans import main as v360_trans_main
-from tool_2dvr import main as two_d_vr_main
-from tool_subtitle import gui as tool_subtitle_gui
-from tool_subembed import main as tool_subembed_main
-from tools import gui as tools_gui
 import subprocess
 from tkinter import filedialog
 from tkinter import messagebox
@@ -378,6 +368,7 @@ class VRVideoToolboxLauncher:
         subtitle_frame = self.create_group(get_text('grp_subtitle'))
         ttk.Button(subtitle_frame, text=get_text('btn_subtitle_tools'), style='Big.TButton', command=self.launch_subtitle_tools).grid(row=1, column=0, sticky='ew', padx=4, pady=2)
         ttk.Button(subtitle_frame, text=get_text('btn_subembed_tools'), style='Big.TButton', command=self.launch_subembed_tools).grid(row=1, column=1, sticky='ew', padx=4, pady=2)
+        ttk.Button(subtitle_frame, text=get_text('btn_si_voice'), style='Big.TButton', command=self.launch_si_voice).grid(row=2, column=0, columnspan=2, sticky='ew', padx=4, pady=2)
         subtitle_frame.columnconfigure(0, weight=1)
         subtitle_frame.columnconfigure(1, weight=1)
         
@@ -514,55 +505,83 @@ class VRVideoToolboxLauncher:
             webbrowser.open("file:///" + os.path.abspath(path).replace("\\", "/"))
 
     def launch_one_click(self):
+        from one_click import main as one_click_main
+
         self.clear_frame()
         # Initialize One-Click App
         self.app = one_click_main.VRMosaicOneClickApp(self.root, on_return=self.request_show_launcher)
 
     def launch_area_selection(self):
+        from area_selection_vr2flat import main as area_selection_main
+
         self.clear_frame()
         # Initialize Area Selection App
         self.app = area_selection_main.VRMosaicApp(self.root, on_return=self.request_show_launcher)
 
     def launch_area_selection_rect_crop(self):
+        from area_selection_rect_crop import main as area_selection_rect_crop_main
+
         self.clear_frame()
         # Initialize Area Selection Rect Crop App
         self.app = area_selection_rect_crop_main.VRMosaicApp(self.root, on_return=self.request_show_launcher)
 
     def launch_vr2flat(self):
+        from tool_vr2flat import main as vr2flat_main
+
         self.clear_frame()
         # Initialize VR2Flat App
         self.app = vr2flat_main.VRMosaicApp(self.root, on_return=self.request_show_launcher)
 
     def launch_split_combine(self):
+        from tool_split_combine import main as split_combine_main
+
         self.clear_frame()
         # Initialize Split/Combine App
         self.app = split_combine_main.VRSplitCombineApp(self.root, on_return=self.request_show_launcher)
 
     def launch_v360_trans(self):
+        from tool_v360_trans import main as v360_trans_main
+
         self.clear_frame()
         # Initialize V360 Trans App
         self.app = v360_trans_main.VRTransApp(self.root, on_return=self.request_show_launcher)
 
     def launch_2dvr(self):
+        from tool_2dvr import main as two_d_vr_main
+
         self.clear_frame()
         self.app = two_d_vr_main.TwoDToVRApp(self.root, on_return=self.request_show_launcher)
 
     def launch_tools(self):
+        from tools import gui as tools_gui
+
         self.clear_frame()
         # Initialize Tools App
         self.app = tools_gui.VRVideoToolsApp(self.root, on_return=self.request_show_launcher)
 
     def launch_tools_zoom(self):
+        from tools import gui as tools_gui
+
         self.clear_frame()
         # Initialize Tools App and select Zoom tab (index 2)
         self.app = tools_gui.VRVideoToolsApp(self.root, on_return=self.request_show_launcher)
         self.app.notebook.select(3)
         
     def launch_subtitle_tools(self):
+        from tool_subtitle import gui as tool_subtitle_gui
+
         self.clear_frame()
         self.app = tool_subtitle_gui.SubtitleToolsApp(self.root, on_return=self.request_show_launcher)
 
+    def launch_si_voice(self):
+        from tool_si import gui as tool_si_gui
+
+        self.clear_frame()
+        self.app = tool_si_gui.SimultaneousInterpretationApp(self.root, on_return=self.request_show_launcher)
+
     def launch_subembed_tools(self):
+        from tool_subembed import main as tool_subembed_main
+
         self.clear_frame()
         self.app = tool_subembed_main.VRSubtitleEmbedApp(self.root, on_return=self.request_show_launcher)
 
@@ -803,6 +822,11 @@ def _start_gpu_warmup():
     threading.Thread(target=_run, name="gpu-warmup", daemon=True).start()
 
 
+def _startup_gpu_warmup_enabled() -> bool:
+    value = os.environ.get("VRTB_START_GPU_WARMUP", "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _selftest_gpu() -> int:
     """GPU self-test: warmup + one CuPy kernel + PyNv probe for diagnostics and packaging validation.
 
@@ -833,7 +857,8 @@ def _selftest_gpu() -> int:
 if __name__ == "__main__":
     if "--selftest-gpu" in sys.argv:
         sys.exit(_selftest_gpu())
-    _start_gpu_warmup()
+    if _startup_gpu_warmup_enabled():
+        _start_gpu_warmup()
     root = tk.Tk()
     app = VRVideoToolboxLauncher(root)
     root.mainloop()

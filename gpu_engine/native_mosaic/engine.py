@@ -11,8 +11,41 @@ per-file model reloads. Detection and restoration already run on GPU.
 from __future__ import annotations
 
 import os
+from contextlib import nullcontext
 from fractions import Fraction
 from pathlib import Path
+
+
+_FALSE_VALUES = {"", "0", "false", "no", "off"}
+_DEFAULT_GPU_FRAME_SOURCE_MIN_PIXELS = 0
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() not in _FALSE_VALUES
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(str(os.environ.get(name, default)).strip())
+    except Exception:
+        return int(default)
+
+
+def _gpu_frame_source_decision(src_meta) -> tuple[bool, str, int, int]:
+    """Decide whether restore_file should use NVDEC-backed frame source."""
+    width = int(getattr(src_meta, "width", 0) or 0)
+    height = int(getattr(src_meta, "height", 0) or 0)
+    pixels = max(0, width) * max(0, height)
+    min_pixels = max(0, _env_int("VRVT_GPU_FRAME_SOURCE_MIN_PIXELS", _DEFAULT_GPU_FRAME_SOURCE_MIN_PIXELS))
+
+    if _env_bool("VRVT_NATIVE_FORCE_CPU_FRAME_SOURCE", False):
+        return False, "forced by VRVT_NATIVE_FORCE_CPU_FRAME_SOURCE", pixels, min_pixels
+    if min_pixels > 0 and pixels < min_pixels:
+        return False, f"input too small ({width}x{height}, {pixels} < {min_pixels} pixels)", pixels, min_pixels
+    return True, f"gpu frame source eligible ({width}x{height}, {pixels} >= {min_pixels} pixels)", pixels, min_pixels
 
 
 class _GpuEncodeSetupError(Exception):
@@ -30,10 +63,16 @@ class NativeMosaicEngine:
         import torch
         from lada.restorationpipeline import load_models
         from lada.utils.os_utils import gpu_has_fp16_acceleration
+        from . import _torch_tuning
         from .models_cfg import detection_model_path, restoration_model_path
 
+        self._tuning_state = _torch_tuning.apply_inference_tuning()
         self.torch = torch
         self.device = torch.device("cuda")
+        try:
+            self._decode_stream = torch.cuda.Stream(device=self.device)
+        except Exception:
+            self._decode_stream = None
         self.fp16 = bool(gpu_has_fp16_acceleration())
         self.restoration_name = "basicvsrpp"
         det_path = detection_model_path()
@@ -47,7 +86,14 @@ class NativeMosaicEngine:
             self.device, self.restoration_name, res_path, None, det_path,
             self.fp16, False,
         )
+        self._tuning_state["restoration_channels_last"] = _torch_tuning.convert_module_channels_last(
+            getattr(self.restoration_model, "model", None)
+        )
+        self._tuning_state["detection_channels_last"] = _torch_tuning.convert_module_channels_last(
+            getattr(self.detection_model, "model", None)
+        )
         self._patch_detection_gpu_preprocess()
+        self._warmup_native_pipeline()
 
     def _patch_detection_gpu_preprocess(self):
         """Fix LADA GPU frame preprocessing for HWC torch frames.
@@ -76,6 +122,64 @@ class NativeMosaicEngine:
 
         model._preprocess_gpu = types.MethodType(_preprocess_gpu, model)
         model.preprocess = types.MethodType(_preprocess, model)
+
+    def _warmup_native_pipeline(self):
+        """Trigger CUDA kernels and model autotune once after model load.
+
+        Warmup must never make engine startup fail; unsupported model shapes or
+        driver hiccups are captured for diagnostics and the real restore path can
+        still run normally.
+        """
+        value = str(os.environ.get("VRVT_NATIVE_WARMUP", "1")).strip().lower()
+        if value in {"0", "false", "no", "off"}:
+            self._warmup_error = None
+            return
+
+        errors: list[str] = []
+        try:
+            import cupy as cp
+            from gpu_engine import nv12_kernels
+
+            y = cp.zeros((16, 16), dtype=cp.uint8)
+            uv = cp.full((8, 8, 2), 128, dtype=cp.uint8)
+            bgr = nv12_kernels.nv12_to_bgr(y, uv, bit_depth=8)
+            nv12_kernels.bgr_to_nv12(bgr)
+            cp.cuda.get_current_stream().synchronize()
+        except Exception as exc:
+            errors.append(f"cupy/nv12: {type(exc).__name__}: {exc}")
+
+        try:
+            frames = [
+                self.torch.zeros((256, 256, 3), device=self.device, dtype=self.torch.uint8)
+                for _ in range(max(1, min(3, int(os.environ.get("VRVT_NATIVE_WARMUP_FRAMES", "3")))))
+            ]
+            with self.torch.inference_mode():
+                batch = self.detection_model.preprocess(frames[:1])
+                self.detection_model.inference_and_postprocess(batch, frames[:1])
+            self.torch.cuda.current_stream(self.device).synchronize()
+        except Exception as exc:
+            errors.append(f"detection: {type(exc).__name__}: {exc}")
+
+        try:
+            frames = [
+                self.torch.zeros((256, 256, 3), device=self.device, dtype=self.torch.uint8)
+                for _ in range(max(1, min(3, int(os.environ.get("VRVT_NATIVE_WARMUP_FRAMES", "3")))))
+            ]
+            with self.torch.inference_mode():
+                self.restoration_model.restore(frames, max_frames=1)
+            self.torch.cuda.current_stream(self.device).synchronize()
+        except Exception as exc:
+            errors.append(f"restoration: {type(exc).__name__}: {exc}")
+
+        try:
+            warmup_clip_length = int(os.environ.get("VRVT_CUDA_GRAPH_WARMUP_FRAMES", "180"))
+            if hasattr(self.restoration_model, "warmup_graph"):
+                self.restoration_model.warmup_graph(warmup_clip_length)
+                self.torch.cuda.current_stream(self.device).synchronize()
+        except Exception as exc:
+            errors.append(f"cuda_graph: {type(exc).__name__}: {exc}")
+
+        self._warmup_error = "; ".join(errors) if errors else None
 
     def _resolve_encoder(self):
         """Choose an nvenc HEVC encoding preset, falling back to reasonable hevc_nvenc options if the CSV preset is unavailable."""
@@ -107,6 +211,7 @@ class NativeMosaicEngine:
         strongly contend with torch model inference like the section 4.5
         streaming path did.
         """
+        from gpu_engine._profile import DecodeProfile, get_active_profile, set_active_profile
         from lada.restorationpipeline.frame_restorer import FrameRestorer
         from lada.utils import video_utils
 
@@ -114,50 +219,125 @@ class NativeMosaicEngine:
             if log_callback:
                 log_callback(m)
 
-        meta = video_utils.get_video_meta_data(input_path)
+        profile = DecodeProfile.from_env_or_argv()
+        profile.metadata(
+            input=str(input_path),
+            output=str(output_path),
+            max_clip_length=int(max_clip_length),
+            produce_mp4=bool(produce_mp4),
+            fp16=bool(self.fp16),
+            warmup_error=self._warmup_error,
+            torch_tuning=self._tuning_state,
+        )
+        previous_profile = get_active_profile()
+        set_active_profile(profile)
 
-        def _make_restorer():
+        def _make_restorer(frame_source_factory=None, video_meta_data=None):
             return FrameRestorer(
                 self.device, input_path, max_clip_length, self.restoration_name,
                 self.detection_model, self.restoration_model, self.pad_mode,
+                video_meta_data=video_meta_data, frame_source_factory=frame_source_factory,
             )
 
-        gpu_ok = False
-        src_meta = None
         try:
-            from gpu_engine import probe
-            src_meta, decision = probe.route(input_path)
-            gpu_ok = bool(decision.is_gpu and not src_meta.is_hdr and not src_meta.is_bt2020)
-            if not gpu_ok:
-                _log(f"[native] GPU NVENC unavailable ({decision.reason or 'non-SDR/10-bit'}); using VideoWriter")
-                if not produce_mp4:
-                    _log("[native] raw HEVC restore requested but GPU NVENC path is unavailable; writing mp4")
-        except Exception as e:
-            _log(f"[native] probe failed, using VideoWriter: {type(e).__name__}: {e}")
-            gpu_ok = False
+            with profile.section("restore_file.total"):
+                with profile.section("metadata.lada_video"):
+                    meta = video_utils.get_video_meta_data(input_path)
 
-        if gpu_ok:
-            try:
-                return self._restore_file_gpu_nvenc(
-                    _make_restorer(), input_path, output_path, meta, src_meta,
-                    bitrate_bps=bitrate_bps,
-                    log_callback=log_callback, cancel_token=cancel_token,
-                    produce_mp4=produce_mp4,
-                    sidecar_metadata=sidecar_metadata,
+                gpu_ok = False
+                frame_source_ok = False
+                src_meta = None
+                decision = None
+                frame_source_reason = ""
+                try:
+                    from gpu_engine import probe
+                    with profile.section("metadata.probe_route"):
+                        src_meta, decision = probe.route(input_path)
+                    gpu_ok = bool(decision.is_gpu and not src_meta.is_hdr and not src_meta.is_bt2020)
+                    frame_source_ok = gpu_ok
+                    if frame_source_ok:
+                        frame_source_ok, frame_source_reason, frame_source_pixels, frame_source_min_pixels = (
+                            _gpu_frame_source_decision(src_meta)
+                        )
+                    else:
+                        frame_source_pixels = int(src_meta.width) * int(src_meta.height)
+                        frame_source_min_pixels = _DEFAULT_GPU_FRAME_SOURCE_MIN_PIXELS
+                    profile.metadata(
+                        source_backend=decision.backend,
+                        source_backend_reason=decision.reason,
+                        source_width=int(src_meta.width),
+                        source_height=int(src_meta.height),
+                        source_bit_depth=int(src_meta.bit_depth),
+                        source_fps=float(src_meta.source_fps or 0.0),
+                        source_frames=int(src_meta.nb_frames or 0),
+                        frame_source_pixels=int(frame_source_pixels),
+                        frame_source_min_pixels=int(frame_source_min_pixels),
+                        frame_source_reason=frame_source_reason,
+                    )
+                    if not gpu_ok:
+                        _log(f"[native] GPU NVENC unavailable ({decision.reason or 'non-SDR/10-bit'}); using VideoWriter")
+                        if not produce_mp4:
+                            _log("[native] raw HEVC restore requested but GPU NVENC path is unavailable; writing mp4")
+                except Exception as e:
+                    _log(f"[native] probe failed, using VideoWriter: {type(e).__name__}: {e}")
+                    gpu_ok = False
+                    frame_source_ok = False
+
+                frame_source_factory = None
+                restorer_meta = None
+                if frame_source_ok:
+                    try:
+                        frame_source_factory, restorer_meta = self._make_gpu_bgr_frame_source_factory(
+                            input_path,
+                            crop_mode="passthrough",
+                            to_fisheye=False,
+                            start_sec=None,
+                            end_sec=None,
+                            profile=profile,
+                        )
+                        profile.metadata(frame_source="gpu_passthrough", frame_source_reason=frame_source_reason)
+                        _log("[native] frame_source=nvdec_gpu_passthrough")
+                    except Exception as e:
+                        frame_source_factory = None
+                        restorer_meta = None
+                        profile.metadata(frame_source="cpu_videoreader", frame_source_error=f"{type(e).__name__}: {e}")
+                        _log(f"[native] GPU frame source unavailable ({type(e).__name__}: {e}); using VideoReader")
+                else:
+                    profile.metadata(frame_source="cpu_videoreader", frame_source_reason=frame_source_reason)
+                    if gpu_ok and frame_source_reason:
+                        _log(f"[native] frame_source=cpu_videoreader ({frame_source_reason})")
+
+                if gpu_ok:
+                    try:
+                        return self._restore_file_gpu_nvenc(
+                            _make_restorer(frame_source_factory, restorer_meta),
+                            input_path, output_path, meta, src_meta,
+                            bitrate_bps=bitrate_bps,
+                            log_callback=log_callback, cancel_token=cancel_token,
+                            produce_mp4=produce_mp4,
+                            sidecar_metadata=sidecar_metadata,
+                            profile=profile,
+                        )
+                    except _GpuEncodeSetupError as e:
+                        _log(f"[native] GPU NVENC setup failed ({e}); fallback to VideoWriter")
+
+                return self._restore_file_videowriter(
+                    _make_restorer(frame_source_factory, restorer_meta), input_path, output_path, meta,
+                    log_callback=log_callback, cancel_token=cancel_token, profile=profile,
                 )
-            except _GpuEncodeSetupError as e:
-                _log(f"[native] GPU NVENC setup failed ({e}); fallback to VideoWriter")
-
-        return self._restore_file_videowriter(
-            _make_restorer(), input_path, output_path, meta,
-            log_callback=log_callback, cancel_token=cancel_token,
-        )
+        finally:
+            try:
+                profile.write(log_callback)
+            except Exception as e:
+                _log(f"[profile] write failed: {type(e).__name__}: {e}")
+            set_active_profile(previous_profile)
 
     def _restore_file_gpu_nvenc(self, frame_restorer, input_path, output_path, meta, src_meta,
                                 *, bitrate_bps: int | None = None,
                                 log_callback=None, cancel_token=None,
                                 produce_mp4: bool = True,
-                                sidecar_metadata: dict | None = None) -> bool:
+                                sidecar_metadata: dict | None = None,
+                                profile=None) -> bool:
         """Plan A: encode restored frames directly from GPU through PyNv NVENC.
 
         Restored BGR frames from the file path, currently CPU torch, are uploaded
@@ -182,16 +362,17 @@ class NativeMosaicEngine:
 
         # --- setup, where failure can fall back cheaply ---
         try:
-            out_w, out_h = int(meta.video_width), int(meta.video_height)
-            fps = float(meta.video_fps_exact)
-            bitrate = _resolve_bitrate(out_w, out_h, fps, bitrate_bps, getattr(src_meta, "bitrate_bps", None))
-            enc_kwargs = _encoder_kwargs(src_meta, bitrate)
-            _log_encoder_settings("native restore", out_w, out_h, 8, enc_kwargs, log_callback)
-            enc = PyNvEncoderSession(
-                out_w, out_h, bit_depth=8, codec="hevc",
-                **enc_kwargs,
-            )
-            raw_path = _media_temp_path(output_path, "native")
+            with profile.section("gpu_nvenc.setup") if profile else nullcontext():
+                out_w, out_h = int(meta.video_width), int(meta.video_height)
+                fps = float(meta.video_fps_exact)
+                bitrate = _resolve_bitrate(out_w, out_h, fps, bitrate_bps, getattr(src_meta, "bitrate_bps", None))
+                enc_kwargs = _encoder_kwargs(src_meta, bitrate)
+                _log_encoder_settings("native restore", out_w, out_h, 8, enc_kwargs, log_callback)
+                enc = PyNvEncoderSession(
+                    out_w, out_h, bit_depth=8, codec="hevc",
+                    **enc_kwargs,
+                )
+                raw_path = _media_temp_path(output_path, "native")
         except Exception as e:
             raise _GpuEncodeSetupError(f"{type(e).__name__}: {e}") from e
 
@@ -202,7 +383,8 @@ class NativeMosaicEngine:
         written = 0
         success = True
         try:
-            frame_restorer.start()
+            with profile.section("restorer.start") if profile else nullcontext():
+                frame_restorer.start()
             with open(raw_path, "wb") as f:
                 sink = _EncodeSink(enc, f)
                 for elem in frame_restorer:
@@ -215,16 +397,22 @@ class NativeMosaicEngine:
                         _log("[native] frame restorer stopped prematurely")
                         break
                     restored_frame, _pts = elem
-                    y_plane, uv_plane = self._prepare_restored_nv12(
-                        restored_frame, from_fisheye=False, out_w=out_w, out_h=out_h
-                    )
-                    app = _pack_planes(y_plane, uv_plane, 8)
-                    sink.feed(app, force_idr=(written == 0))
+                    with profile.section("encode.prepare_nv12", torch_module=self.torch, cuda=True) if profile else nullcontext():
+                        y_plane, uv_plane = self._prepare_restored_nv12(
+                            restored_frame, from_fisheye=False, out_w=out_w, out_h=out_h,
+                            profile=profile,
+                        )
+                        app = _pack_planes(y_plane, uv_plane, 8)
+                    with profile.section("encode.nvenc_feed") if profile else nullcontext():
+                        sink.feed(app, force_idr=(written == 0))
                     written += 1
+                    if profile:
+                        profile.increment("frames_encoded")
                     prog.update(written)
                 if success:
                     prog.finish(written)
-                    sink.flush()
+                    with profile.section("encode.nvenc_flush") if profile else nullcontext():
+                        sink.flush()
         except Exception as e:
             success = False
             _log(f"[native] error during GPU encode: {type(e).__name__}: {e}")
@@ -284,11 +472,12 @@ class NativeMosaicEngine:
             return True
 
         _log("[native] muxing audio...")
-        mux.mux_hevc_with_audio(
-            raw_path, output_path, fps=fps, color=getattr(src_meta, "color", None),
-            audio_source=input_path, audio_start_sec=None, audio_duration=None,
-            log_callback=log_callback,
-        )
+        with profile.section("mux.audio") if profile else nullcontext():
+            mux.mux_hevc_with_audio(
+                raw_path, output_path, fps=fps, color=getattr(src_meta, "color", None),
+                audio_source=input_path, audio_start_sec=None, audio_duration=None,
+                log_callback=log_callback,
+            )
         try:
             raw_path.unlink()
         except OSError:
@@ -297,9 +486,11 @@ class NativeMosaicEngine:
         return True
 
     def _restore_file_videowriter(self, frame_restorer, input_path, output_path, meta,
-                                  *, log_callback=None, cancel_token=None) -> bool:
+                                  *, log_callback=None, cancel_token=None,
+                                  profile=None) -> bool:
         """Fallback to the original Lada VideoWriter encode path for HDR/10-bit/non-PyNv-safe sources."""
         from gpu_engine.files import _media_temp_path
+        from gpu_engine.native_mosaic import _gpu_ops
         from lada.utils import audio_utils, video_utils
         from lada.utils.threading_utils import STOP_MARKER, ErrorMarker
 
@@ -319,7 +510,8 @@ class NativeMosaicEngine:
         n = 0
         total = getattr(meta, "frames_count", 0) or 0
         try:
-            frame_restorer.start()
+            with profile.section("restorer.start") if profile else nullcontext():
+                frame_restorer.start()
             with video_utils.VideoWriter(
                 tmp_out, meta.video_width, meta.video_height, meta.video_fps_exact,
                 encoder=encoder, encoder_options=encoder_options,
@@ -335,8 +527,14 @@ class NativeMosaicEngine:
                         _log("[native] frame restorer stopped prematurely")
                         break
                     restored_frame, restored_pts = elem
-                    writer.write(restored_frame, restored_pts, bgr2rgb=True)
+                    _gpu_ops.wait_decode_event(restored_frame)
+                    if profile and isinstance(restored_frame, self.torch.Tensor) and restored_frame.is_cuda:
+                        profile.increment("d2h_expected_count")
+                    with profile.section("videowriter.write") if profile else nullcontext():
+                        writer.write(restored_frame, restored_pts, bgr2rgb=True)
                     n += 1
+                    if profile:
+                        profile.increment("frames_written_videowriter")
                     if log_callback and (n % 30 == 0):
                         pct = f" ({100 * n / total:.0f}%)" if total else ""
                         _log(f"[native] restored {n}{('/' + str(total)) if total else ''} frames{pct}")
@@ -348,7 +546,8 @@ class NativeMosaicEngine:
 
         if success:
             _log("[native] muxing audio...")
-            audio_utils.combine_audio_video_files(meta, tmp_out, output_path)
+            with profile.section("mux.audio_videowriter") if profile else nullcontext():
+                audio_utils.combine_audio_video_files(meta, tmp_out, output_path)
             _log(f"[native] done -> {output_path}")
         else:
             try:
@@ -360,6 +559,8 @@ class NativeMosaicEngine:
 
     @staticmethod
     def _crop_region(mode: str, w: int, h: int):
+        if mode == "passthrough":
+            return (0, 0, w, h)
         hw, hh = w // 2, h // 2
         return {
             "left": (0, 0, hw, h),
@@ -369,19 +570,24 @@ class NativeMosaicEngine:
         }[mode]
 
     @staticmethod
-    def _cupy_to_torch(arr):
+    def _cupy_to_torch(arr, profile=None, synchronize: bool = True):
         import cupy as cp
         import torch
 
         arr = cp.ascontiguousarray(arr)
-        cp.cuda.get_current_stream().synchronize()
+        if synchronize and profile:
+            profile.increment("sync_count")
+            profile.increment("cupy_to_torch_sync_count")
+        if synchronize:
+            with profile.section("sync.cupy_to_torch") if profile else nullcontext():
+                cp.cuda.get_current_stream().synchronize()
         try:
             return torch.utils.dlpack.from_dlpack(arr)
         except TypeError:
             return torch.utils.dlpack.from_dlpack(arr.toDlpack())
 
     @staticmethod
-    def _torch_to_cupy(tensor):
+    def _torch_to_cupy(tensor, profile=None):
         import cupy as cp
 
         if not tensor.is_cuda:
@@ -389,7 +595,11 @@ class NativeMosaicEngine:
         tensor = tensor.contiguous()
         try:
             import torch
-            torch.cuda.current_stream(tensor.device).synchronize()
+            if profile:
+                profile.increment("sync_count")
+                profile.increment("torch_to_cupy_sync_count")
+            with profile.section("sync.torch_to_cupy") if profile else nullcontext():
+                torch.cuda.current_stream(tensor.device).synchronize()
         except Exception:
             pass
         try:
@@ -397,7 +607,7 @@ class NativeMosaicEngine:
         except TypeError:
             return cp.from_dlpack(tensor.detach())
 
-    def _planes_to_torch_bgr(self, y_plane, uv_plane, bit_depth: int = 8):
+    def _planes_to_torch_bgr(self, y_plane, uv_plane, bit_depth: int = 8, profile=None):
         """Convert NV12/P010 CuPy planes to BGR8 torch CUDA tensors.
 
         CuPy RawKernel fuses chroma upsampling with YUV->BGR conversion to avoid
@@ -405,15 +615,37 @@ class NativeMosaicEngine:
         """
         from gpu_engine import nv12_kernels
 
-        bgr = nv12_kernels.nv12_to_bgr(y_plane, uv_plane, bit_depth=bit_depth)
-        return self._cupy_to_torch(bgr).to(device=self.device)
+        with profile.section("decode.nv12_to_bgr", torch_module=self.torch, cuda=True) if profile else nullcontext():
+            bgr = nv12_kernels.nv12_to_bgr(y_plane, uv_plane, bit_depth=bit_depth)
+        return self._cupy_to_torch(bgr, profile=profile).to(device=self.device)
 
-    def _torch_bgr_to_nv12_cupy(self, bgr_frame):
+    def _planes_to_torch_bgr_async(self, y_plane, uv_plane, bit_depth: int = 8, profile=None):
+        """Convert planes on the decode stream and attach a torch event to the tensor."""
+        import cupy as cp
+        from gpu_engine import nv12_kernels
+        from gpu_engine.native_mosaic import _gpu_ops
+
+        if self._decode_stream is None:
+            return self._planes_to_torch_bgr(y_plane, uv_plane, bit_depth=bit_depth, profile=profile), None
+
+        with self.torch.cuda.stream(self._decode_stream):
+            with cp.cuda.ExternalStream(self._decode_stream.cuda_stream):
+                with profile.section("decode.nv12_to_bgr", torch_module=self.torch, cuda=True) if profile else nullcontext():
+                    bgr = nv12_kernels.nv12_to_bgr(y_plane, uv_plane, bit_depth=bit_depth)
+                tensor = self._cupy_to_torch(bgr, profile=profile, synchronize=False).to(device=self.device)
+                event = self.torch.cuda.Event()
+                event.record(self._decode_stream)
+        _gpu_ops.attach_decode_event(tensor, event)
+        if profile:
+            profile.increment("decode_event_count")
+        return tensor, event
+
+    def _torch_bgr_to_nv12_cupy(self, bgr_frame, profile=None):
         """Convert BGR8 torch CUDA tensors to NV12 CuPy planes."""
         from gpu_engine import nv12_kernels
 
         bgr = bgr_frame.to(device=self.device, dtype=self.torch.uint8)
-        return nv12_kernels.bgr_to_nv12(self._torch_to_cupy(bgr))
+        return nv12_kernels.bgr_to_nv12(self._torch_to_cupy(bgr, profile=profile))
 
     @staticmethod
     def _to_lada_video_meta(path: str, width: int, height: int, fps: float,
@@ -444,6 +676,7 @@ class NativeMosaicEngine:
         start_sec: float | None,
         end_sec: float | None,
         fov: float = 180.0,
+        profile=None,
     ):
         from gpu_engine import probe
 
@@ -451,7 +684,7 @@ class NativeMosaicEngine:
         fps = meta.source_fps or 30.0
         start_idx = max(0, int(round((start_sec or 0.0) * fps)))
         end_idx = int(round(end_sec * fps)) if end_sec is not None else None
-        if crop_mode == "sbs":
+        if crop_mode in {"sbs", "passthrough"}:
             out_w, out_h = meta.width, meta.height
         else:
             _x, _y0, out_w, out_h = self._crop_region(crop_mode, meta.width, meta.height)
@@ -479,6 +712,7 @@ class NativeMosaicEngine:
                 start_sec=source_start,
                 end_sec=end_sec,
                 fov=fov,
+                profile=profile,
             )
 
         return _factory, lada_meta
@@ -492,6 +726,7 @@ class NativeMosaicEngine:
         start_sec: float | None,
         end_sec: float | None,
         fov: float = 180.0,
+        profile=None,
     ):
         import cupy as cp
         from gpu_engine import nv12_kernels, probe, v360_lut
@@ -503,6 +738,7 @@ class NativeMosaicEngine:
         start_idx = max(0, int(round((start_sec or 0.0) * fps)))
         end_idx = int(round(end_sec * fps)) if end_sec is not None else None
         dec = PyNvThreadedSerialDecoder(Path(input_path), bit_depth=bd, start_frame=start_idx)
+        pending_events = []
         try:
             total = len(dec)
             stop_idx = min(end_idx if end_idx is not None else total, total)
@@ -510,27 +746,50 @@ class NativeMosaicEngine:
             x, y0, out_w, out_h = self._crop_region(crop_mode, info.width, info.height)
             lut_y = v360_lut.make_lut("heq2fisheye", out_w, out_h, fov) if to_fisheye else None
             lut_c = v360_lut.make_lut("heq2fisheye", out_w // 2, out_h // 2, fov) if to_fisheye else None
+            decoder_batch_size = max(8, int(getattr(dec, "batch_size", 8) or 8))
+            if profile:
+                profile.metadata(decode_event_batch_size=int(decoder_batch_size))
+
+            def _sync_pending_events():
+                if not pending_events:
+                    return
+                with profile.section("sync.decode_batch_event") if profile else nullcontext():
+                    for event in pending_events:
+                        event.synchronize()
+                if profile:
+                    profile.increment("decode_batch_event_sync_count")
+                pending_events.clear()
+
             for i in range(start_idx, stop_idx):
-                frame = dec.frame_at(i)
-                # Plan C key fix: remove per-frame whole-device synchronization
-                # with cp.cuda.Device().synchronize(). It waited for another
-                # thread's full BasicVSR++ clip (~10-14s) before returning,
-                # serializing the multithreaded pipeline. The measured fused
-                # path was 0.69fps even though the frame source itself reached
-                # 156fps. ThreadedDecoder buffers decode ahead with buffer_size=32,
-                # so fetched frame memory is ready. Later CuPy geometry/color work
-                # runs on the current stream, and _planes_to_torch_bgr ->
-                # _cupy_to_torch synchronizes the current stream before yield,
-                # ensuring this frame's CuPy reads finish before PyNv batch memory
-                # is reused by the next frame.
+                if pending_events and ((i - start_idx) % decoder_batch_size == 0):
+                    _sync_pending_events()
+                with profile.section("decode.frame_at") if profile else nullcontext():
+                    frame = dec.frame_at(i)
                 y_plane, uv_plane = frame.y_uv_cupy()
                 y_plane = y_plane[y0:y0 + out_h, x:x + out_w]
                 uv_plane = uv_plane[y0 // 2:(y0 + out_h) // 2, x // 2:(x + out_w) // 2, :]
                 if to_fisheye:
-                    y_plane = nv12_kernels.remap_y(y_plane, lut_y, out_w, out_h)
-                    uv_plane = nv12_kernels.remap_uv(uv_plane, lut_c, out_w // 2, out_h // 2)
-                yield self._planes_to_torch_bgr(y_plane, uv_plane, bit_depth=bd), getattr(frame, "pts", i - start_idx)
+                    with profile.section("decode.remap_fisheye", torch_module=self.torch, cuda=True) if profile else nullcontext():
+                        y_plane = nv12_kernels.remap_y(y_plane, lut_y, out_w, out_h)
+                        uv_plane = nv12_kernels.remap_uv(uv_plane, lut_c, out_w // 2, out_h // 2)
+                    bgr = self._planes_to_torch_bgr(y_plane, uv_plane, bit_depth=bd, profile=profile)
+                    event = None
+                else:
+                    bgr, event = self._planes_to_torch_bgr_async(y_plane, uv_plane, bit_depth=bd, profile=profile)
+                    if event is not None:
+                        pending_events.append(event)
+                if profile:
+                    profile.increment("frames_decoded")
+                yield bgr, getattr(frame, "pts", i - start_idx)
         finally:
+            try:
+                with profile.section("sync.decode_batch_event") if profile and pending_events else nullcontext():
+                    for event in pending_events:
+                        event.synchronize()
+                if profile and pending_events:
+                    profile.increment("decode_batch_event_sync_count")
+            except Exception:
+                pass
             dec.stop()
 
     def _iter_gpu_bgr_frames_sbs(
@@ -627,17 +886,24 @@ class NativeMosaicEngine:
         finally:
             frame_restorer.stop()
 
-    def _prepare_restored_nv12(self, bgr_frame, *, from_fisheye: bool, out_w: int, out_h: int):
+    def _prepare_restored_nv12(self, bgr_frame, *, from_fisheye: bool, out_w: int, out_h: int,
+                               profile=None):
         import cupy as cp
         from gpu_engine import nv12_kernels, v360_lut
+        from gpu_engine.native_mosaic import _gpu_ops
 
-        y_plane, uv_plane = self._torch_bgr_to_nv12_cupy(bgr_frame)
+        _gpu_ops.wait_decode_event(bgr_frame)
+        y_plane, uv_plane = self._torch_bgr_to_nv12_cupy(bgr_frame, profile=profile)
         if from_fisheye:
             lut_y = v360_lut.make_lut("fisheye2heq", out_w, out_h)
             lut_c = v360_lut.make_lut("fisheye2heq", out_w // 2, out_h // 2)
             y_plane = nv12_kernels.remap_y(y_plane, lut_y, out_w, out_h)
             uv_plane = nv12_kernels.remap_uv(uv_plane, lut_c, out_w // 2, out_h // 2)
-        cp.cuda.get_current_stream().synchronize()
+        if profile:
+            profile.increment("sync_count")
+            profile.increment("prepare_nv12_sync_count")
+        with profile.section("sync.prepare_nv12") if profile else nullcontext():
+            cp.cuda.get_current_stream().synchronize()
         return y_plane, uv_plane
 
     def _prepare_restored_nv12_sbs(self, bgr_frame, *, from_fisheye: bool, eye_w: int, eye_h: int):

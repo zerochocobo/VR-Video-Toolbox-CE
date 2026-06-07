@@ -4,7 +4,7 @@
 作者: 研究阶段交付
 目标: **DA3-Small + 默认 soft_shift 羽化，4K 输入达到 ≥60fps 端到端转换**
 范围: `tool_2dvr/logic.py`、`tool_2dvr/_vendor/da3/depth_anything_3/`（必要时深改）
-不在范围: E2FGVI 模式、`flat3d` 以外投影的 FOV 调优
+不在范围: 视频修补模式、`flat3d` 以外投影的 FOV 调优
 
 ---
 
@@ -169,7 +169,7 @@ ffmpeg 解码 (CPU rgb24) ─pipe─▶ Python read
 
 - DA3 `inference_depth_only` 必须保证 depth 数值与 `inference` 完全一致（diff < 1e-4），用一段静态图做单元对比
 - 三种投影 `flat3d / hequirect / fisheye` 各跑 5s clip 回归
-- 所有 `hole_fill_mode`（soft_shift / shift_fill / background / inpaint / e2fgvi / none）回归
+- 所有 `hole_fill_mode`（soft_shift / shift_fill / background / inpaint / lama / none）回归
 - `start_time/end_time` 裁剪、音频 `-map 0:a?` mux 回归
 - CUDA OOM 回退路径（`_predict_depths_resilient`、`_render_with_depths` 的二分递归）必须保留
 - NVDEC fallback 路径：故意喂一段 AV1 文件验证回退到 CPU 解码
@@ -181,7 +181,7 @@ ffmpeg 解码 (CPU rgb24) ─pipe─▶ Python read
 - 不替换 DA3 模型（仍是 Small）
 - 不引入新的视频解码库（PyAV/VPF）—— 先用 ffmpeg `-hwaccel cuda` 走通
 - 不改变默认 `hole_fill_mode=soft_shift` 行为
-- 不动 E2FGVI 后处理路径
+- 不动视频修补后处理路径
 - 不调整 max_disparity_pixels 等视觉参数
 
 ---

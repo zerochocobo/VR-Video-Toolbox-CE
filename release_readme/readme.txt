@@ -95,7 +95,7 @@ Not sure which mode fits your video?
 ◆ Step 3: Batch Subtitle Generation (Optional)
 ════════════════════════════════════════════════════════
 
-Click "JAV Subtitle Tools" on the main screen to access subtitle generation.
+Click "Japanese Batch Subtitle Tools" on the main screen to access subtitle generation.
 
 This feature works independently of mosaic removal and does NOT require Lada.
 It does require:

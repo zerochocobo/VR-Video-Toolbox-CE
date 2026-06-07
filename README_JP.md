@@ -114,7 +114,7 @@ python main.py
 - `Area Selection Direct Crop Mode`：局所的なクロップによるモザイク処理
 - `Area Selection VR to Flat Mode`：VRから平面への変換選択範囲処理
 - **VR Video DLNA Server**：ワンクリックでLAN DLNA共有を開始/停止。共有ディレクトリ、ポート、字幕ロードを管理する専用設定画面付き。
-- `JAV Subtitle Tools`：字幕生成、翻訳、およびバッチツール
+- `日本語一括字幕ツール`：字幕生成、翻訳、およびバッチツール
 - `VR Hard Subtitle Embed Tool`：VRビデオへの字幕のハードコード埋め込み
 - その他のボタン：分割/結合、投影変換、平面変換、小ツール箱
 
