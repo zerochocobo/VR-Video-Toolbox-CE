@@ -8,6 +8,11 @@
 
 软件首页：https://github.com/zerochocobo/VR-Video-Toolbox-CE
 
+整合包下载地址：
+
+- 百度网盘：https://pan.baidu.com/s/1763ZDLEXvyHgDRq8_ZaxBw?pwd=1234
+- 夸克网盘：https://pan.quark.cn/s/210f85bfdb37?pwd=QT4k
+
 当前主要功能：
 
 - 马赛克去除
