@@ -21,11 +21,31 @@ try:
 except Exception:
     pass
 
-from ffmpy3 import FFmpeg
-from faster_whisper.audio import decode_audio
-from faster_whisper.vad import VadOptions, get_speech_timestamps
-from faster_whisper import WhisperModel
-from faster_whisper.feature_extractor import FeatureExtractor
+FFmpeg = None
+WhisperModel = None
+decode_audio = None
+FeatureExtractor = None
+
+
+def _ensure_ffmpy3():
+    global FFmpeg
+    if FFmpeg is None:
+        from ffmpy3 import FFmpeg as _FFmpeg
+        FFmpeg = _FFmpeg
+    return FFmpeg
+
+
+def _ensure_faster_whisper():
+    global WhisperModel, decode_audio, FeatureExtractor
+    if WhisperModel is None or decode_audio is None or FeatureExtractor is None:
+        from faster_whisper import WhisperModel as _WhisperModel
+        from faster_whisper.audio import decode_audio as _decode_audio
+        from faster_whisper.feature_extractor import FeatureExtractor as _FeatureExtractor
+
+        WhisperModel = _WhisperModel
+        decode_audio = _decode_audio
+        FeatureExtractor = _FeatureExtractor
+    return WhisperModel, decode_audio, FeatureExtractor
 
 # --- Configuration & Constants ---
 
@@ -212,8 +232,25 @@ PROFILE_CONFIGS = {
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv"}
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus"}
+SI_SIDECAR_MEDIA_SUFFIXES = (".si.wav", ".si.mp4")
 
 # --- Utility Functions ---
+
+def is_si_sidecar_media_file(path: str | os.PathLike[str]) -> bool:
+    return Path(path).name.lower().endswith(SI_SIDECAR_MEDIA_SUFFIXES)
+
+
+def is_supported_source_media_file(path: str | os.PathLike[str]) -> bool:
+    candidate = Path(path)
+    return candidate.suffix.lower() in (VIDEO_EXTENSIONS | AUDIO_EXTENSIONS) and not is_si_sidecar_media_file(candidate)
+
+
+def is_subtitle_video_candidate(path: str | os.PathLike[str]) -> bool:
+    candidate = Path(path)
+    if is_si_sidecar_media_file(candidate):
+        return False
+    name = candidate.name.lower()
+    return candidate.suffix.lower() in VIDEO_EXTENSIONS and not name.endswith("_srt.mkv")
 
 def check_ffmpeg():
     return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
@@ -461,13 +498,13 @@ def batch_add_srt(base_dir, search_subdirs=True, replace_original=False, auto_lo
     if search_subdirs:
         for root, _, files in os.walk(base_dir):
             for file in files:
-                if (file.lower().endswith(".mp4") or file.lower().endswith(".mkv")) and not file.endswith("_srt.mkv"):
+                if is_subtitle_video_candidate(file):
                     tasks.append((root, file))
     else:
         try:
             files = os.listdir(base_dir)
             for file in files:
-                if (file.lower().endswith(".mp4") or file.lower().endswith(".mkv")) and not file.endswith("_srt.mkv") and os.path.isfile(os.path.join(base_dir, file)):
+                if is_subtitle_video_candidate(file) and os.path.isfile(os.path.join(base_dir, file)):
                     tasks.append((base_dir, file))
         except Exception as e:
             log_callback(f"Error reading directory: {e}")
@@ -624,6 +661,8 @@ def batch_remove_srt(base_dir, search_subdirs=True, delete_mkv=False, log_callba
 
 class SubtitleGenerator:
     def __init__(self, model_path: str, model_preset: str, log_callback, use_gpu: bool = True):
+        WhisperModel, _, _ = _ensure_faster_whisper()
+
         self.model_preset = model_preset
         self.log_callback = log_callback
         self.models_root = os.path.dirname(model_path)
@@ -757,6 +796,7 @@ class SubtitleGenerator:
 
     def split_audio(self, audio_path: str, chunk_seconds: float):
         """Return fixed-size chunks with absolute offsets."""
+        _, decode_audio, _ = _ensure_faster_whisper()
         audio = decode_audio(audio_path, sampling_rate=16000)
         if audio.ndim != 1:
             audio = np.asarray(audio).reshape(-1)
@@ -789,6 +829,7 @@ class SubtitleGenerator:
             self.log_callback("auditok import failed; falling back to fixed chunks.")
             return self.split_audio(audio_path, chunk_seconds)
 
+        _, decode_audio, _ = _ensure_faster_whisper()
         audio = decode_audio(audio_path, sampling_rate=16000)
         if audio.ndim != 1:
             audio = np.asarray(audio).reshape(-1)
@@ -1010,6 +1051,7 @@ class SubtitleGenerator:
             "Loaded WhisperSeg ONNX with providers: "
             f"{self.whisperseg_session.get_providers()}"
         )
+        _, _, FeatureExtractor = _ensure_faster_whisper()
         self.whisperseg_feature_extractor = FeatureExtractor(
             feature_size=80,
             sampling_rate=16000,
@@ -1160,6 +1202,7 @@ class SubtitleGenerator:
 
     def split_audio_auditok_whisperseg(self, audio_path: str, chunk_seconds: float):
         auditok_chunks = self.split_audio_auditok(audio_path, chunk_seconds)
+        _, decode_audio, _ = _ensure_faster_whisper()
         audio = decode_audio(audio_path, sampling_rate=16000)
         if audio.ndim != 1:
             audio = np.asarray(audio).reshape(-1)
@@ -1248,6 +1291,7 @@ class SubtitleGenerator:
         return segmented_chunks
 
     def split_audio_whisperseg(self, audio_path: str, chunk_seconds: float):
+        _, decode_audio, _ = _ensure_faster_whisper()
         audio = decode_audio(audio_path, sampling_rate=16000)
         if audio.ndim != 1:
             audio = np.asarray(audio).reshape(-1)
@@ -1689,6 +1733,7 @@ def extract_audio(video_path: str, audio_path: str, denoise_preset: str, log_cal
         log_callback(f"Audio DSP preset: {denoise_preset}")
         ffmpeg_opts += f' -af {filter_str}'
         
+    FFmpeg = _ensure_ffmpy3()
     ff = FFmpeg(
         executable="ffmpeg",
         inputs={video_path: None},
@@ -1731,15 +1776,13 @@ def batch_generate_srt(base_dir: str, search_subdirs: bool, skip_if_exists: bool
     if search_subdirs:
         for root, _, files in os.walk(base_dir):
             for file in files:
-                ext = os.path.splitext(file)[1].lower()
-                if ext in VIDEO_EXTENSIONS or ext in AUDIO_EXTENSIONS:
+                if is_supported_source_media_file(file):
                     tasks.append(Path(root) / file)
     else:
         try:
             for file in os.listdir(base_dir):
-                ext = os.path.splitext(file)[1].lower()
                 filepath = Path(base_dir) / file
-                if filepath.is_file() and (ext in VIDEO_EXTENSIONS or ext in AUDIO_EXTENSIONS):
+                if filepath.is_file() and is_supported_source_media_file(filepath):
                     tasks.append(filepath)
         except Exception as e:
             log_callback(f"Error reading directory: {e}")
@@ -1806,9 +1849,6 @@ def batch_generate_srt(base_dir: str, search_subdirs: bool, skip_if_exists: bool
 # Subtitle Translation Logic
 # ============================================================
 import random
-import requests
-import json
-import keyring
 
 DEFAULT_TRANS_CONFIG = {
     "api_base_url": "https://api.deepseek.com/",
@@ -1883,6 +1923,8 @@ class LLMClient:
         self.output_tokens = 0
 
     def complete(self, prompt: str) -> str:
+        import requests
+
         payload = {
             "model": self.model,
             "messages": [{"role": "system", "content": prompt}],
@@ -2252,7 +2294,7 @@ def batch_convert_srt_to_ass(base_dir: str, alignment: int, base_cn_size: int, b
         video_path = None
         for suffix in [".mp4", ".mkv"]:
             potential_path = srt_path.with_suffix(suffix)
-            if potential_path.exists():
+            if potential_path.exists() and not is_si_sidecar_media_file(potential_path):
                 video_path = potential_path
                 break
 

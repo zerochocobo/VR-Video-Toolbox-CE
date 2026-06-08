@@ -36,7 +36,7 @@ import subprocess
 from tkinter import filedialog
 from tkinter import messagebox
 
-ver_name = "v1.0 beta.2 (build 2026-06-05)"
+ver_name = "v1.0 beta.3 (build 2026-06-08)"
 DLNA_SERVER_EXE_NAME = "vr_dlna_server.exe"
 
 
@@ -658,7 +658,6 @@ class VRVideoToolboxLauncher:
         current_port = app_config.get('dlna_port', 8090)
         current_auto_sub = app_config.get('dlna_auto_subnotes', True) if app_config.get('dlna_auto_subnotes') is not None else app_config.get('dlna_auto_subtitles', True)
         current_dirs_str = app_config.get('dlna_video_dirs', '') or ''
-        
         current_dirs = [d.strip() for d in str(current_dirs_str).split('|') if d.strip()]
 
         dialog = tk.Toplevel(self.root)
@@ -696,7 +695,7 @@ class VRVideoToolboxLauncher:
 
         # Path List
         ttk.Label(dialog, text=get_text('lbl_dlna_dirs')).grid(row=4, column=0, columnspan=2, sticky='w', padx=18, pady=(12, 4))
-        
+
         list_frame = ttk.Frame(dialog)
         list_frame.grid(row=5, column=0, columnspan=2, sticky='nsew', padx=18, pady=4)
         
@@ -733,14 +732,14 @@ class VRVideoToolboxLauncher:
         # Bottom Buttons
         bottom_btn_frame = ttk.Frame(dialog)
         bottom_btn_frame.grid(row=7, column=0, columnspan=2, sticky='e', padx=18, pady=(10, 18))
-        
+
         def save_config():
             name = name_var.get().strip()
             try:
                 port = int(port_var.get())
             except ValueError:
                 port = 8090
-                
+
             auto_sub = auto_sub_var.get()
             dirs = [str(d).strip() for d in listbox.get(0, 'end') if str(d).strip()]
             if require_dirs and not dirs:
@@ -751,19 +750,22 @@ class VRVideoToolboxLauncher:
                 )
                 return
             dirs_str = "|".join(dirs)
-            
+
             app_config.set('dlna_server_name', name if name else 'VR Video Server')
             app_config.set('dlna_port', port)
             app_config.set('dlna_auto_subtitles', auto_sub)
             app_config.set('dlna_auto_subnotes', auto_sub)  # Dual save for compat
+            # DLNA SI live-mix feature is currently disabled (UI hidden). Force the
+            # flag off on every save so any previously-enabled config gets cleared.
+            app_config.set('dlna_si_enabled', False)
             app_config.set('dlna_video_dirs', dirs_str)
-            
+
             saved['ok'] = True
             dialog.destroy()
-            
+
             if self.dlna_process is not None:
                 messagebox.showinfo(
-                    "Config Saved", 
+                    "Config Saved",
                     "DLNA Server configurations saved. Please restart the DLNA Server to apply changes.\n\nDLNA服务器配置已保存，重启服务后生效。"
                 )
 

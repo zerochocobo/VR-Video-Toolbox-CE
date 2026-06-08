@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import importlib.util
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _VENDOR = os.path.join(_HERE, "_vendor")
@@ -93,26 +94,34 @@ def _prepare():
     _prepared = True
 
 
-def unavailable_reason() -> str | None:
+def unavailable_reason(*, runtime_check: bool = True) -> str | None:
     """Return None when the engine is available, otherwise a human-readable reason.
 
     This makes the one-click dependency check actionable instead of a black box:
     it distinguishes torch import failure, missing CUDA/GPU, and each missing
-    model file (printing the exact path expected).
+    model file (printing the exact path expected). Set runtime_check=False for
+    UI startup checks that must not import CuPy or warm up the GPU stack.
     """
-    try:
-        _prepare()
-    except Exception as e:
-        return f"引擎初始化失败: {e}"
-    try:
-        import torch
-    except Exception as e:
-        return f"无法导入 torch: {e}"
-    try:
-        if not torch.cuda.is_available():
-            return "torch.cuda 不可用（未检测到可用的 NVIDIA GPU 或 CUDA 运行时未正确加载）"
-    except Exception as e:
-        return f"torch.cuda 检测异常: {e}"
+    if runtime_check:
+        try:
+            _prepare()
+        except Exception as e:
+            return f"引擎初始化失败: {e}"
+        try:
+            import torch
+        except Exception as e:
+            return f"无法导入 torch: {e}"
+        try:
+            if not torch.cuda.is_available():
+                return "torch.cuda 不可用（未检测到可用的 NVIDIA GPU 或 CUDA 运行时未正确加载）"
+        except Exception as e:
+            return f"torch.cuda 检测异常: {e}"
+    else:
+        try:
+            if importlib.util.find_spec("torch") is None:
+                return "无法导入 torch: 未安装 torch"
+        except Exception as e:
+            return f"无法检查 torch: {e}"
     try:
         from .models_cfg import detection_model_path, restoration_model_path
         det = detection_model_path()

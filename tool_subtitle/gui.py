@@ -5,7 +5,6 @@ import gc
 import threading
 import time
 import sys
-import keyring
 
 from tool_subtitle import logic
 from utils import app_config, i18n
@@ -17,6 +16,11 @@ import locale
 
 def get_text(key):
     return i18n.translate('subtitle', key)
+
+
+def _load_keyring():
+    import keyring
+    return keyring
 
 
 class SubtitleToolsApp:
@@ -601,27 +605,14 @@ class SubtitleToolsApp:
         key_frame = ttk.Frame(ai_frame)
         key_frame.pack(fill='x', pady=2)
         ttk.Label(key_frame, text=get_text('lbl_api_key'), width=20).pack(side='left')
-        
-        try:
-            saved_key = (
-                keyring.get_password("VR_Video_Toolbox", "deepseek_api_key")
-                or keyring.get_password("VR_Mosaic_Removal", "deepseek_api_key")
-                or ""
-            )
-        except Exception:
-            saved_key = ""
-            
-        self.api_key_var = tk.StringVar(value=saved_key)
+
+        self.api_key_var = tk.StringVar(value="")
         self.api_key_entry = ttk.Entry(key_frame, textvariable=self.api_key_var, show="*")
         self.api_key_entry.pack(side='left', fill='x', expand=True)
         
         self.btn_test_api = ttk.Button(key_frame, text=get_text('btn_test_api'), command=self.test_trans_api)
         self.btn_del_key = ttk.Button(key_frame, text=get_text('btn_delete_key'), command=self.delete_trans_key)
-        
-        if saved_key:
-            self.btn_del_key.pack(side='left', padx=(10, 0))
-        else:
-            self.btn_test_api.pack(side='left', padx=(10, 0))
+        self.btn_test_api.pack(side='left', padx=(10, 0))
 
         # Max Tokens & Save config button
         token_frame = ttk.Frame(ai_frame)
@@ -695,6 +686,41 @@ class SubtitleToolsApp:
         self.trans_log.pack(fill='both', expand=True)
         
         self.stop_event_trans = threading.Event()
+        self.root.after(0, self.load_saved_trans_key)
+
+    def load_saved_trans_key(self):
+        def task():
+            try:
+                keyring = _load_keyring()
+                saved_key = (
+                    keyring.get_password("VR_Video_Toolbox", "deepseek_api_key")
+                    or keyring.get_password("VR_Mosaic_Removal", "deepseek_api_key")
+                    or ""
+                )
+            except Exception:
+                saved_key = ""
+
+            if not saved_key:
+                return
+
+            def update_ui():
+                try:
+                    if not self.api_key_entry.winfo_exists():
+                        return
+                    if not self.api_key_var.get():
+                        self.api_key_var.set(saved_key)
+                    self.btn_test_api.pack_forget()
+                    if not self.btn_del_key.winfo_ismapped():
+                        self.btn_del_key.pack(side='left', padx=(10, 0))
+                except tk.TclError:
+                    pass
+
+            try:
+                self.root.after(0, update_ui)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=task, daemon=True).start()
 
     def browse_trans_dir(self):
         path = filedialog.askdirectory()
@@ -723,6 +749,7 @@ class SubtitleToolsApp:
             
     def delete_trans_key(self):
         try:
+            keyring = _load_keyring()
             for service_name in ("VR_Video_Toolbox", "VR_Mosaic_Removal"):
                 try:
                     keyring.delete_password(service_name, "deepseek_api_key")
@@ -732,8 +759,6 @@ class SubtitleToolsApp:
             self.btn_del_key.pack_forget()
             self.btn_test_api.pack(side='left', padx=(10, 0))
             messagebox.showinfo("Success", get_text('msg_key_deleted'))
-        except keyring.errors.PasswordDeleteError:
-            pass
         except Exception as e:
             messagebox.showerror("Error", get_text('msg_key_del_warn').format(e))
 
@@ -753,6 +778,7 @@ class SubtitleToolsApp:
                 
                 # Save the key to keyring only after the test succeeds.
                 try:
+                    keyring = _load_keyring()
                     keyring.set_password("VR_Video_Toolbox", "deepseek_api_key", api_key)
                     def update_ui_success():
                         self.btn_test_api.pack_forget()

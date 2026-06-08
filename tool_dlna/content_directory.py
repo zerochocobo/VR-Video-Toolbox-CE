@@ -18,6 +18,7 @@ from tool_dlna.firewall import hidden_subprocess_kwargs
 ROOT_ID = "0"
 FOLDER_PREFIX = "d_"
 VIDEO_PREFIX = "v_"
+VIDEO_SI_PREFIX = "vs_"
 DLNA_FLAGS_BASE = "01700000000000000000000000000000"
 
 _VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".m4v"}
@@ -42,7 +43,7 @@ def _probe_video(path: Path) -> dict:
     cmd = [
         "ffprobe", "-v", "error",
         "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,duration,bit_rate:format=duration,size,bit_rate",
+        "-show_entries", "stream=width,height,duration,bit_rate,size:format=duration,size,bit_rate",
         "-of", "json",
         str(path)
     ]
@@ -61,12 +62,20 @@ def _probe_video(path: Path) -> dict:
             bitrate = int(streams[0].get("bit_rate") or fmt.get("bit_rate") or 0)
             if bitrate <= 0 and duration > 0:
                 bitrate = int(size * 8 / duration)
+            video_size = int(streams[0].get("size") or 0)
+            if video_size <= 0 and duration > 0 and bitrate > 0:
+                video_size = int(bitrate * duration / 8)
+            if video_size <= 0:
+                video_size = size
+            if size > 0:
+                video_size = min(video_size, size)
 
             return {
                 "width": width,
                 "height": height,
                 "duration": duration,
                 "size": size,
+                "video_size": video_size,
                 "bitrate": bitrate
             }
     except Exception:
@@ -75,7 +84,7 @@ def _probe_video(path: Path) -> dict:
         size = path.stat().st_size
     except OSError:
         size = 0
-    return {"width": 0, "height": 0, "duration": 0.0, "size": size, "bitrate": 0}
+    return {"width": 0, "height": 0, "duration": 0.0, "size": size, "video_size": size, "bitrate": 0}
 
 
 def probe_cached(path: Path) -> dict:
@@ -141,7 +150,8 @@ def _didl_for(items: list[dict]) -> str:
         bitrate = it["bitrate"]
         mime = it["mime"]
 
-        proto = f"http-get:*:{mime}:DLNA.ORG_PN={it['dlna_pn']};DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS={DLNA_FLAGS_BASE}"
+        dlna_ci = int(it.get("dlna_ci", 0))
+        proto = f"http-get:*:{mime}:DLNA.ORG_PN={it['dlna_pn']};DLNA.ORG_OP=01;DLNA.ORG_CI={dlna_ci};DLNA.ORG_FLAGS={DLNA_FLAGS_BASE}"
 
         attrs: list[str] = []
         if size > 0:
@@ -194,7 +204,14 @@ def _child_count(path: Path) -> int:
         return 0
 
 
-def _get_items_for_dir(directory: Path, parent_id: str, base_url: str, media_library, subtitles_enabled: bool) -> list[dict]:
+def _get_items_for_dir(
+    directory: Path,
+    parent_id: str,
+    base_url: str,
+    media_library,
+    subtitles_enabled: bool,
+    si_service=None,
+) -> list[dict]:
     items: list[dict] = []
     try:
         children = sorted(directory.iterdir(), key=lambda p: (not p.is_dir(), p.name.casefold()))
@@ -259,6 +276,31 @@ def _get_items_for_dir(directory: Path, parent_id: str, base_url: str, media_lib
                         "subtitles": sub_list,
                     }
                 )
+                try:
+                    si_config = si_service.current_config() if si_service is not None else None
+                    si_source = si_service.has_si_source(child) if si_config is not None and si_config.enabled else None
+                except Exception as e:
+                    log.warning("Cannot inspect SI source for %s: %s", child, e)
+                    si_config = None
+                    si_source = None
+                if si_config is not None and si_config.enabled and si_source is not None:
+                    items.append(
+                        {
+                            "id": f"{VIDEO_SI_PREFIX}{rel_key}",
+                            "parent_id": parent_id,
+                            "title": f"[SI] {title}",
+                            "url": f"{base_url}/media_si/{quoted_key}",
+                            "thumb": f"{base_url}/thumb/{quoted_key}",
+                            "size": si_service.estimate_output_size(child),
+                            "duration": meta["duration"],
+                            "resolution": f"{meta['width']}x{meta['height']}" if meta["width"] > 0 else "",
+                            "bitrate": meta["bitrate"],
+                            "mime": "video/mp4",
+                            "dlna_pn": "AVC_MP4_HP_HD_AAC",
+                            "dlna_ci": 1,
+                            "subtitles": sub_list,
+                        }
+                    )
             else:
                 skipped += 1
         except Exception as e:
@@ -342,7 +384,14 @@ def _parse_soap_args(body: bytes) -> dict:
     return args
 
 
-def handle_soap(soap_action: str, body: bytes, base_url: str, media_library, subtitles_enabled: bool) -> tuple[bytes, int]:
+def handle_soap(
+    soap_action: str,
+    body: bytes,
+    base_url: str,
+    media_library,
+    subtitles_enabled: bool,
+    si_service=None,
+) -> tuple[bytes, int]:
     """Parse SOAP action and compile matching Browse result XML."""
     action = soap_action.strip('"').split("#")[-1]
     args = _parse_soap_args(body)
@@ -377,8 +426,25 @@ def handle_soap(soap_action: str, body: bytes, base_url: str, media_library, sub
 
         # 2. ObjectID mapping to single video item
         video_file = None
+        video_rel = ""
+        is_si_video = False
         if object_id.startswith(VIDEO_PREFIX):
             rel = object_id[len(VIDEO_PREFIX):]
+            video_rel = rel
+            video_file = media_library.key_to_path(rel)
+            if video_file is not None:
+                try:
+                    parent_rel = media_library.path_to_key(video_file.parent)
+                    if not parent_rel or parent_rel == ".":
+                        parent_id = ROOT_ID
+                    else:
+                        parent_id = f"{FOLDER_PREFIX}{parent_rel}"
+                except ValueError:
+                    parent_id = ROOT_ID
+        elif object_id.startswith(VIDEO_SI_PREFIX):
+            rel = object_id[len(VIDEO_SI_PREFIX):]
+            video_rel = rel
+            is_si_video = True
             video_file = media_library.key_to_path(rel)
             if video_file is not None:
                 try:
@@ -392,6 +458,7 @@ def handle_soap(soap_action: str, body: bytes, base_url: str, media_library, sub
 
         # 3. Handle BrowseMetadata
         if flag == "BrowseMetadata":
+            metadata_count = 1
             if video_file is not None and video_file.is_file():
                 # Browse single video details
                 meta = probe_cached(video_file)
@@ -414,18 +481,27 @@ def handle_soap(soap_action: str, body: bytes, base_url: str, media_library, sub
                 item = {
                     "id": object_id,
                     "parent_id": parent_id,
-                    "title": title,
-                    "url": f"{base_url}/media/{quote(rel)}",
-                    "thumb": f"{base_url}/thumb/{quote(rel)}",
-                    "size": meta["size"],
+                    "title": f"[SI] {title}" if is_si_video else title,
+                    "url": f"{base_url}/media_si/{quote(video_rel)}" if is_si_video else f"{base_url}/media/{quote(video_rel)}",
+                    "thumb": f"{base_url}/thumb/{quote(video_rel)}",
+                    "size": si_service.estimate_output_size(video_file) if is_si_video and si_service is not None else meta["size"],
                     "duration": meta["duration"],
                     "resolution": f"{meta['width']}x{meta['height']}" if meta["width"] > 0 else "",
                     "bitrate": meta["bitrate"],
-                    "mime": _get_mime(video_file),
-                    "dlna_pn": _get_dlna_pn(video_file),
+                    "mime": "video/mp4" if is_si_video else _get_mime(video_file),
+                    "dlna_pn": "AVC_MP4_HP_HD_AAC" if is_si_video else _get_dlna_pn(video_file),
+                    "dlna_ci": 1 if is_si_video else 0,
                     "subtitles": sub_list,
                 }
-                didl = _didl_for([item])
+                if is_si_video:
+                    try:
+                        si_config = si_service.current_config() if si_service is not None else None
+                        if si_config is None or not si_config.enabled or si_service.has_si_source(video_file) is None:
+                            item = None
+                    except Exception:
+                        item = None
+                didl = _didl_for([item] if item is not None else [])
+                metadata_count = 1 if item is not None else 0
             else:
                 # Browse directory details
                 target_dir = directory or media_library.first_root.path
@@ -434,8 +510,8 @@ def handle_soap(soap_action: str, body: bytes, base_url: str, media_library, sub
             return _wrap_soap(
                 "Browse",
                 f"<Result>{html.escape(didl)}</Result>"
-                f"<NumberReturned>1</NumberReturned>"
-                f"<TotalMatches>1</TotalMatches>"
+                f"<NumberReturned>{metadata_count}</NumberReturned>"
+                f"<TotalMatches>{metadata_count}</TotalMatches>"
                 f"<UpdateID>1</UpdateID>",
             ), 200
 
@@ -455,7 +531,14 @@ def handle_soap(soap_action: str, body: bytes, base_url: str, media_library, sub
                     }
                 )
         elif directory is not None and directory.is_dir():
-            all_items = _get_items_for_dir(directory, object_id, base_url, media_library, subtitles_enabled)
+            all_items = _get_items_for_dir(
+                directory,
+                object_id,
+                base_url,
+                media_library,
+                subtitles_enabled,
+                si_service=si_service,
+            )
         elif directory is None:
             log.warning("CDS Browse resolved no directory for object_id=%s", object_id)
         else:

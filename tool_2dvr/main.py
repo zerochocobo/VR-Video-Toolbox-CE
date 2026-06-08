@@ -19,6 +19,19 @@ def get_text(key):
     return i18n.translate("two_d_vr", key)
 
 
+def _format_seconds_as_time(seconds):
+    value = max(0.0, round(float(seconds), 3))
+    whole = int(value)
+    frac = value - whole
+    hours, rem = divmod(whole, 3600)
+    minutes, secs = divmod(rem, 60)
+    if frac > 0:
+        sec_text = f"{secs + frac:06.3f}".rstrip("0").rstrip(".")
+    else:
+        sec_text = f"{secs:02d}"
+    return f"{hours:02d}:{minutes:02d}:{sec_text}"
+
+
 class TwoDToVRApp:
     def __init__(self, root, on_return=None):
         self.root = root
@@ -47,8 +60,10 @@ class TwoDToVRApp:
 
         self.input_var = tk.StringVar()
         self.output_var = tk.StringVar()
-        self.start_var = tk.StringVar(value="00:00:30")
-        self.end_var = tk.StringVar(value="00:00:60")
+        self.start_var = tk.StringVar(value="00:00:00")
+        self.duration_var = tk.StringVar(value=get_text("opt_duration_30s"))
+        self.custom_minutes_var = tk.StringVar(value="5")
+        self.until_time_var = tk.StringVar(value="00:00:30")
         self.projection_var = tk.StringVar(value=logic.DEFAULT_PROJECTION)
         self.hole_fill_var = tk.StringVar()
         self.stabilize_var = tk.StringVar()
@@ -66,10 +81,36 @@ class TwoDToVRApp:
         time_frame.grid(row=2, column=1, sticky="w", padx=4, pady=4)
         ttk.Label(form, text=get_text("lbl_time")).grid(row=2, column=0, sticky="w", padx=4, pady=4)
         vcmd = (self.root.register(self.validate_time_input), "%P")
+        number_vcmd = (self.root.register(self.validate_number_input), "%P")
         ttk.Label(time_frame, text=get_text("lbl_start")).pack(side="left")
-        ttk.Entry(time_frame, textvariable=self.start_var, width=12, validate="key", validatecommand=vcmd).pack(side="left", padx=(4, 10))
-        ttk.Label(time_frame, text=get_text("lbl_end")).pack(side="left")
-        ttk.Entry(time_frame, textvariable=self.end_var, width=12, validate="key", validatecommand=vcmd).pack(side="left", padx=(4, 0))
+        ttk.Entry(time_frame, textvariable=self.start_var, width=12, validate="key", validatecommand=vcmd).pack(side="left", padx=(4, 12))
+        ttk.Label(time_frame, text=get_text("lbl_duration")).pack(side="left")
+        self.duration_combo = ttk.Combobox(
+            time_frame,
+            textvariable=self.duration_var,
+            values=list(self._duration_display_map().keys()),
+            state="readonly",
+            width=18,
+        )
+        self.duration_combo.pack(side="left", padx=(4, 0))
+        self.duration_combo.bind("<<ComboboxSelected>>", self._update_time_controls)
+        self.custom_minutes_label = ttk.Label(time_frame, text=get_text("lbl_custom_minutes"))
+        self.custom_minutes_entry = ttk.Entry(
+            time_frame,
+            textvariable=self.custom_minutes_var,
+            width=6,
+            validate="key",
+            validatecommand=number_vcmd,
+        )
+        self.until_time_label = ttk.Label(time_frame, text=get_text("lbl_end_time"))
+        self.until_time_entry = ttk.Entry(
+            time_frame,
+            textvariable=self.until_time_var,
+            width=12,
+            validate="key",
+            validatecommand=vcmd,
+        )
+        self._update_time_controls()
 
         projection_frame = ttk.Frame(form)
         projection_frame.grid(row=3, column=1, sticky="w", padx=4, pady=4)
@@ -203,6 +244,11 @@ class TwoDToVRApp:
             return True
         return all(ch in "0123456789:." for ch in value)
 
+    def validate_number_input(self, value):
+        if value == "":
+            return True
+        return all(ch in "0123456789." for ch in value)
+
     def log(self, message):
         def _do():
             self.log_text.config(state="normal")
@@ -229,12 +275,74 @@ class TwoDToVRApp:
         label = self.stabilize_var.get()
         return self.stabilize_display_to_value.get(label, logic.DEFAULT_STABILIZE_MODE)
 
+    def _duration_display_map(self):
+        return {
+            get_text("opt_duration_15s"): 15.0,
+            get_text("opt_duration_30s"): 30.0,
+            get_text("opt_duration_60s"): 60.0,
+            get_text("opt_duration_custom_minutes"): "custom_minutes",
+            get_text("opt_duration_until_time"): "until_time",
+            get_text("opt_duration_all"): None,
+        }
+
+    def _update_time_controls(self, _event=None):
+        selected = self._duration_display_map().get(self.duration_var.get(), 30.0)
+        if selected == "custom_minutes":
+            self.custom_minutes_label.pack(side="left", padx=(10, 4))
+            self.custom_minutes_entry.pack(side="left")
+        else:
+            self.custom_minutes_label.pack_forget()
+            self.custom_minutes_entry.pack_forget()
+
+        if selected == "until_time":
+            self.until_time_label.pack(side="left", padx=(10, 4))
+            self.until_time_entry.pack(side="left")
+        else:
+            self.until_time_label.pack_forget()
+            self.until_time_entry.pack_forget()
+
+    def _read_time_range(self):
+        start = self.start_var.get().strip() or "00:00:00"
+        try:
+            start_sec = logic.parse_time_to_seconds(start)
+        except ValueError as exc:
+            raise ValueError(get_text("err_time_range")) from exc
+        if start_sec is None:
+            start_sec = 0.0
+            start = "00:00:00"
+
+        selected = self._duration_display_map().get(self.duration_var.get(), 30.0)
+        if selected == "custom_minutes":
+            try:
+                minutes = float((self.custom_minutes_var.get() or "").strip())
+            except ValueError as exc:
+                raise ValueError(get_text("err_time_range")) from exc
+            if minutes <= 0:
+                raise ValueError(get_text("err_time_range"))
+            return start, _format_seconds_as_time(start_sec + minutes * 60.0)
+
+        if selected == "until_time":
+            end = self.until_time_var.get().strip()
+            try:
+                end_sec = logic.parse_time_to_seconds(end)
+            except ValueError as exc:
+                raise ValueError(get_text("err_time_range")) from exc
+            if end_sec is None or end_sec <= start_sec:
+                raise ValueError(get_text("err_time_order"))
+            return start, end
+
+        if selected is None:
+            if start_sec <= 0:
+                return "", ""
+            return start, ""
+
+        return start, _format_seconds_as_time(start_sec + float(selected))
+
     def _validate_form(self):
         input_path = self.input_var.get().strip()
         if not input_path or not os.path.exists(input_path):
             raise ValueError(get_text("err_input"))
-        start = self.start_var.get().strip()
-        end = self.end_var.get().strip()
+        start, end = self._read_time_range()
         start_sec = logic.parse_time_to_seconds(start)
         end_sec = logic.parse_time_to_seconds(end)
         if start_sec is not None and end_sec is not None and start_sec >= end_sec:

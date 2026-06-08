@@ -27,6 +27,11 @@ _DEFAULTS = {
     'dlna_port': 8090,
     'dlna_video_dirs': '',
     'dlna_auto_subtitles': True,
+    'dlna_si_enabled': False,
+    'dlna_si_mix_channel': 'left',
+    'dlna_si_original_volume_percent': 100,
+    'dlna_si_volume_percent': 50,
+    'dlna_si_delay_seconds': 1.0,
     # GPU pipeline from the gpu_engine refactor.
     'transcode_backend': 'auto',  # auto | gpu | ffmpeg
     'mosaic_engine': 'lada',      # lada | jasna | native_gpu placeholder, not implemented.
@@ -91,13 +96,25 @@ _DEFAULTS = {
 }
 
 _CODE_DEFAULT_ONLY_PREFIXES = ('pre_extract', 'source_scan')
+_CODE_DEFAULT_ONLY_KEYS = {
+    'gpu_log_verbose',
+    'gpu_bitrate_multiplier',
+    'gpu_bitrate_final_multiplier',
+    'progress_log_interval_s',
+    'progress_log_min_pct',
+    'output_mp4_faststart',
+    'paste_passthrough_enabled',
+    'paste_passthrough_min_frames',
+    'paste_passthrough_max_subseg',
+}
 
 # --- In-memory cache to avoid frequent IO ---
 _cache: dict = {}
 
 
 def _is_code_default_only_key(key: object) -> bool:
-    return str(key).startswith(_CODE_DEFAULT_ONLY_PREFIXES)
+    key_text = str(key)
+    return key_text in _CODE_DEFAULT_ONLY_KEYS or key_text.startswith(_CODE_DEFAULT_ONLY_PREFIXES)
 
 
 def _strip_code_default_only(data: dict) -> dict:

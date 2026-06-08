@@ -20,7 +20,7 @@ _parent_dir = os.path.dirname(_app_dir)
 if _parent_dir not in sys.path:
     sys.path.insert(0, _parent_dir)
 
-from tool_dlna import dlna_server, firewall, media_library
+from tool_dlna import dlna_server, firewall, media_library, si_stream
 
 
 def get_runtime_base_dir() -> Path:
@@ -54,6 +54,11 @@ def main() -> int:
         "dlna_port": 8090,
         "dlna_video_dirs": "",
         "dlna_auto_subtitles": True,
+        "dlna_si_enabled": False,
+        "dlna_si_mix_channel": "left",
+        "dlna_si_original_volume_percent": 100,
+        "dlna_si_volume_percent": 50,
+        "dlna_si_delay_seconds": 1.0,
     }
 
     # 3. Read persists config
@@ -93,6 +98,9 @@ def main() -> int:
     logger.info("UUID        : %s", device_uuid)
     logger.info("Python exe  : %s", sys.executable)
     logger.info("DLNA module : %s", getattr(dlna_server, "__file__", "unknown"))
+    si_config = si_stream.SIMixConfig.from_mapping(config)
+    si_config_holder = si_stream.ConfigHolder(si_config)
+    logger.info("DLNA SI auto entry enabled: %s", si_config.enabled)
 
     # 5. Firewall permissions
     firewall_ok = firewall.ensure_rules(port)
@@ -117,6 +125,7 @@ def main() -> int:
         device_uuid=device_uuid,
         lan_ip=lan_ip,
         cache_dir=cache_dir,
+        si_config_holder=si_config_holder,
     )
 
     import uvicorn

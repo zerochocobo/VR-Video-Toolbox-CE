@@ -26,10 +26,11 @@ def check_dependencies():
     missing = []
     tools = ["ffmpeg", "ffprobe"]
     if engine_runner.is_native_engine():
-        # The built-in engine has no CLI dependency; check torch.cuda and model files.
+        # Opening the page should not import CuPy or warm up the GPU stack.
+        # Full runtime availability is checked when a native_gpu task actually starts.
         try:
             from gpu_engine import native_mosaic
-            reason = native_mosaic.unavailable_reason()
+            reason = native_mosaic.unavailable_reason(runtime_check=False)
             if reason:
                 missing.append(f"内置引擎: {reason}")
         except Exception as e:

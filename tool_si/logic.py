@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import math
 import os
 import re
@@ -69,11 +70,20 @@ ALL_SPEAKERS = (
     "Sohee",
 )
 
+SPEAKER_NOTE_KEYS = {
+    speaker: f"speaker_note_{speaker.lower()}"
+    for speaker in ALL_SPEAKERS
+}
+
 LANGUAGE_NATIVE_SPEAKERS = {
     "Chinese": ("Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric"),
     "English": ("Ryan", "Aiden"),
     "Japanese": ("Ono_Anna",),
     "Korean": ("Sohee",),
+}
+
+DEFAULT_LANGUAGE_SPEAKERS = {
+    "Chinese": "Serena",
 }
 
 UI_LANGUAGE_TO_TTS = {
@@ -83,6 +93,15 @@ UI_LANGUAGE_TO_TTS = {
 }
 
 LogCallback = Callable[[str], None]
+SI_MIX_CHANNELS = ("left", "right")
+ORIGINAL_VOLUME_CHOICES = (70, 80, 90, 100)
+SI_VOLUME_CHOICES = (50, 60, 70, 80, 90, 100)
+SI_DELAY_SECONDS_CHOICES = (0.0, 0.3, 0.5, 0.7, 1.0, 1.2, 1.5, 2.0)
+DEFAULT_ORIGINAL_VOLUME_PERCENT = 100
+DEFAULT_SI_VOLUME_PERCENT = 50
+DEFAULT_SI_DELAY_SECONDS = 1.0
+MAX_SUBTITLE_ENTRY_DURATION = 300.0
+MAX_SUBTITLE_TIMECODE_SECONDS = 6 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -95,6 +114,13 @@ class SubtitleEntry:
     @property
     def duration(self) -> float:
         return max(0.0, self.end - self.start)
+
+
+@dataclass(frozen=True)
+class SITrackMixTask:
+    video_path: Path
+    si_audio_path: Path
+    output_path: Path
 
 
 def get_model_dir(models_root: str | os.PathLike[str]) -> str:
@@ -111,7 +137,14 @@ def speakers_for_language(language: str) -> tuple[str, ...]:
 
 def default_speaker_for_language(language: str) -> str:
     speakers = speakers_for_language(language)
+    preferred = DEFAULT_LANGUAGE_SPEAKERS.get(language)
+    if preferred in speakers:
+        return preferred
     return speakers[0] if speakers else ALL_SPEAKERS[0]
+
+
+def speaker_note_key(speaker: str) -> str:
+    return SPEAKER_NOTE_KEYS.get(speaker, "")
 
 
 def check_model_files(models_root: str | os.PathLike[str]) -> bool:
@@ -150,14 +183,6 @@ def download_model(models_root: str | os.PathLike[str], log_callback: LogCallbac
         snapshot_download(repo_id=MODEL_REPO_ID, local_dir=model_dir)
         log_callback("Model download finished.")
         return check_model_files(models_root)
-    except TypeError:
-        try:
-            snapshot_download(repo_id=MODEL_REPO_ID, local_dir=model_dir)
-            log_callback("Model download finished.")
-            return check_model_files(models_root)
-        except Exception as exc:
-            log_callback(f"Download failed: {exc}")
-            return False
     except Exception as exc:
         log_callback(f"Download failed: {exc}")
         return False
@@ -191,6 +216,8 @@ _HAN_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
 def _parse_timecode(value: str) -> float:
     time_part, ms_part = value.replace(",", ".").split(".", 1)
     hours, minutes, seconds = (int(part) for part in time_part.split(":"))
+    if minutes >= 60 or seconds >= 60:
+        raise ValueError(f"Invalid subtitle timecode: {value}")
     milliseconds = int(ms_part.ljust(3, "0")[:3])
     return hours * 3600 + minutes * 60 + seconds + milliseconds / 1000.0
 
@@ -234,11 +261,18 @@ def _select_subtitle_text_line(text_lines: list[str], language: str | None = Non
     return cleaned_lines[0]
 
 
-def parse_srt(path: str | os.PathLike[str], language: str | None = None) -> list[SubtitleEntry]:
+def parse_srt(
+    path: str | os.PathLike[str],
+    language: str | None = None,
+    log_callback: LogCallback | None = None,
+) -> list[SubtitleEntry]:
     text = _read_text_with_fallback(path)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     blocks = re.split(r"\n\s*\n+", text.strip())
     entries: list[SubtitleEntry] = []
+    skipped_invalid_timecode = 0
+    skipped_too_long = 0
+    skipped_beyond_max = 0
 
     for block_index, block in enumerate(blocks, 1):
         lines = [line.strip("\ufeff") for line in block.split("\n") if line.strip()]
@@ -250,9 +284,20 @@ def parse_srt(path: str | os.PathLike[str], language: str | None = None) -> list
         match = _TIMECODE_RE.search(lines[time_line_index])
         if not match:
             continue
-        start = _parse_timecode(match.group("start"))
-        end = _parse_timecode(match.group("end"))
+        try:
+            start = _parse_timecode(match.group("start"))
+            end = _parse_timecode(match.group("end"))
+        except ValueError:
+            skipped_invalid_timecode += 1
+            continue
         if end <= start:
+            skipped_invalid_timecode += 1
+            continue
+        if end > MAX_SUBTITLE_TIMECODE_SECONDS:
+            skipped_beyond_max += 1
+            continue
+        if (end - start) > MAX_SUBTITLE_ENTRY_DURATION:
+            skipped_too_long += 1
             continue
 
         text_lines = lines[time_line_index + 1 :]
@@ -261,7 +306,67 @@ def parse_srt(path: str | os.PathLike[str], language: str | None = None) -> list
             continue
         entries.append(SubtitleEntry(index=block_index, start=start, end=end, text=selected_line))
 
+    if log_callback is not None:
+        if skipped_invalid_timecode:
+            log_callback(f"Skipped {skipped_invalid_timecode} subtitle entries with invalid timecodes.")
+        if skipped_too_long:
+            log_callback(
+                f"Skipped {skipped_too_long} subtitle entries longer than "
+                f"{MAX_SUBTITLE_ENTRY_DURATION:g}s (single-entry duration cap)."
+            )
+        if skipped_beyond_max:
+            log_callback(
+                f"Skipped {skipped_beyond_max} subtitle entries past "
+                f"{MAX_SUBTITLE_TIMECODE_SECONDS / 3600:g}h (timecode cap)."
+            )
+
     return entries
+
+
+def _coerce_non_negative_seconds(value: int | float, name: str) -> float:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a non-negative number of seconds.") from exc
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError(f"{name} must be a non-negative number of seconds.")
+    return seconds
+
+
+def _entries_for_time_window(
+    entries: list[SubtitleEntry],
+    start_seconds: int | float = 0.0,
+    duration_seconds: int | float | None = None,
+) -> tuple[list[SubtitleEntry], float | None, bool]:
+    start = _coerce_non_negative_seconds(start_seconds, "start_seconds")
+    if duration_seconds is None:
+        duration = None
+        end = None
+    else:
+        duration = _coerce_non_negative_seconds(duration_seconds, "duration_seconds")
+        if duration <= 0:
+            raise ValueError("duration_seconds must be positive or None.")
+        end = start + duration
+
+    time_limited = start > 0 or duration is not None
+    if not time_limited:
+        return list(entries), None, False
+
+    selected: list[SubtitleEntry] = []
+    for entry in entries:
+        clipped_start = max(entry.start, start)
+        clipped_end = entry.end if end is None else min(entry.end, end)
+        if clipped_end <= clipped_start:
+            continue
+        selected.append(
+            SubtitleEntry(
+                index=entry.index,
+                start=max(0.0, clipped_start - start),
+                end=max(0.0, clipped_end - start),
+                text=entry.text,
+            )
+        )
+    return selected, duration, True
 
 
 def default_output_path(srt_path: str | os.PathLike[str]) -> str:
@@ -269,11 +374,420 @@ def default_output_path(srt_path: str | os.PathLike[str]) -> str:
     return str(path.with_name(f"{path.stem}.si.wav"))
 
 
-def collect_paired_srt_tasks(base_dir: str | os.PathLike[str]) -> list[Path]:
+def default_si_audio_path(video_path: str | os.PathLike[str]) -> str:
+    path = Path(video_path)
+    return str(path.with_suffix(".si.wav"))
+
+
+def default_si_mix_output_path(video_path: str | os.PathLike[str]) -> str:
+    path = Path(video_path)
+    return str(path.with_name(f"{path.stem}_SI.mp4"))
+
+
+def collect_paired_si_mix_tasks(base_dir: str | os.PathLike[str], recursive: bool = True) -> list[SITrackMixTask]:
+    root_path = Path(base_dir)
+    seen: set[Path] = set()
+    tasks: list[SITrackMixTask] = []
+    candidates = root_path.rglob("*") if recursive else root_path.iterdir()
+    for video in candidates:
+        if not video.is_file() or video.suffix.lower() not in {".mp4", ".mkv"}:
+            continue
+        resolved = video.resolve()
+        if resolved in seen:
+            continue
+        si_audio = Path(default_si_audio_path(video))
+        if not si_audio.is_file():
+            continue
+        seen.add(resolved)
+        tasks.append(
+            SITrackMixTask(
+                video_path=video,
+                si_audio_path=si_audio,
+                output_path=Path(default_si_mix_output_path(video)),
+            )
+        )
+    return sorted(tasks, key=lambda task: str(task.video_path).lower())
+
+
+def _validate_si_mix_channel(channel: str) -> str:
+    normalized = (channel or "").strip().lower()
+    if normalized not in SI_MIX_CHANNELS:
+        raise ValueError(f"Unsupported SI mix channel: {channel}")
+    return normalized
+
+
+def _validate_original_volume(percent: int | float) -> int:
+    try:
+        value = int(percent)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid volume percent: {percent}") from exc
+    if value not in ORIGINAL_VOLUME_CHOICES:
+        raise ValueError("Original volume percent must be one of 70, 80, 90, 100.")
+    return value
+
+
+def _validate_si_volume(percent: int | float) -> int:
+    try:
+        value = int(percent)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid SI volume percent: {percent}") from exc
+    if value not in SI_VOLUME_CHOICES:
+        raise ValueError("SI volume percent must be one of 50, 60, 70, 80, 90, 100.")
+    return value
+
+
+def _validate_si_delay_seconds(seconds: int | float) -> float:
+    try:
+        value = round(float(seconds), 1)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid SI delay seconds: {seconds}") from exc
+    if value not in SI_DELAY_SECONDS_CHOICES:
+        raise ValueError("SI delay must be one of 0, 0.3, 0.5, 0.7, 1, 1.2, 1.5, 2 seconds.")
+    return value
+
+
+def _filter_number(value: int | float) -> str:
+    return f"{float(value):.6f}".rstrip("0").rstrip(".")
+
+
+def build_si_mix_filter(
+    mix_channel: str,
+    original_volume_percent: int | float,
+    si_volume_percent: int | float,
+    si_delay_seconds: int | float = DEFAULT_SI_DELAY_SECONDS,
+) -> str:
+    channel = _validate_si_mix_channel(mix_channel)
+    original_volume = _filter_number(_validate_original_volume(original_volume_percent) / 100.0)
+    si_volume = _filter_number(_validate_si_volume(si_volume_percent) / 100.0)
+    si_delay_ms = int(round(_validate_si_delay_seconds(si_delay_seconds) * 1000))
+
+    if channel == "left":
+        mix_part = (
+            "[ol][si]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[left_mix_raw];"
+            "[left_mix_raw][or]join=inputs=2:channel_layout=stereo,"
+            "alimiter=limit=0.95[si_track]"
+        )
+    else:
+        mix_part = (
+            "[or][si]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[right_mix_raw];"
+            "[ol][right_mix_raw]join=inputs=2:channel_layout=stereo,"
+            "alimiter=limit=0.95[si_track]"
+        )
+
+    return (
+        f"[0:a:0]aresample=48000,aformat=channel_layouts=stereo,volume={original_volume}[orig];"
+        f"[1:a:0]aresample=48000,aformat=channel_layouts=mono,adelay={si_delay_ms},volume={si_volume}[si];"
+        "[orig]channelsplit=channel_layout=stereo[ol][or];"
+        f"{mix_part}"
+    )
+
+
+def probe_audio_stream_count(video_path: str | os.PathLike[str], log_callback: LogCallback | None = None) -> int | None:
+    if not shutil.which("ffprobe"):
+        if log_callback:
+            log_callback("ffprobe not found; audio stream count is unavailable.")
+        return None
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "a",
+        "-show_entries",
+        "stream=index",
+        "-of",
+        "json",
+        str(video_path),
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            startupinfo=_build_startupinfo(),
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        if log_callback:
+            log_callback("ffprobe audio stream probe timed out after 15 seconds.")
+        return None
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"ffprobe audio stream probe failed: {exc}")
+        return None
+    if result.returncode != 0:
+        if log_callback:
+            message = (result.stderr or result.stdout or "").strip()
+            log_callback(f"ffprobe audio stream probe failed: {message}")
+        return None
+    try:
+        data = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    streams = data.get("streams", [])
+    if not isinstance(streams, list):
+        return None
+    return len(streams)
+
+
+def build_si_audio_mix_command(
+    video_path: str | os.PathLike[str],
+    si_audio_path: str | os.PathLike[str],
+    output_path: str | os.PathLike[str],
+    mix_channel: str,
+    original_volume_percent: int | float,
+    si_volume_percent: int | float,
+    si_delay_seconds: int | float = DEFAULT_SI_DELAY_SECONDS,
+    audio_stream_count: int | None = 1,
+    add_independent_track: bool = False,
+) -> list[str]:
+    if audio_stream_count is not None and audio_stream_count < 1:
+        raise ValueError("Input video must contain at least one audio stream.")
+
+    filter_arg = build_si_mix_filter(mix_channel, original_volume_percent, si_volume_percent, si_delay_seconds)
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-stats",
+        "-y",
+        "-i",
+        str(video_path),
+        "-i",
+        str(si_audio_path),
+        "-filter_complex",
+        filter_arg,
+        "-map",
+        "0:v?",
+    ]
+    if add_independent_track:
+        si_audio_index = audio_stream_count if audio_stream_count is not None else 1
+        cmd.extend(["-map", "0:a?" if audio_stream_count is not None else "0:a:0", "-map", "[si_track]"])
+    else:
+        si_audio_index = 0
+        cmd.extend(["-map", "[si_track]"])
+        if audio_stream_count is not None:
+            for audio_index in range(1, audio_stream_count):
+                cmd.extend(["-map", f"0:a:{audio_index}?"])
+        else:
+            cmd.extend(["-map", "0:a?", "-map", "-0:a:0"])
+
+    cmd.extend(
+        [
+            "-map",
+            "0:s?",
+            "-map_metadata",
+            "0",
+            "-map_chapters",
+            "0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "copy",
+            f"-c:a:{si_audio_index}",
+            "aac",
+            f"-b:a:{si_audio_index}",
+            "192k",
+            f"-ar:a:{si_audio_index}",
+            "48000",
+            f"-ac:a:{si_audio_index}",
+            "2",
+            "-c:s",
+            "copy",
+            f"-metadata:s:a:{si_audio_index}",
+            "title=SI",
+            f"-metadata:s:a:{si_audio_index}",
+            "handler_name=SI",
+            "-disposition:a:0",
+            "default",
+        ]
+    )
+    if add_independent_track:
+        cmd.extend([f"-disposition:a:{si_audio_index}", "0"])
+    cmd.extend(["-movflags", "+faststart", str(output_path)])
+    return cmd
+
+
+def _format_command_for_log(cmd: list[str]) -> str:
+    if sys.platform == "win32":
+        return subprocess.list2cmdline(cmd)
+    return " ".join(cmd)
+
+
+def _terminate_process(process: subprocess.Popen, timeout: float = 2.0) -> None:
+    try:
+        if process.poll() is not None:
+            return
+    except Exception:
+        return
+    try:
+        process.terminate()
+        process.wait(timeout=timeout)
+        return
+    except Exception:
+        pass
+    if sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True,
+                timeout=5,
+                startupinfo=_build_startupinfo(),
+            )
+            process.wait(timeout=timeout)
+            return
+        except Exception:
+            pass
+    try:
+        process.kill()
+        process.wait(timeout=timeout)
+    except Exception:
+        pass
+
+
+def mix_si_audio_track(
+    video_path: str | os.PathLike[str],
+    si_audio_path: str | os.PathLike[str],
+    output_path: str | os.PathLike[str] | None = None,
+    mix_channel: str = "left",
+    original_volume_percent: int | float = DEFAULT_ORIGINAL_VOLUME_PERCENT,
+    si_volume_percent: int | float = DEFAULT_SI_VOLUME_PERCENT,
+    si_delay_seconds: int | float = DEFAULT_SI_DELAY_SECONDS,
+    add_independent_track: bool = False,
+    log_callback: LogCallback = print,
+    stop_event: Event | None = None,
+    process_callback: Callable[[subprocess.Popen | None], None] | None = None,
+) -> str:
+    if not shutil.which("ffmpeg"):
+        raise FileNotFoundError("ffmpeg not found.")
+
+    video = Path(video_path)
+    si_audio = Path(si_audio_path)
+    output = Path(output_path or default_si_mix_output_path(video))
+    if not video.is_file():
+        raise FileNotFoundError(f"Video file not found: {video}")
+    if not si_audio.is_file():
+        raise FileNotFoundError(f"SI audio file not found: {si_audio}")
+    if video.resolve() == output.resolve():
+        raise ValueError("Output file must be different from the input video.")
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    audio_stream_count = probe_audio_stream_count(video, log_callback)
+    if audio_stream_count is None:
+        if add_independent_track:
+            log_callback("Warning: audio stream count unavailable; preserving the first original audio track before SI.")
+        else:
+            log_callback(
+                "Warning: audio stream count unavailable; copying original audio streams except the first after "
+                "the mixed SI track."
+            )
+    cmd = build_si_audio_mix_command(
+        video_path=video,
+        si_audio_path=si_audio,
+        output_path=output,
+        mix_channel=mix_channel,
+        original_volume_percent=original_volume_percent,
+        si_volume_percent=si_volume_percent,
+        si_delay_seconds=si_delay_seconds,
+        audio_stream_count=audio_stream_count,
+        add_independent_track=add_independent_track,
+    )
+    log_callback(f"Executing: {_format_command_for_log(cmd)}")
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        universal_newlines=True,
+        errors="replace",
+        startupinfo=_build_startupinfo(),
+    )
+    if process_callback:
+        process_callback(process)
+    try:
+        if process.stdout:
+            try:
+                for line in process.stdout:
+                    text = line.strip()
+                    if text:
+                        log_callback(text)
+                    if stop_event and stop_event.is_set():
+                        _terminate_process(process)
+                        break
+            except OSError:
+                if not (stop_event and stop_event.is_set()):
+                    raise
+        process.wait()
+    finally:
+        if process_callback:
+            process_callback(None)
+        try:
+            if process.stdout:
+                process.stdout.close()
+        except Exception:
+            pass
+
+    if stop_event and stop_event.is_set():
+        raise RuntimeError("Stopped by user.")
+    if process.returncode != 0:
+        err_msg = f"FFmpeg SI audio mix failed with code {process.returncode}"
+        try:
+            from utils import ffmpeg_checker
+
+            ffmpeg_checker.handle_ffmpeg_error(cmd, err_msg, log_callback)
+        except Exception:
+            pass
+        raise RuntimeError(err_msg)
+    log_callback(f"Saved mixed video: {output}")
+    return str(output)
+
+
+def batch_mix_si_audio_tracks(
+    base_dir: str | os.PathLike[str],
+    mix_channel: str = "left",
+    original_volume_percent: int | float = DEFAULT_ORIGINAL_VOLUME_PERCENT,
+    si_volume_percent: int | float = DEFAULT_SI_VOLUME_PERCENT,
+    si_delay_seconds: int | float = DEFAULT_SI_DELAY_SECONDS,
+    add_independent_track: bool = False,
+    log_callback: LogCallback = print,
+    stop_event: Event | None = None,
+    recursive: bool = True,
+    process_callback: Callable[[subprocess.Popen | None], None] | None = None,
+) -> list[str]:
+    tasks = collect_paired_si_mix_tasks(base_dir, recursive=recursive)
+    if not tasks:
+        raise ValueError("No paired MP4/MKV + .si.wav files found.")
+
+    outputs: list[str] = []
+    for index, task in enumerate(tasks, 1):
+        if stop_event and stop_event.is_set():
+            raise RuntimeError("Stopped by user.")
+        log_callback(f"=== [{index}/{len(tasks)}] {task.video_path} ===")
+        output = mix_si_audio_track(
+            video_path=task.video_path,
+            si_audio_path=task.si_audio_path,
+            output_path=task.output_path,
+            mix_channel=mix_channel,
+            original_volume_percent=original_volume_percent,
+            si_volume_percent=si_volume_percent,
+            si_delay_seconds=si_delay_seconds,
+            add_independent_track=add_independent_track,
+            log_callback=log_callback,
+            stop_event=stop_event,
+            process_callback=process_callback,
+        )
+        outputs.append(output)
+    return outputs
+
+
+def collect_paired_srt_tasks(base_dir: str | os.PathLike[str], recursive: bool = True) -> list[Path]:
     root_path = Path(base_dir)
     seen: set[Path] = set()
     tasks: list[Path] = []
-    for video in root_path.rglob("*"):
+    candidates = root_path.rglob("*") if recursive else root_path.iterdir()
+    for video in candidates:
         if not video.is_file() or video.suffix.lower() not in {".mp4", ".mkv"}:
             continue
         srt_path = video.with_suffix(".srt")
@@ -354,10 +868,13 @@ def _atempo_chain(factor: float) -> str:
     return ",".join(f"atempo={part:.6f}" for part in parts)
 
 
-def _speed_up_with_ffmpeg(audio: np.ndarray, sample_rate: int, factor: float) -> np.ndarray:
+def _speed_up_with_ffmpeg(audio: np.ndarray, sample_rate: int, factor: float, target_samples: int | None = None) -> np.ndarray:
     if not shutil.which("ffmpeg"):
-        return audio
-    with tempfile.TemporaryDirectory(prefix="si_tts_") as tmp_dir:
+        return _speed_up_fast_resample(audio, target_samples) if target_samples else audio
+    # Windows: if the timeout fires, ffmpeg's killed handle may briefly hold the
+    # temp wav files. ignore_cleanup_errors avoids a PermissionError leaking out
+    # of TemporaryDirectory.__exit__ (Python 3.10+).
+    with tempfile.TemporaryDirectory(prefix="si_tts_", ignore_cleanup_errors=True) as tmp_dir:
         src = Path(tmp_dir) / "src.wav"
         dst = Path(tmp_dir) / "dst.wav"
         write_wav_mono(src, audio, sample_rate)
@@ -379,17 +896,21 @@ def _speed_up_with_ffmpeg(audio: np.ndarray, sample_rate: int, factor: float) ->
             "pcm_s16le",
             str(dst),
         ]
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            startupinfo=_build_startupinfo(),
-        )
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                startupinfo=_build_startupinfo(),
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            return _speed_up_fast_resample(audio, target_samples) if target_samples else audio
         if result.returncode != 0 or not dst.exists():
-            return audio
+            return _speed_up_fast_resample(audio, target_samples) if target_samples else audio
         converted, converted_rate = read_wav_mono(dst)
         if converted_rate != sample_rate:
-            return audio
+            return _speed_up_fast_resample(audio, target_samples) if target_samples else audio
         return converted
 
 
@@ -437,7 +958,7 @@ def fit_audio_to_duration(audio: np.ndarray, sample_rate: int, target_duration: 
         # stretches where the pitch artefact would actually be audible.
         if factor > 1.15:
             if _time_fit_mode() == "ffmpeg":
-                mono = _speed_up_with_ffmpeg(mono, sample_rate, factor)
+                mono = _speed_up_with_ffmpeg(mono, sample_rate, factor, target_samples)
             else:
                 mono = _speed_up_in_memory(mono, target_samples, factor)
         elif factor > 1.0:
@@ -448,6 +969,26 @@ def fit_audio_to_duration(audio: np.ndarray, sample_rate: int, target_duration: 
     elif mono.size < target_samples:
         mono = np.pad(mono, (0, target_samples - mono.size))
     return np.clip(mono, -1.0, 1.0).astype(np.float32, copy=False)
+
+
+def _mix_timeline_segment(timeline: np.ndarray, start_sample: int, segment: np.ndarray) -> None:
+    if start_sample >= timeline.size:
+        return
+    end_sample = min(timeline.size, start_sample + segment.size)
+    if end_sample <= start_sample:
+        return
+    segment = segment[: end_sample - start_sample]
+    existing = timeline[start_sample:end_sample]
+    # If any sample in this range already has audio from a previous entry, the
+    # two subtitles overlap. Halve the whole new segment AND the existing audio
+    # in the overlap window uniformly so volume stays flat across the boundary,
+    # instead of per-sample halving which would step-jump at the overlap edge.
+    overlapping = np.any((np.abs(existing) > 1e-6) & (np.abs(segment) > 1e-6))
+    if overlapping:
+        mixed = existing * 0.5 + segment * 0.5
+    else:
+        mixed = existing + segment
+    timeline[start_sample:end_sample] = np.clip(mixed, -1.0, 1.0)
 
 
 def _load_tts_model(model_dir: str, log_callback: LogCallback):
@@ -697,6 +1238,8 @@ def subtitle_to_audio(
     stop_event: Event | None = None,
     tts_model=None,
     max_entries: int | None = None,
+    start_seconds: int | float = 0.0,
+    duration_seconds: int | float | None = None,
 ) -> str:
     if language not in SUPPORTED_LANGUAGES:
         raise ValueError(f"Unsupported language: {language}")
@@ -709,14 +1252,21 @@ def subtitle_to_audio(
     if not srt_path.is_file():
         raise FileNotFoundError(f"SRT file not found: {srt_path}")
     output_path = Path(output_path or default_output_path(srt_path))
-    all_entries = parse_srt(srt_path, language=language)
+    all_entries = parse_srt(srt_path, language=language, log_callback=log_callback)
+    window_entries, fixed_duration, time_limited = _entries_for_time_window(
+        all_entries,
+        start_seconds=start_seconds,
+        duration_seconds=duration_seconds,
+    )
     if max_entries is not None:
         if max_entries <= 0:
             raise ValueError("max_entries must be positive or None.")
-        entries = all_entries[:max_entries]
+        entries = window_entries[:max_entries]
     else:
-        entries = all_entries
+        entries = window_entries
     if not entries:
+        if all_entries and time_limited:
+            raise ValueError("No subtitle entries found in the selected time range.")
         raise ValueError("No valid subtitle entries found.")
     model_dir = get_model_dir(models_root)
     if not check_model_files(models_root):
@@ -727,10 +1277,25 @@ def subtitle_to_audio(
 
     timeline: np.ndarray | None = None
     sample_rate = 24000
-    total_duration = max(entry.end for entry in entries)
+    total_duration = fixed_duration if fixed_duration is not None else max(entry.end for entry in entries)
     batch_size = resolve_tts_batch_size()
     batches = _iter_tts_batches(entries, batch_size, preserve_order=max_entries is not None)
-    if max_entries is not None and len(all_entries) > len(entries):
+    if time_limited:
+        start = _coerce_non_negative_seconds(start_seconds, "start_seconds")
+        if duration_seconds is None:
+            range_desc = f"from {start:.3f}s"
+        else:
+            duration = _coerce_non_negative_seconds(duration_seconds, "duration_seconds")
+            range_desc = f"{start:.3f}-{start + duration:.3f}s"
+        limit_desc = ""
+        if max_entries is not None and len(window_entries) > len(entries):
+            limit_desc = f" Converting first {len(entries)} selected entries for test."
+        log_callback(
+            f"Parsed {len(all_entries)} subtitle entries; selected {len(window_entries)} in {range_desc}."
+            f"{limit_desc} Output duration: {total_duration:.3f}s. "
+            f"TTS batch size: {batch_size} ({len(batches)} batches)."
+        )
+    elif max_entries is not None and len(all_entries) > len(entries):
         log_callback(
             f"Parsed {len(all_entries)} subtitle entries; converting first {len(entries)} for test. "
             f"Output duration: {total_duration:.3f}s. TTS batch size: {batch_size} ({len(batches)} batches)."
@@ -770,12 +1335,7 @@ def subtitle_to_audio(
                 timeline = np.zeros(total_samples, dtype=np.float32)
 
             start_sample = max(0, int(round(entry.start * sample_rate)))
-            end_sample = min(timeline.size, start_sample + segment.size)
-            if end_sample <= start_sample:
-                continue
-            segment = segment[: end_sample - start_sample]
-            mixed = timeline[start_sample:end_sample] + segment
-            timeline[start_sample:end_sample] = np.clip(mixed, -1.0, 1.0)
+            _mix_timeline_segment(timeline, start_sample, segment)
 
     if timeline is None:
         timeline = np.zeros(1, dtype=np.float32)
@@ -791,8 +1351,9 @@ def batch_subtitle_to_audio(
     models_root: str | os.PathLike[str],
     log_callback: LogCallback = print,
     stop_event: Event | None = None,
+    recursive: bool = True,
 ) -> list[str]:
-    tasks = collect_paired_srt_tasks(base_dir)
+    tasks = collect_paired_srt_tasks(base_dir, recursive=recursive)
     if not tasks:
         raise ValueError("No paired SRT files found.")
     if not check_model_files(models_root):

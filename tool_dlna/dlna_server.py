@@ -5,6 +5,7 @@ Defines HTTP routes for devices, SOAP commands, Range-supported streams, and ffm
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import logging
 import os
 import random
@@ -14,14 +15,15 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from urllib.parse import quote, unquote
 
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
-from tool_dlna import connection_manager, content_directory, descriptions, subtitles
+from tool_dlna import connection_manager, content_directory, descriptions, si_stream, subtitles
 from tool_dlna.firewall import hidden_subprocess_kwargs
 
 MCAST_GRP = "239.255.255.250"
@@ -83,6 +85,53 @@ def normalize_absolute_form_path(scope: dict) -> tuple[str, str]:
     except Exception:
         pass
     return original, normalized
+
+
+def is_loopback_host(host: str | None) -> bool:
+    value = (host or "").strip().strip("[]")
+    if value.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
+TAIL_PROBE_DEAD_ZONE_BYTES = 5 * 1024 * 1024
+MID_PROBE_MAX_SIZE_BYTES = 2 * 1024 * 1024
+
+
+def classify_moov_probe(range_start: int, range_end: int | None, total: int) -> str:
+    """Identify DLNA player moov-atom probes on virtual SI streams.
+
+    Many MP4 players probe a fragmented MP4 stream for a trailing moov atom by
+    requesting a slice very close to the end of the file (typically the last
+    ~100KB-1MB). Some clients also probe inside the file body. Both probes are
+    open-ended (``bytes=N-``) on most clients, so a closed Range is NOT a
+    reliable signal.
+
+    Tail probe (open OR closed Range): ``total - range_start`` is in the last
+    few MB of the virtual file. Even a user who deliberately seeks the very end
+    of the video cannot actually play anything from <5MB of bytes, so refusing
+    these is safe.
+
+    Mid probe: small closed Range in the latter half of the file. A real user
+    seek arrives as an open-ended Range, so requiring ``range_end`` here keeps
+    us from blocking it.
+
+    Returns "tail" or "mid" if the request looks like a probe, otherwise "".
+    The handler should refuse probe requests with HTTP 416 so the player falls
+    back to sequential playback from byte 0.
+    """
+    if total <= 0 or range_start < 0:
+        return ""
+    if (total - range_start) <= TAIL_PROBE_DEAD_ZONE_BYTES:
+        return "tail"
+    if range_end is not None:
+        probe_size = range_end - range_start + 1
+        if 0 < probe_size <= MID_PROBE_MAX_SIZE_BYTES and range_start >= int(total * 0.5):
+            return "mid"
+    return ""
 
 
 class SSDPServer:
@@ -279,13 +328,24 @@ def create_app(
     subtitles_enabled: bool,
     device_uuid: str,
     lan_ip: str,
-    cache_dir: Path
+    cache_dir: Path,
+    si_config_holder: si_stream.ConfigHolder | None = None,
 ) -> FastAPI:
     """Create and configure FastAPI app with DLNA endpoints."""
-    app = FastAPI(title="VRVideoToolbox-DLNA")
     base_url = f"http://{lan_ip}:{port}"
     thumb_dir = cache_dir / "thumbs"
     logger = get_logger()
+    si_holder = si_config_holder or si_stream.ConfigHolder(si_stream.SIMixConfig(enabled=False))
+    si_service = si_stream.SIStreamService(media_library, si_holder)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        try:
+            yield
+        finally:
+            si_service.shutdown()
+
+    app = FastAPI(title="VRVideoToolbox-DLNA", lifespan=lifespan)
 
     @app.middleware("http")
     async def log_http_requests(request: Request, call_next):
@@ -358,7 +418,14 @@ def create_app(
         soap_action = request.headers.get("SOAPAction", "")
         body = await request.body()
         logger.info("SOAP ContentDirectory action=%s bytes=%d", soap_action, len(body))
-        payload, status = content_directory.handle_soap(soap_action, body, base_url, media_library, subtitles_enabled)
+        payload, status = content_directory.handle_soap(
+            soap_action,
+            body,
+            base_url,
+            media_library,
+            subtitles_enabled,
+            si_service=si_service,
+        )
         return Response(content=payload, status_code=status, media_type=XML_MEDIA_TYPE)
 
     @app.post("/control/cm")
@@ -388,6 +455,90 @@ def create_app(
             except Exception:
                 pass
         return FileResponse(path, headers=headers, media_type="video/mp4")
+
+    @app.get("/media_si/{name:path}")
+    async def media_si_get(request: Request, name: str):
+        path = _safe_video_path(name)
+        config = si_service.current_config()
+        if not config.enabled:
+            raise HTTPException(404, "SI entries disabled")
+        if si_service.has_si_source(path) is None:
+            raise HTTPException(404, "No SI source")
+
+        range_header = request.headers.get("range")
+        range_start, range_end = si_stream.parse_range_header(range_header)
+        total = si_service.estimate_output_size(path)
+        logger.info(
+            "SI request path=%s range=%s -> start=%d end=%s total=%d",
+            name,
+            range_header or "(none)",
+            range_start,
+            range_end if range_end is not None else "open",
+            total,
+        )
+        if total > 0 and range_start >= total:
+            return Response(
+                status_code=416,
+                headers={
+                    "Accept-Ranges": "bytes",
+                    "Content-Range": f"bytes */{total}",
+                },
+            )
+
+        probe_kind = classify_moov_probe(range_start, range_end, total)
+        if probe_kind:
+            logger.info(
+                "Refusing SI moov-probe request bytes=%d-%s total=%d (%s)",
+                range_start,
+                range_end,
+                total,
+                probe_kind,
+            )
+            return Response(
+                status_code=416,
+                headers={
+                    "Accept-Ranges": "bytes",
+                    "Content-Range": f"bytes */{total}",
+                },
+            )
+
+        safe_start = min(max(0, range_start), max(0, total - 1))
+        safe_end = min((range_end if range_end is not None else total - 1), total - 1)
+        client_id = request.client.host if request.client else None
+        chunks, content_length, total, status = si_service.open_stream(
+            path,
+            safe_start,
+            safe_end if range_end is not None else None,
+            client_id=client_id,
+        )
+        content_end = safe_start + content_length - 1 if content_length > 0 else safe_start
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(content_length),
+            "transferMode.dlna.org": "Streaming",
+            "contentFeatures.dlna.org": (
+                f"DLNA.ORG_PN=AVC_MP4_HP_HD_AAC;DLNA.ORG_OP=01;DLNA.ORG_CI=1;"
+                f"DLNA.ORG_FLAGS={DLNA_FLAGS_BASE}"
+            ),
+        }
+        if status == 206:
+            headers["Content-Range"] = f"bytes {safe_start}-{content_end}/{total}"
+        return StreamingResponse(chunks, status_code=status, headers=headers, media_type="video/mp4")
+
+    @app.post("/admin/reload_si_config")
+    async def reload_si_config(request: Request):
+        client_host = request.client.host if request.client else ""
+        if not is_loopback_host(client_host):
+            raise HTTPException(403, "Forbidden")
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            raise HTTPException(400, "Invalid SI config payload")
+        new_config = si_stream.SIMixConfig.from_mapping(data)
+        si_service.reload_config(new_config)
+        return {"ok": True, "config": new_config.as_dict()}
 
     @app.get("/subs/{name:path}")
     async def subtitle_get(name: str):

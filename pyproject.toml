@@ -13,6 +13,7 @@ dependencies = [
     # PTMediaServer uses the same upper bound; see reference/PTMediaServer/pyproject.toml.
     "numpy>=1.26,<2.1",
     "auditok>=0.3.0",
+    "onnxruntime-gpu",
     "huggingface-hub>=1.8.0",
     "keyring>=25.7.0",
     "requests>=2.32.5",
@@ -39,6 +40,7 @@ dependencies = [
     # The cu128 wheel includes sm_120 kernels.
     "torch==2.8.0",
     "torchvision==0.23.0",
+    "torchaudio==2.8.0",
     "ultralytics==8.4.4",
     "mmengine==0.10.7",
     # Depth Anything 3 vendored inference path for tool_2dvr.
@@ -59,6 +61,7 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
 torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
 
 [dependency-groups]
 dev = [

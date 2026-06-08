@@ -64,6 +64,32 @@ class EngineRunnerTests(unittest.TestCase):
 
         self.assertEqual(actual, str(raw_out))
 
+    def test_one_click_native_dependency_check_is_lightweight(self) -> None:
+        app_config._cache = {
+            "engine": "native_gpu",
+        }
+
+        with (
+            patch("one_click.logic.shutil.which", return_value="tool"),
+            patch("gpu_engine.native_mosaic.unavailable_reason", return_value=None) as unavailable_reason,
+        ):
+            missing = logic.check_dependencies()
+
+        self.assertEqual(missing, [])
+        unavailable_reason.assert_called_once_with(runtime_check=False)
+
+    def test_native_unavailable_reason_lightweight_does_not_prepare_gpu(self) -> None:
+        from gpu_engine import native_mosaic
+
+        with (
+            patch.object(native_mosaic, "_prepare", side_effect=AssertionError("warmup should be deferred")),
+            patch("gpu_engine.native_mosaic.importlib.util.find_spec", return_value=object()),
+            patch("gpu_engine.native_mosaic.os.path.isfile", return_value=True),
+        ):
+            reason = native_mosaic.unavailable_reason(runtime_check=False)
+
+        self.assertIsNone(reason)
+
 
 if __name__ == "__main__":
     unittest.main()

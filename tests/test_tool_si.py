@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -33,6 +34,15 @@ class FakeTTSModel:
 
 
 class SimultaneousInterpretationLogicTests(unittest.TestCase):
+    def test_default_chinese_speaker_is_serena(self) -> None:
+        self.assertEqual(logic.default_speaker_for_language("Chinese"), "Serena")
+        self.assertIn("Vivian", logic.speakers_for_language("Chinese"))
+
+    def test_speaker_note_keys_cover_all_speakers(self) -> None:
+        for speaker in logic.ALL_SPEAKERS:
+            self.assertTrue(logic.speaker_note_key(speaker), speaker)
+        self.assertEqual(logic.speaker_note_key("Ono_Anna"), "speaker_note_ono_anna")
+
     def test_parse_srt_uses_first_non_empty_subtitle_line(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             srt_path = Path(tmp_dir) / "sample.srt"
@@ -86,6 +96,269 @@ class SimultaneousInterpretationLogicTests(unittest.TestCase):
             tasks = logic.collect_paired_srt_tasks(root)
 
         self.assertEqual([path.name for path in tasks], ["a.srt", "b.srt"])
+
+    def test_collect_paired_srt_tasks_can_skip_subdirectories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "a.mp4").write_bytes(b"")
+            (root / "a.srt").write_text("x", encoding="utf-8")
+            nested = root / "nested"
+            nested.mkdir()
+            (nested / "b.mp4").write_bytes(b"")
+            (nested / "b.srt").write_text("x", encoding="utf-8")
+
+            tasks = logic.collect_paired_srt_tasks(root, recursive=False)
+
+        self.assertEqual([path.name for path in tasks], ["a.srt"])
+
+    def test_collect_paired_si_mix_tasks_finds_si_wav_matching_mp4_or_mkv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "a.mp4").write_bytes(b"")
+            (root / "a.si.wav").write_bytes(b"wav")
+            nested = root / "nested"
+            nested.mkdir()
+            (nested / "b.mkv").write_bytes(b"")
+            (nested / "b.si.wav").write_bytes(b"wav")
+            (nested / "ignored.si.wav").write_bytes(b"wav")
+
+            tasks = logic.collect_paired_si_mix_tasks(root)
+
+        self.assertEqual([task.video_path.name for task in tasks], ["a.mp4", "b.mkv"])
+        self.assertEqual([task.si_audio_path.name for task in tasks], ["a.si.wav", "b.si.wav"])
+        self.assertEqual([task.output_path.name for task in tasks], ["a_SI.mp4", "b_SI.mp4"])
+
+    def test_collect_paired_si_mix_tasks_can_skip_subdirectories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "a.mp4").write_bytes(b"")
+            (root / "a.si.wav").write_bytes(b"wav")
+            nested = root / "nested"
+            nested.mkdir()
+            (nested / "b.mp4").write_bytes(b"")
+            (nested / "b.si.wav").write_bytes(b"wav")
+
+            tasks = logic.collect_paired_si_mix_tasks(root, recursive=False)
+
+        self.assertEqual([task.video_path.name for task in tasks], ["a.mp4"])
+
+    def test_batch_mix_si_audio_tracks_uses_default_si_outputs_and_options(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "a.mp4").write_bytes(b"")
+            (root / "a.si.wav").write_bytes(b"wav")
+
+            with patch.object(
+                logic,
+                "mix_si_audio_track",
+                side_effect=lambda **kwargs: str(kwargs["output_path"]),
+            ) as mix_audio:
+                outputs = logic.batch_mix_si_audio_tracks(
+                    base_dir=root,
+                    mix_channel="right",
+                    original_volume_percent=90,
+                    si_volume_percent=60,
+                    si_delay_seconds=1.2,
+                    add_independent_track=True,
+                    log_callback=lambda _message: None,
+                    recursive=False,
+                )
+
+        self.assertEqual([Path(output).name for output in outputs], ["a_SI.mp4"])
+        kwargs = mix_audio.call_args.kwargs
+        self.assertEqual(kwargs["video_path"].name, "a.mp4")
+        self.assertEqual(kwargs["si_audio_path"].name, "a.si.wav")
+        self.assertEqual(kwargs["output_path"].name, "a_SI.mp4")
+        self.assertEqual(kwargs["mix_channel"], "right")
+        self.assertEqual(kwargs["original_volume_percent"], 90)
+        self.assertEqual(kwargs["si_volume_percent"], 60)
+        self.assertEqual(kwargs["si_delay_seconds"], 1.2)
+        self.assertEqual(kwargs["add_independent_track"], True)
+
+    def test_default_si_audio_mix_paths_use_same_stem(self) -> None:
+        video_path = Path("work") / "test.mp4"
+
+        self.assertEqual(logic.default_si_audio_path(video_path), str(Path("work") / "test.si.wav"))
+        self.assertEqual(logic.default_si_mix_output_path(video_path), str(Path("work") / "test_SI.mp4"))
+
+    def test_build_si_audio_mix_command_replaces_first_audio_by_default(self) -> None:
+        cmd = logic.build_si_audio_mix_command(
+            video_path="test.mp4",
+            si_audio_path="test.si.wav",
+            output_path="test_SI.mp4",
+            mix_channel="left",
+            original_volume_percent=100,
+            si_volume_percent=50,
+            audio_stream_count=2,
+        )
+        filter_arg = cmd[cmd.index("-filter_complex") + 1]
+        mapped_streams = [cmd[index + 1] for index, token in enumerate(cmd) if token == "-map"]
+
+        self.assertIn("[ol][si]amix", filter_arg)
+        self.assertIn("[left_mix_raw][or]join", filter_arg)
+        self.assertIn("alimiter=limit=0.95[si_track]", filter_arg)
+        self.assertIn("aformat=channel_layouts=stereo", filter_arg)
+        self.assertIn("aformat=channel_layouts=mono", filter_arg)
+        self.assertIn("volume=1[orig]", filter_arg)
+        self.assertIn("adelay=1000", filter_arg)
+        self.assertIn("volume=0.5[si]", filter_arg)
+        self.assertEqual(mapped_streams[:3], ["0:v?", "[si_track]", "0:a:1?"])
+        self.assertNotIn("0:a?", cmd)
+        self.assertIn("-c:a:0", cmd)
+        self.assertIn("-metadata:s:a:0", cmd)
+        self.assertIn("title=SI", cmd)
+        self.assertEqual(cmd[-1], "test_SI.mp4")
+
+    def test_build_si_audio_mix_command_keeps_original_audio_when_probe_unavailable(self) -> None:
+        cmd = logic.build_si_audio_mix_command(
+            video_path="test.mp4",
+            si_audio_path="test.si.wav",
+            output_path="test_SI.mp4",
+            mix_channel="left",
+            original_volume_percent=100,
+            si_volume_percent=50,
+            audio_stream_count=None,
+        )
+        mapped_streams = [cmd[index + 1] for index, token in enumerate(cmd) if token == "-map"]
+
+        self.assertEqual(mapped_streams[:4], ["0:v?", "[si_track]", "0:a?", "-0:a:0"])
+        self.assertIn("-c:a:0", cmd)
+        self.assertIn("-metadata:s:a:0", cmd)
+
+    def test_build_si_audio_mix_command_can_add_independent_track(self) -> None:
+        cmd = logic.build_si_audio_mix_command(
+            video_path="test.mp4",
+            si_audio_path="test.si.wav",
+            output_path="test_SI.mp4",
+            mix_channel="left",
+            original_volume_percent=100,
+            si_volume_percent=50,
+            audio_stream_count=2,
+            add_independent_track=True,
+        )
+        filter_arg = cmd[cmd.index("-filter_complex") + 1]
+
+        self.assertIn("[ol][si]amix", filter_arg)
+        self.assertIn("[left_mix_raw][or]join", filter_arg)
+        self.assertIn("alimiter=limit=0.95[si_track]", filter_arg)
+        self.assertIn("volume=1[orig]", filter_arg)
+        self.assertIn("adelay=1000", filter_arg)
+        self.assertIn("volume=0.5[si]", filter_arg)
+        self.assertIn("0:a?", cmd)
+        self.assertIn("-c:a:2", cmd)
+        self.assertIn("-metadata:s:a:2", cmd)
+        self.assertIn("title=SI", cmd)
+        self.assertEqual(cmd[-1], "test_SI.mp4")
+
+    def test_probe_audio_stream_count_times_out_cleanly(self) -> None:
+        messages: list[str] = []
+
+        with patch.object(logic.shutil, "which", return_value="ffprobe"), patch.object(
+            logic.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["ffprobe"], timeout=15),
+        ):
+            result = logic.probe_audio_stream_count("broken.mp4", messages.append)
+
+        self.assertIsNone(result)
+        self.assertTrue(any("timed out" in message for message in messages))
+
+    def test_build_si_audio_mix_command_overlays_right_channel(self) -> None:
+        cmd = logic.build_si_audio_mix_command(
+            video_path="test.mp4",
+            si_audio_path="test.si.wav",
+            output_path="test_SI.mp4",
+            mix_channel="right",
+            original_volume_percent=80,
+            si_volume_percent=90,
+            si_delay_seconds=1.2,
+            audio_stream_count=1,
+        )
+        filter_arg = cmd[cmd.index("-filter_complex") + 1]
+
+        self.assertIn("[or][si]amix", filter_arg)
+        self.assertIn("[ol][right_mix_raw]join", filter_arg)
+        self.assertIn("alimiter=limit=0.95[si_track]", filter_arg)
+        self.assertIn("volume=0.8[orig]", filter_arg)
+        self.assertIn("adelay=1200", filter_arg)
+        self.assertIn("volume=0.9[si]", filter_arg)
+        self.assertIn("-c:a:0", cmd)
+        self.assertIn("-metadata:s:a:0", cmd)
+
+    def test_build_si_audio_mix_command_accepts_zero_si_delay(self) -> None:
+        cmd = logic.build_si_audio_mix_command(
+            video_path="test.mp4",
+            si_audio_path="test.si.wav",
+            output_path="test_SI.mp4",
+            mix_channel="left",
+            original_volume_percent=100,
+            si_volume_percent=50,
+            si_delay_seconds=0,
+            audio_stream_count=1,
+        )
+        filter_arg = cmd[cmd.index("-filter_complex") + 1]
+
+        self.assertIn("adelay=0", filter_arg)
+
+    def test_mix_timeline_segment_attenuates_overlapping_audio(self) -> None:
+        timeline = np.array([0.0, 0.8, 0.8, 0.0], dtype=np.float32)
+        segment = np.array([0.8, 0.8], dtype=np.float32)
+
+        logic._mix_timeline_segment(timeline, 1, segment)
+
+        self.assertTrue(np.allclose(timeline, [0.0, 0.8, 0.8, 0.0]))
+
+    def test_parse_srt_skips_invalid_or_extreme_timecodes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            srt_path = Path(tmp_dir) / "bad_times.srt"
+            srt_path.write_text(
+                "1\n00:61:00,000 --> 00:61:01,000\nBad minute\n\n"
+                "2\n00:00:00,000 --> 00:05:01,000\nToo long\n\n"
+                "3\n07:00:00,000 --> 07:00:01,000\nToo late\n\n"
+                "4\n00:00:01,000 --> 00:00:02,000\nGood\n",
+                encoding="utf-8",
+            )
+
+            entries = logic.parse_srt(srt_path)
+
+        self.assertEqual([entry.text for entry in entries], ["Good"])
+
+    def test_speed_up_with_ffmpeg_timeout_falls_back_to_fast_resample(self) -> None:
+        audio = np.linspace(-0.5, 0.5, 100, dtype=np.float32)
+
+        with patch.object(logic.shutil, "which", return_value="ffmpeg"), patch.object(
+            logic.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["ffmpeg"], timeout=30),
+        ):
+            result = logic._speed_up_with_ffmpeg(audio, sample_rate=1000, factor=2.0, target_samples=50)
+
+        self.assertEqual(result.shape[0], 50)
+
+    def test_build_si_audio_mix_command_rejects_video_without_audio(self) -> None:
+        with self.assertRaises(ValueError):
+            logic.build_si_audio_mix_command(
+                video_path="test.mp4",
+                si_audio_path="test.si.wav",
+                output_path="test_SI.mp4",
+                mix_channel="left",
+                original_volume_percent=100,
+                si_volume_percent=50,
+                audio_stream_count=0,
+            )
+
+    def test_build_si_audio_mix_command_rejects_out_of_range_si_delay(self) -> None:
+        with self.assertRaises(ValueError):
+            logic.build_si_audio_mix_command(
+                video_path="test.mp4",
+                si_audio_path="test.si.wav",
+                output_path="test_SI.mp4",
+                mix_channel="left",
+                original_volume_percent=100,
+                si_volume_percent=50,
+                si_delay_seconds=1.6,
+                audio_stream_count=1,
+            )
 
     def test_fit_audio_to_duration_pads_short_audio_to_target_samples(self) -> None:
         audio = np.ones(100, dtype=np.float32) * 0.5
@@ -185,6 +458,76 @@ class SimultaneousInterpretationLogicTests(unittest.TestCase):
             self.assertEqual(len(fake_model.calls), 1)
             self.assertEqual(fake_model.calls[0]["text"], ["A", "B"])
             self.assertTrue(any("converting first 2 for test" in message for message in messages))
+
+    def test_subtitle_to_audio_filters_by_processing_time_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            srt_path = root / "sample.srt"
+            output_path = root / "out.wav"
+            srt_path.write_text(
+                "1\n00:00:00,000 --> 00:00:00,100\nA\n\n"
+                "2\n00:00:00,100 --> 00:00:00,200\nB\n\n"
+                "3\n00:00:00,350 --> 00:00:00,450\nC\n",
+                encoding="utf-8",
+            )
+            (root / logic.MODEL_DIR_NAME).mkdir()
+            fake_model = FakeTTSModel()
+            messages: list[str] = []
+
+            with patch.object(logic, "check_model_files", return_value=True), patch.dict(
+                "os.environ", {logic.TTS_BATCH_SIZE_ENV: "4"}
+            ):
+                logic.subtitle_to_audio(
+                    srt_path=srt_path,
+                    output_path=output_path,
+                    language="Chinese",
+                    speaker="Vivian",
+                    models_root=root,
+                    log_callback=messages.append,
+                    tts_model=fake_model,
+                    start_seconds=0.0,
+                    duration_seconds=0.25,
+                )
+
+            audio, sr = logic.read_wav_mono(output_path)
+            self.assertEqual(sr, 100)
+            self.assertEqual(audio.shape[0], 25)
+            self.assertEqual(len(fake_model.calls), 1)
+            self.assertEqual(fake_model.calls[0]["text"], ["A", "B"])
+            self.assertTrue(any("selected 2 in 0.000-0.250s" in message for message in messages))
+
+    def test_subtitle_to_audio_shifts_processing_window_to_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            srt_path = root / "sample.srt"
+            output_path = root / "out.wav"
+            srt_path.write_text(
+                "1\n00:00:01,000 --> 00:00:01,200\nA\n\n"
+                "2\n00:00:01,300 --> 00:00:01,500\nB\n",
+                encoding="utf-8",
+            )
+            (root / logic.MODEL_DIR_NAME).mkdir()
+            fake_model = FakeTTSModel()
+
+            with patch.object(logic, "check_model_files", return_value=True), patch.dict(
+                "os.environ", {logic.TTS_BATCH_SIZE_ENV: "4"}
+            ):
+                logic.subtitle_to_audio(
+                    srt_path=srt_path,
+                    output_path=output_path,
+                    language="Chinese",
+                    speaker="Vivian",
+                    models_root=root,
+                    log_callback=lambda _message: None,
+                    tts_model=fake_model,
+                    start_seconds=1.0,
+                    duration_seconds=0.6,
+                )
+
+            audio, sr = logic.read_wav_mono(output_path)
+            self.assertEqual(sr, 100)
+            self.assertEqual(audio.shape[0], 60)
+            self.assertGreater(float(np.abs(audio[:5]).max()), 0.0)
 
     def test_subtitle_to_audio_preserves_srt_order_when_limited(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

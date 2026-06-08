@@ -54,6 +54,15 @@ class AppConfigLanguageTests(unittest.TestCase):
                         "pre_extract_yolo_imgsz": 8192,
                         "source_scan_enabled": False,
                         "source_scan_final_merge_mode": "gpu",
+                        "gpu_log_verbose": True,
+                        "gpu_bitrate_multiplier": 9.0,
+                        "gpu_bitrate_final_multiplier": 9.0,
+                        "progress_log_interval_s": 99.0,
+                        "progress_log_min_pct": 99.0,
+                        "output_mp4_faststart": "always",
+                        "paste_passthrough_enabled": False,
+                        "paste_passthrough_min_frames": 1,
+                        "paste_passthrough_max_subseg": 1,
                         "gpu_encode_preset": "P4",
                     }
                 ),
@@ -67,6 +76,15 @@ class AppConfigLanguageTests(unittest.TestCase):
                 app_config.get("source_scan_final_merge_mode"),
                 app_config._DEFAULTS["source_scan_final_merge_mode"],
             )
+            self.assertEqual(app_config.get("gpu_log_verbose"), app_config._DEFAULTS["gpu_log_verbose"])
+            self.assertEqual(app_config.get("gpu_bitrate_multiplier"), 2.0)
+            self.assertEqual(app_config.get("gpu_bitrate_final_multiplier"), 1.0)
+            self.assertEqual(app_config.get("progress_log_interval_s"), 5.0)
+            self.assertEqual(app_config.get("progress_log_min_pct"), 5.0)
+            self.assertEqual(app_config.get("output_mp4_faststart"), "auto")
+            self.assertEqual(app_config.get("paste_passthrough_enabled"), True)
+            self.assertEqual(app_config.get("paste_passthrough_min_frames"), 60)
+            self.assertEqual(app_config.get("paste_passthrough_max_subseg"), 32)
             self.assertEqual(app_config.get("gpu_encode_preset"), "P4")
 
     def test_code_default_only_keys_are_not_persisted(self) -> None:
@@ -78,6 +96,15 @@ class AppConfigLanguageTests(unittest.TestCase):
                     {
                         "pre_extract_yolo_conf": 0.99,
                         "source_scan_final_merge_mode": "gpu",
+                        "gpu_log_verbose": True,
+                        "gpu_bitrate_multiplier": 9.0,
+                        "gpu_bitrate_final_multiplier": 9.0,
+                        "progress_log_interval_s": 99.0,
+                        "progress_log_min_pct": 99.0,
+                        "output_mp4_faststart": "always",
+                        "paste_passthrough_enabled": False,
+                        "paste_passthrough_min_frames": 1,
+                        "paste_passthrough_max_subseg": 1,
                         "gpu_encode_preset": "P4",
                     }
                 ),
@@ -89,6 +116,15 @@ class AppConfigLanguageTests(unittest.TestCase):
 
             self.assertNotIn("pre_extract_yolo_conf", saved)
             self.assertNotIn("source_scan_final_merge_mode", saved)
+            self.assertNotIn("gpu_log_verbose", saved)
+            self.assertNotIn("gpu_bitrate_multiplier", saved)
+            self.assertNotIn("gpu_bitrate_final_multiplier", saved)
+            self.assertNotIn("progress_log_interval_s", saved)
+            self.assertNotIn("progress_log_min_pct", saved)
+            self.assertNotIn("output_mp4_faststart", saved)
+            self.assertNotIn("paste_passthrough_enabled", saved)
+            self.assertNotIn("paste_passthrough_min_frames", saved)
+            self.assertNotIn("paste_passthrough_max_subseg", saved)
             self.assertEqual(saved["gpu_encode_preset"], "P4")
             self.assertEqual(saved["language"], "en")
 
@@ -98,8 +134,10 @@ class AppConfigLanguageTests(unittest.TestCase):
             app_config._CONFIG_PATH = str(Path(raw) / "config.json")
 
             app_config.set("pre_extract_yolo_conf", 0.99)
+            app_config.set("output_mp4_faststart", "always")
 
             self.assertEqual(app_config.get("pre_extract_yolo_conf"), app_config._DEFAULTS["pre_extract_yolo_conf"])
+            self.assertEqual(app_config.get("output_mp4_faststart"), app_config._DEFAULTS["output_mp4_faststart"])
             self.assertFalse(Path(app_config._CONFIG_PATH).exists())
 
     def test_gpu_encoder_preset_and_strict_maxrate_come_from_config(self) -> None:
