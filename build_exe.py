@@ -431,6 +431,10 @@ def verify() -> None:
     else:
         info("WARNING: PyNvVideoCodec directory not found in _internal; GPU decode 不可用.")
 
+    qwen_modeling = INTERNAL / "tool_si" / "_vendor" / "qwen_tts" / "core" / "models" / "modeling_qwen3_tts.py"
+    if not qwen_modeling.exists():
+        fail(r"Missing vendored Qwen3-TTS source under _internal\tool_si\_vendor\qwen_tts.")
+
     info("verification passed.")
 
 

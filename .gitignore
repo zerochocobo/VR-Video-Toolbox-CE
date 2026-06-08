@@ -1,15 +1,16 @@
-AGENTS.md
+# AGENTS.md
 CLAUDE.md
 GEMINI.md
 __pycache__
 build
 dist
-*.spec
 *.jpg
 *.pt
 .claude
 .pytest_cache
 .venv/
+.base/
+.base 
 .vscode/settings.json
 /prompt
 /GUI/VR_Mosaic_Removal/prompt
