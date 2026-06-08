@@ -12,6 +12,8 @@
 
 - 马赛克去除
 - 字幕生成、翻译、嵌入
+- 同声传译（SI）语音生成与视频 SI 音轨混合
+- 2D 视频转深度 VR180 SBS
 - **轻量级局域网 VR 视频 DLNA 服务器**（支持 180° SBS 格式自适应诱导、外部字幕自动关联与多物理目录映射）
 - VR 视频拆分、合并、投影转换等辅助工具
 
@@ -23,6 +25,8 @@
 
 - 想批量处理 VR 视频的用户
 - 想给 VR 视频生成字幕、翻译字幕或嵌入字幕的用户
+- 想把字幕转换成同声传译语音，并将 SI 音轨混入视频的用户
+- 想把普通 2D 视频转换成基于深度估计的 VR180 SBS 视频的用户
 - 想要在 VR 头显（如 Quest/Pico）中用 Skybox 等播放器直接无线播放电脑本地视频并自动关联字幕的用户
 - 想尝试用 AI 工具去除视频马赛克的用户
 - 想拆分左右眼、合并视频、转换 VR 投影格式的用户
@@ -71,7 +75,36 @@
 
 字幕识别和翻译结果仍建议人工检查，尤其是人名、专有名词和多人对话场景。
 
-### 3. VR 视频辅助工具
+### 3. 同声传译语音
+
+同声传译语音工具基于 Qwen3-TTS 和 FFmpeg：
+
+- 将 SRT 字幕转换成同名 `.si.wav` 语音文件，可选择语言和预设音色
+- 在音色选择右侧显示 speaker 特点备注，备注参考 Qwen3-TTS CustomVoice 模型页说明
+- 单文件测试可限制处理时间，如 15 秒、30 秒、自定义分钟、直到指定时间点或全部字幕
+- 批量将与 MP4/MKV 同名的字幕转换成 `.si.wav`
+- 将 `video.si.wav` 混入同名 MP4/MKV，生成 SI 视频音频结果
+- 可选择叠加到左声道或右声道，并设置原声音量、SI 音量和 SI 延迟
+- 可选择替换第一条音轨，或新增一条名为 `SI` 的独立音轨
+- 可批量扫描带有同名 `.si.wav` 旁路文件的 MP4/MKV，输出 `_SI.mp4`
+
+SI 的同步和响度仍建议人工试听校对。部分 TTS 结果本身已经包含翻译延迟，此时额外 SI 延迟需要按素材调整。
+
+### 4. 2D 转深度 VR
+
+2D 转深度 VR 工具使用本地 Depth Anything 3 Small 模型，把普通 2D 视频转换为立体 VR 输出：
+
+- 本地逐帧估计深度，并渲染左右眼画面
+- 输出 VR180 side-by-side MP4
+- 支持 3D 平面、半球等距 VR180 和鱼眼投影输出
+- 可选择开始时间和处理时长，方便先做短片段测试
+- 可调眼距，并提供面向正式输出的空洞填充模式
+- 可选择时序稳定选项，降低深度闪烁
+- 优先使用 PyNvVideoCodec/CUDA 路径，可在不支持时回退 FFmpeg
+
+基于单目深度的 2D 转 VR 是近似效果。大遮挡、快速运动、强模糊或深度估计不准确的场景可能出现立体伪影，建议先用短片段试算。
+
+### 5. VR 视频辅助工具
 
 项目还包含一些常用小工具：
 
@@ -81,7 +114,7 @@
 - 视频截图、局部放大检查等辅助功能
 - 批量处理脚本
 
-### 4. VR 视频 DLNA 服务器
+### 6. VR 视频 DLNA 服务器
 
 一个高内聚、轻量级的局域网 DLNA / UPnP 视频流媒体服务器：
 
@@ -115,6 +148,8 @@ python main.py
 - `Area Selection VR to Flat Mode`：VR 转平面选区处理
 - **VR 视频 DLNA 服务器**：一键开启/停止局域网 DLNA 共享，提供独立的配置窗口（管理共享目录、端口及字幕关联）
 - `日语批量字幕工具`：字幕生成与翻译相关工具
+- `同声传译语音`：从字幕生成 `.si.wav`，并将 SI 音频混入 MP4/MKV 视频
+- `2D转深度VR`：将 2D 视频转换成基于深度估计的 VR180 SBS 输出
 - `VR Hard Subtitle Embed Tool`：VR 硬字幕嵌入
 - 其他按钮：VR 拆分合并、投影转换、小工具箱
 
@@ -135,9 +170,12 @@ python main.py
 - `ffmpeg.exe`
 - `ffprobe.exe`
 - `lada-cli.exe` 或 `jasna-cli.exe`（二选一）
-- 基础 Python 包：`Pillow`、`pyinstaller`、`ffmpy3`、`faster-whisper`、`numpy>=1.26,<2.1`、`auditok`、`huggingface-hub`、`keyring`、`requests`、`av`、`fastapi`、`uvicorn`
+- 基础 Python 包：`Pillow`、`pyinstaller`、`ffmpy3`、`faster-whisper`、`numpy>=1.26,<2.1`、`auditok`、`onnxruntime-gpu`、`huggingface-hub`、`keyring`、`requests`、`transformers`、`accelerate`、`librosa`、`soundfile`、`av`、`fastapi`、`uvicorn`
 - CUDA/视频 Python 包：`pynvvideocodec>=2.1.0`、`cupy-cuda12x>=14.0`、`nvidia-cuda-nvrtc-cu12==12.8.93`、`nvidia-cuda-runtime-cu12==12.8.90`、`nvidia-cuda-cccl-cu12>=12.9.27`
-- 内置 AI/GPU 包：`torch==2.8.0` 和 `torchvision==0.23.0`（来自 PyTorch `cu128` wheel 源），以及 `ultralytics==8.4.4`、`mmengine==0.10.7`
+- 内置 AI/GPU 包：`torch==2.8.0`、`torchvision==0.23.0` 和 `torchaudio==2.8.0`（来自 PyTorch `cu128` wheel 源），以及 `ultralytics==8.4.4`、`mmengine==0.10.7`、`omegaconf`、`einops`、`safetensors`、`opencv-python`
+- 可选/本地模型：
+  - 同声传译语音需要将 Qwen3-TTS 12Hz CustomVoice 放到 `models/Qwen3-TTS-12Hz-0.6B-CustomVoice`
+  - 2D 转深度 VR 需要将 Depth Anything 3 Small 放到 `models/DA3/Small`
 
 Python 依赖安装：
 
@@ -146,7 +184,7 @@ cd GUI\VR_Video_Toolbox
 uv sync
 ```
 
-如果手动用 `pip` 安装，请以 `pyproject.toml` 中的版本为准，并从 `https://download.pytorch.org/whl/cu128` 安装 PyTorch / torchvision。
+如果手动用 `pip` 安装，请以 `pyproject.toml` 中的版本为准，并从 `https://download.pytorch.org/whl/cu128` 安装 PyTorch / torchvision / torchaudio。
 
 FFmpeg 和 AI 引擎（Lada / Jasna）需要能被程序找到。可以放到系统 `PATH` 中，也可以在打包版或运行目录旁边放置相关可执行文件。
 
@@ -161,6 +199,8 @@ FFmpeg 和 AI 引擎（Lada / Jasna）需要能被程序找到。可以放到系
 │     ├─ area_selection_vr2flat/
 │     ├─ tool_subtitle/         字幕生成、翻译、批量处理
 │     ├─ tool_subembed/         VR 字幕嵌入
+│     ├─ tool_si/               同声传译语音与 SI 音轨混合
+│     ├─ tool_2dvr/             2D 转深度 VR
 │     ├─ tool_dlna/             局域网 DLNA/UPnP 视频服务器
 │     ├─ tool_split_combine/    VR 拆分与合并
 │     ├─ tool_v360_trans/       VR 投影转换
@@ -181,6 +221,8 @@ FFmpeg 和 AI 引擎（Lada / Jasna）需要能被程序找到。可以放到系
 - `_sbs`：左右眼并排格式
 - `_L` / `_R`：左眼或右眼视频
 - 字幕工具会根据任务生成 `.srt`、翻译后的字幕文件或嵌入字幕后的视频
+- 同声传译语音工具会生成 `.si.wav`；混合 SI 视频音轨会输出 `_SI.mp4`
+- 2D 转深度 VR 会输出类似 `_2dvr_flat3d_LR_SBS.mp4` 或 `_2dvr_hequirect_LR_180_SBS.mp4` 的文件
 
 实际命名以所选工具界面提示为准。
 

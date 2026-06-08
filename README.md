@@ -12,6 +12,8 @@ Current main features:
 
 - Mosaic removal
 - Subtitle generation, translation, and embedding
+- Simultaneous interpretation (SI) voice generation and SI video audio-track mixing
+- 2D video to depth-based VR180 SBS conversion
 - **Lightweight LAN VR Video DLNA Server** (supports 180° SBS format auto-inducing, external subtitle auto-association, and multi-root mapping)
 - VR split/combine, projection conversion, and other helper tools
 
@@ -23,6 +25,8 @@ The goal is to make complex video workflows usable through a GUI and batch scrip
 
 - Users who batch-process VR videos
 - Users who generate, translate, or embed subtitles for VR videos
+- Users who want to turn subtitles into simultaneous-interpretation audio and mix it into videos as an SI track
+- Users who want to convert ordinary 2D videos into depth-based VR180 SBS videos
 - Users who want to play local PC videos wirelessly on VR headsets (e.g. Oculus Quest, Pico) with player apps like Skybox and load subtitles automatically
 - Users who want to try AI-assisted mosaic removal
 - Users who need left/right eye splitting, merging, projection conversion, screenshots, or preview helpers
@@ -69,7 +73,36 @@ Subtitle tools are included to reduce manual subtitle work:
 
 Speech recognition and translation results should still be reviewed manually, especially for names, domain-specific words, and multi-speaker dialogue.
 
-### 3. VR Video Utilities
+### 3. Simultaneous Interpretation Voice
+
+The simultaneous interpretation tool builds on Qwen3-TTS and FFmpeg:
+
+- Convert SRT subtitles into a same-name `.si.wav` voice track with selectable language and predefined speaker voices
+- Show speaker notes beside the voice selector, based on the Qwen3-TTS CustomVoice model card
+- Limit a single test run to a selected time window, such as 15 seconds, 30 seconds, custom minutes, until a time point, or all subtitles
+- Batch-convert subtitles paired with MP4/MKV files into `.si.wav`
+- Mix `video.si.wav` into the matching MP4/MKV as an SI audio result
+- Choose whether SI is overlaid on the left or right channel, set original/SI volume, and add SI delay
+- Either replace the first audio track with the SI mix or add a new independent audio track named `SI`
+- Batch-scan MP4/MKV files with same-name `.si.wav` sidecar files and output `_SI.mp4`
+
+SI timing and loudness still need human review. Generated TTS may already contain translation delay, so the extra SI delay should be adjusted per source.
+
+### 4. 2D to Depth VR
+
+The 2D to Depth VR tool converts ordinary 2D videos into stereoscopic VR output using a local Depth Anything 3 Small model:
+
+- Estimate per-frame depth locally and render left/right eye views
+- Output VR180 side-by-side MP4 files
+- Support flat 3D, half-equirectangular VR180, and fisheye projection outputs
+- Select start time and duration, including short test windows before processing a full video
+- Adjust eye distance and choose production-oriented hole-fill modes
+- Use temporal stabilization options to reduce depth flicker
+- Prefer the PyNvVideoCodec/CUDA path where available, with FFmpeg fallback
+
+Depth-based 2D-to-VR conversion is an approximation. Scenes with large occlusions, fast motion, strong blur, or inaccurate monocular depth may show stereo artifacts, so short test clips are recommended.
+
+### 5. VR Video Utilities
 
 The toolkit also includes common VR helpers:
 
@@ -79,7 +112,7 @@ The toolkit also includes common VR helpers:
 - Take screenshots and inspect local areas
 - Run batch processing scripts
 
-### 4. VR Video DLNA Server
+### 6. VR Video DLNA Server
 
 A highly cohesive and lightweight LAN DLNA / UPnP video streaming server:
 
@@ -102,6 +135,8 @@ From the launcher, choose the tool you need:
 - `Area Selection VR to Flat Mode`: VR-to-flat area processing
 - **VR Video DLNA Server**: One-click startup/shutdown for LAN DLNA sharing, providing an independent config window for directories, port, and subtitles.
 - `Japanese Batch Subtitle Tools`: subtitle generation, translation, and batch tools
+- `Simultaneous Interpretation Voice`: generate `.si.wav` from subtitles and mix SI audio into MP4/MKV videos
+- `2D to Depth VR`: convert 2D videos into depth-based VR180 SBS output
 - `VR Hard Subtitle Embed Tool`: hard subtitle embedding for VR video
 - Other buttons: split/combine, projection conversion, flat conversion, and small utilities
 
@@ -122,9 +157,12 @@ Required executables and packages:
 - `ffmpeg.exe`
 - `ffprobe.exe`
 - `lada-cli.exe` or `jasna-cli.exe` (choose one)
-- Base Python packages: `Pillow`, `pyinstaller`, `ffmpy3`, `faster-whisper`, `numpy>=1.26,<2.1`, `auditok`, `huggingface-hub`, `keyring`, `requests`, `av`, `fastapi`, `uvicorn`
+- Base Python packages: `Pillow`, `pyinstaller`, `ffmpy3`, `faster-whisper`, `numpy>=1.26,<2.1`, `auditok`, `onnxruntime-gpu`, `huggingface-hub`, `keyring`, `requests`, `transformers`, `accelerate`, `librosa`, `soundfile`, `av`, `fastapi`, `uvicorn`
 - CUDA/video Python packages: `pynvvideocodec>=2.1.0`, `cupy-cuda12x>=14.0`, `nvidia-cuda-nvrtc-cu12==12.8.93`, `nvidia-cuda-runtime-cu12==12.8.90`, `nvidia-cuda-cccl-cu12>=12.9.27`
-- Native AI/GPU packages: `torch==2.8.0` and `torchvision==0.23.0` from the PyTorch `cu128` wheel index, plus `ultralytics==8.4.4` and `mmengine==0.10.7`
+- Native AI/GPU packages: `torch==2.8.0`, `torchvision==0.23.0`, and `torchaudio==2.8.0` from the PyTorch `cu128` wheel index, plus `ultralytics==8.4.4`, `mmengine==0.10.7`, `omegaconf`, `einops`, `safetensors`, and `opencv-python`
+- Optional/local models:
+  - Qwen3-TTS 12Hz CustomVoice under `models/Qwen3-TTS-12Hz-0.6B-CustomVoice` for SI voice generation
+  - Depth Anything 3 Small under `models/DA3/Small` for 2D to Depth VR
 
 Install Python dependencies:
 
@@ -133,7 +171,7 @@ cd GUI\VR_Video_Toolbox
 uv sync
 ```
 
-If installing manually with `pip`, keep the CUDA package versions aligned with `pyproject.toml`, and install PyTorch/torchvision from `https://download.pytorch.org/whl/cu128`.
+If installing manually with `pip`, keep the CUDA package versions aligned with `pyproject.toml`, and install PyTorch/torchvision/torchaudio from `https://download.pytorch.org/whl/cu128`.
 
 FFmpeg and the AI engine (Lada or Jasna) must be discoverable by the program. You can add them to the system `PATH`, or place the executables next to the packaged app or runtime directory.
 
@@ -148,6 +186,8 @@ FFmpeg and the AI engine (Lada or Jasna) must be discoverable by the program. Yo
 │     ├─ area_selection_vr2flat/
 │     ├─ tool_subtitle/         Subtitle generation, translation, batch processing
 │     ├─ tool_subembed/         VR subtitle embedding
+│     ├─ tool_si/               Simultaneous interpretation voice and SI audio mixing
+│     ├─ tool_2dvr/             2D to depth-based VR conversion
 │     ├─ tool_dlna/             LAN DLNA/UPnP video server
 │     ├─ tool_split_combine/    VR split/combine tools
 │     ├─ tool_v360_trans/       VR projection conversion
@@ -168,6 +208,8 @@ Processed files are usually written next to the input video or to the output dir
 - `_sbs`: side-by-side left/right eye format
 - `_L` / `_R`: left-eye or right-eye video
 - Subtitle tools may generate `.srt`, translated subtitle files, or videos with embedded subtitles
+- SI voice tools generate `.si.wav`; SI video audio mixing outputs `_SI.mp4`
+- 2D to Depth VR outputs files such as `_2dvr_flat3d_LR_SBS.mp4` or `_2dvr_hequirect_LR_180_SBS.mp4`
 
 Exact names depend on the selected tool and settings.
 
