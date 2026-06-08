@@ -100,6 +100,11 @@ SI_DELAY_SECONDS_CHOICES = (0.0, 0.3, 0.5, 0.7, 1.0, 1.2, 1.5, 2.0)
 DEFAULT_ORIGINAL_VOLUME_PERCENT = 100
 DEFAULT_SI_VOLUME_PERCENT = 50
 DEFAULT_SI_DELAY_SECONDS = 1.0
+SI_DUCK_THRESHOLD = "0.025"
+SI_DUCK_RATIO = "5"
+SI_DUCK_ATTACK_MS = "30"
+SI_DUCK_RELEASE_MS = "600"
+SI_DUCK_MAKEUP = "1"
 MAX_SUBTITLE_ENTRY_DURATION = 300.0
 MAX_SUBTITLE_TIMECODE_SECONDS = 6 * 60 * 60
 
@@ -371,17 +376,29 @@ def _entries_for_time_window(
 
 def default_output_path(srt_path: str | os.PathLike[str]) -> str:
     path = Path(srt_path)
-    return str(path.with_name(f"{path.stem}.si.wav"))
+    return _format_path_like_source(path.with_name(f"{path.stem}.si.wav"), srt_path)
 
 
 def default_si_audio_path(video_path: str | os.PathLike[str]) -> str:
     path = Path(video_path)
-    return str(path.with_suffix(".si.wav"))
+    return _format_path_like_source(path.with_suffix(".si.wav"), video_path)
 
 
 def default_si_mix_output_path(video_path: str | os.PathLike[str]) -> str:
     path = Path(video_path)
-    return str(path.with_name(f"{path.stem}_SI.mp4"))
+    return _format_path_like_source(path.with_name(f"{path.stem}_SI.mp4"), video_path)
+
+
+def _format_path_like_source(path: Path, source_path: str | os.PathLike[str]) -> str:
+    result = str(path)
+    source = os.fspath(source_path)
+    forward_index = source.rfind("/")
+    backward_index = source.rfind("\\")
+    if forward_index > backward_index:
+        return result.replace("\\", "/")
+    if backward_index > forward_index:
+        return result.replace("/", "\\")
+    return result
 
 
 def collect_paired_si_mix_tasks(base_dir: str | os.PathLike[str], recursive: bool = True) -> list[SITrackMixTask]:
@@ -455,6 +472,7 @@ def build_si_mix_filter(
     original_volume_percent: int | float,
     si_volume_percent: int | float,
     si_delay_seconds: int | float = DEFAULT_SI_DELAY_SECONDS,
+    duck_original: bool = False,
 ) -> str:
     channel = _validate_si_mix_channel(mix_channel)
     original_volume = _filter_number(_validate_original_volume(original_volume_percent) / 100.0)
@@ -472,6 +490,24 @@ def build_si_mix_filter(
             "[or][si]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[right_mix_raw];"
             "[ol][right_mix_raw]join=inputs=2:channel_layout=stereo,"
             "alimiter=limit=0.95[si_track]"
+        )
+
+    if duck_original:
+        compressor = (
+            f"threshold={SI_DUCK_THRESHOLD}:"
+            f"ratio={SI_DUCK_RATIO}:"
+            f"attack={SI_DUCK_ATTACK_MS}:"
+            f"release={SI_DUCK_RELEASE_MS}:"
+            f"makeup={SI_DUCK_MAKEUP}"
+        )
+        return (
+            "[0:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+            f"volume={original_volume}[orig_base];"
+            "[1:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=mono,"
+            f"adelay={si_delay_ms},volume={si_volume},apad,asplit=2[si_key][si];"
+            f"[orig_base][si_key]sidechaincompress={compressor}[orig];"
+            "[orig]channelsplit=channel_layout=stereo[ol][or];"
+            f"{mix_part}"
         )
 
     return (
@@ -541,11 +577,18 @@ def build_si_audio_mix_command(
     si_delay_seconds: int | float = DEFAULT_SI_DELAY_SECONDS,
     audio_stream_count: int | None = 1,
     add_independent_track: bool = False,
+    duck_original: bool = False,
 ) -> list[str]:
     if audio_stream_count is not None and audio_stream_count < 1:
         raise ValueError("Input video must contain at least one audio stream.")
 
-    filter_arg = build_si_mix_filter(mix_channel, original_volume_percent, si_volume_percent, si_delay_seconds)
+    filter_arg = build_si_mix_filter(
+        mix_channel,
+        original_volume_percent,
+        si_volume_percent,
+        si_delay_seconds,
+        duck_original=duck_original,
+    )
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -656,6 +699,7 @@ def mix_si_audio_track(
     si_volume_percent: int | float = DEFAULT_SI_VOLUME_PERCENT,
     si_delay_seconds: int | float = DEFAULT_SI_DELAY_SECONDS,
     add_independent_track: bool = False,
+    duck_original: bool = False,
     log_callback: LogCallback = print,
     stop_event: Event | None = None,
     process_callback: Callable[[subprocess.Popen | None], None] | None = None,
@@ -693,6 +737,7 @@ def mix_si_audio_track(
         si_delay_seconds=si_delay_seconds,
         audio_stream_count=audio_stream_count,
         add_independent_track=add_independent_track,
+        duck_original=duck_original,
     )
     log_callback(f"Executing: {_format_command_for_log(cmd)}")
 
@@ -751,6 +796,7 @@ def batch_mix_si_audio_tracks(
     si_volume_percent: int | float = DEFAULT_SI_VOLUME_PERCENT,
     si_delay_seconds: int | float = DEFAULT_SI_DELAY_SECONDS,
     add_independent_track: bool = False,
+    duck_original: bool = False,
     log_callback: LogCallback = print,
     stop_event: Event | None = None,
     recursive: bool = True,
@@ -774,6 +820,7 @@ def batch_mix_si_audio_tracks(
             si_volume_percent=si_volume_percent,
             si_delay_seconds=si_delay_seconds,
             add_independent_track=add_independent_track,
+            duck_original=duck_original,
             log_callback=log_callback,
             stop_event=stop_event,
             process_callback=process_callback,

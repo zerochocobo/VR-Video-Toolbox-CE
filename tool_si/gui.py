@@ -240,8 +240,14 @@ class SimultaneousInterpretationApp:
             text=get_text("chk_add_independent_track"),
             variable=self.mix_add_independent_track_var,
         ).grid(row=0, column=0, columnspan=2, sticky="w", padx=(0, 18), pady=2)
+        self.mix_duck_original_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            options_frame,
+            text=get_text("chk_duck_original_when_si"),
+            variable=self.mix_duck_original_var,
+        ).grid(row=0, column=2, columnspan=2, sticky="w", padx=(0, 18), pady=2)
 
-        ttk.Label(options_frame, text=get_text("lbl_mix_channel")).grid(row=0, column=2, sticky="w", padx=(0, 6), pady=2)
+        ttk.Label(options_frame, text=get_text("lbl_mix_channel")).grid(row=0, column=4, sticky="w", padx=(0, 6), pady=2)
         self.mix_channel_var = tk.StringVar(value=get_text("opt_channel_left"))
         self.mix_channel_combo = ttk.Combobox(
             options_frame,
@@ -250,7 +256,7 @@ class SimultaneousInterpretationApp:
             width=16,
             state="readonly",
         )
-        self.mix_channel_combo.grid(row=0, column=3, sticky="w", pady=2)
+        self.mix_channel_combo.grid(row=0, column=5, sticky="w", pady=2)
 
         ttk.Label(options_frame, text=get_text("lbl_original_volume")).grid(row=1, column=0, sticky="w", padx=(0, 6), pady=2)
         self.mix_original_volume_var = tk.StringVar(value="100%")
@@ -321,8 +327,14 @@ class SimultaneousInterpretationApp:
             text=get_text("chk_add_independent_track"),
             variable=self.batch_mix_add_independent_track_var,
         ).grid(row=0, column=0, columnspan=2, sticky="w", padx=(0, 18), pady=2)
+        self.batch_mix_duck_original_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            options_frame,
+            text=get_text("chk_duck_original_when_si"),
+            variable=self.batch_mix_duck_original_var,
+        ).grid(row=0, column=2, columnspan=2, sticky="w", padx=(0, 18), pady=2)
 
-        ttk.Label(options_frame, text=get_text("lbl_mix_channel")).grid(row=0, column=2, sticky="w", padx=(0, 6), pady=2)
+        ttk.Label(options_frame, text=get_text("lbl_mix_channel")).grid(row=0, column=4, sticky="w", padx=(0, 6), pady=2)
         self.batch_mix_channel_var = tk.StringVar(value=get_text("opt_channel_left"))
         ttk.Combobox(
             options_frame,
@@ -330,7 +342,7 @@ class SimultaneousInterpretationApp:
             values=list(self._mix_channel_display_map().keys()),
             width=16,
             state="readonly",
-        ).grid(row=0, column=3, sticky="w", pady=2)
+        ).grid(row=0, column=5, sticky="w", pady=2)
 
         ttk.Label(options_frame, text=get_text("lbl_original_volume")).grid(row=1, column=0, sticky="w", padx=(0, 6), pady=2)
         self.batch_mix_original_volume_var = tk.StringVar(value="100%")
@@ -809,6 +821,7 @@ class SimultaneousInterpretationApp:
         si_volume = self._selected_si_volume()
         si_delay = self._selected_si_delay()
         add_independent_track = self.mix_add_independent_track_var.get()
+        duck_original = self.mix_duck_original_var.get()
 
         def task():
             start_time = time.time()
@@ -824,6 +837,7 @@ class SimultaneousInterpretationApp:
                     si_volume_percent=si_volume,
                     si_delay_seconds=si_delay,
                     add_independent_track=add_independent_track,
+                    duck_original=duck_original,
                     log_callback=self.log,
                     stop_event=self.stop_mix_event,
                     process_callback=self._set_mix_process,
@@ -863,6 +877,7 @@ class SimultaneousInterpretationApp:
         si_volume = self._selected_batch_mix_si_volume()
         si_delay = self._selected_batch_mix_si_delay()
         add_independent_track = self.batch_mix_add_independent_track_var.get()
+        duck_original = self.batch_mix_duck_original_var.get()
         recursive = self.batch_mix_recursive_var.get()
 
         def task():
@@ -877,6 +892,7 @@ class SimultaneousInterpretationApp:
                     si_volume_percent=si_volume,
                     si_delay_seconds=si_delay,
                     add_independent_track=add_independent_track,
+                    duck_original=duck_original,
                     log_callback=self.log,
                     stop_event=self.stop_batch_mix_event,
                     recursive=recursive,
