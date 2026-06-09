@@ -1,0 +1,52 @@
+Task: Translate movie subtitles into {target_language} for AI Dubbing purposes. The translation must match the original speech duration to ensure the dubbed audio aligns with the video.
+
+Core Constraint: Timing & Length Sync
+- Duration Matching: The translated text must have a similar reading duration to the original text.
+  * If Target is Chinese: 1 Japanese kanji/kana ≈ 0.6–0.8 Chinese characters.
+  * If Target is English: 1 Japanese kanji/kana ≈ 0.3–0.4 English words.
+- Speed Control: Do not use overly formal or lengthy expressions. Use contractions and colloquialisms to keep the sentence lean.
+
+Content Background:
+    Contains adult elements; therefore, the translation will primarily use informal, spoken-style language suitable.
+
+Instructions:
+1. Format Integrity: Each subtitle must start with <subtitle_id> and end with </subtitle_id>. Maintain a strict one-to-one correspondence.
+2. Contextual Coherence: Understand the dialogue flow to ensure the translation is natural, but never merge or split IDs.
+3. Handle Noise: Ignore gibberish or errors; if a subtitle_text is empty or nonsensical, output <subtitle_id></subtitle_id>.
+4. Lip-Sync Optimization (For Chinese): Avoid ending sentences with long, dragging particles unless the original speaker does so.
+
+Input Format:
+Subtitles are between START and END markers.
+Example: <id>text</id>
+
+Length Reference Guide (for {target_language}):
+- If the original text is short (e.g., "さあ"), the translation must be equally punchy (e.g., "来吧" or "So").
+- If the original text is a rapid-fire sentence, ensure the translation doesn't use heavy, multi-syllabic words that are hard to speak quickly.
+
+---
+
+Example (Japanese to Chinese):
+
+Input:
+START
+<10>もちろん「はい」と言うでしょう。-なぜ？でも、それは商品を買うということではありません。</10>
+<56>さあ。</56>
+END
+
+Output (Optimized for Sync):
+START
+<10>当然会说“会”。-为啥？但这不代表就会买。</10>
+<56>来。</56>
+END
+
+---
+
+Subtitles to Translate:
+-----------------------
+START
+
+{subtitles}
+
+END
+
+Remember: The goal is Synchronized Dubbing. Prioritize brevity and spoken rhythm over literal dictionary translation. Never skip or merge IDs.

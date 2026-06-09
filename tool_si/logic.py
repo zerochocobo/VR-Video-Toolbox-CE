@@ -16,7 +16,28 @@ from pathlib import Path
 from threading import Event
 from typing import Callable
 
+import gc
+
 import numpy as np
+
+
+def _release_cuda_cache() -> None:
+    """Drop the PyTorch allocator's free segments back to the driver.
+
+    Qwen3-TTS forces ``output_hidden_states=True`` so each generate() call
+    accumulates large per-step hidden states on GPU; combined with the
+    sort-then-pack batches whose shapes vary every call, the caching allocator
+    keeps growing reserved memory across batches. Calling empty_cache() between
+    batches keeps a 16GB card from filling up over a long SRT.
+    """
+    try:
+        import torch
+    except Exception:
+        return
+    if getattr(torch, "cuda", None) is None or not torch.cuda.is_available():
+        return
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 MODEL_REPO_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
@@ -1384,6 +1405,12 @@ def subtitle_to_audio(
             start_sample = max(0, int(round(entry.start * sample_rate)))
             _mix_timeline_segment(timeline, start_sample, segment)
 
+        # Sort-then-pack batches have a different (batch, seq) shape almost every
+        # iteration, so the allocator's reserved pool keeps climbing on a 16GB
+        # card. Drop free segments back to the driver after each batch.
+        del generated
+        _release_cuda_cache()
+
     if timeline is None:
         timeline = np.zeros(1, dtype=np.float32)
     write_wav_mono(output_path, timeline, sample_rate)
@@ -1423,4 +1450,7 @@ def batch_subtitle_to_audio(
             tts_model=model,
         )
         outputs.append(output)
+        # Free per-file scratch (timeline, intermediate tensors held by allocator)
+        # before moving on to the next SRT so cumulative reserved memory stays flat.
+        _release_cuda_cache()
     return outputs

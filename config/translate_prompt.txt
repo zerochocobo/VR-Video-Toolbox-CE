@@ -19,7 +19,7 @@ Instructions:
         - No skipping of subtitles is allowed.
         
 Content Background:
-    Contains adult elements; therefore, the translation will primarily use colloquial language.
+    Contains adult elements; therefore, the translation will primarily use informal, spoken-style language suitable.
 
 --------
 

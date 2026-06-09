@@ -33,7 +33,7 @@ a = Analysis(
         # DLNA does not need GPU/AI dependencies; exclude them explicitly to reduce size.
         "cupy", "cupy_backends", "cupyx", "fastrlock",
         "pynvvideocodec", "PyNvVideoCodec",
-        "torch", "torchvision", "torchgen", "functorch",
+        "torch", "torchvision", "torchaudio", "torchgen", "functorch",
         "ultralytics", "mmengine",
         "faster_whisper", "auditok",
         "nvidia",

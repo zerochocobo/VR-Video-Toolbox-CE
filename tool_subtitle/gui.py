@@ -86,23 +86,28 @@ class SubtitleToolsApp:
         self.tab_trans = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(self.tab_trans, text=get_text('tab_trans'))
         self.setup_trans_tab()
+
+        # Tab 3: One-click Listening Translation
+        self.tab_listen = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(self.tab_listen, text=get_text('tab_listen'))
+        self.setup_listen_tab()
         
-        # Tab 3: SRT to ASS
+        # Tab 4: SRT to ASS
         self.tab_ass = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(self.tab_ass, text=get_text('tab_ass'))
         self.setup_ass_tab()
 
-        # Tab 4: Batch Add Soft Subtitles
+        # Tab 5: Batch Add Soft Subtitles
         self.tab_srt = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(self.tab_srt, text=get_text('tab_srt'))
         self.setup_srt_tab()
 
-        # Tab 4.5: Remove Soft Subtitles
+        # Tab 6: Remove Soft Subtitles
         self.tab_rm_sub = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(self.tab_rm_sub, text=get_text('tab_rm_sub'))
         self.setup_rm_sub_tab()
         
-        # Tab 5: Rank Subtitles
+        # Tab 7: Rank Subtitles
         self.tab_rank = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(self.tab_rank, text=get_text('tab_rank'))
         self.setup_rank_tab()
@@ -585,52 +590,62 @@ class SubtitleToolsApp:
         # Load config
         self.trans_config = logic.load_trans_config()
 
+        option_cols = ttk.Frame(frame)
+        option_cols.pack(fill='x', pady=(0, 4))
+        option_cols.grid_columnconfigure(0, weight=1, uniform='trans_opts')
+        option_cols.grid_columnconfigure(1, weight=1, uniform='trans_opts')
+
         # AI Configuration Group
-        ai_frame = ttk.LabelFrame(frame, text=get_text('grp_ai_config'), padding=10)
-        ai_frame.pack(fill='x', pady=5)
+        ai_frame = ttk.LabelFrame(option_cols, text=get_text('grp_ai_config'), padding=8)
+        ai_frame.grid(row=0, column=0, sticky='nsew', padx=(0, 4))
 
-        # API URL & Model Name (Side by Side)
-        url_model_frame = ttk.Frame(ai_frame)
-        url_model_frame.pack(fill='x', pady=2)
+        # API URL
+        api_url_frame = ttk.Frame(ai_frame)
+        api_url_frame.pack(fill='x', pady=1)
         
-        ttk.Label(url_model_frame, text=get_text('lbl_api_url'), width=15).pack(side='left')
+        ttk.Label(api_url_frame, text=get_text('lbl_api_url'), width=20).pack(side='left', padx=(0, 6))
         self.api_url_var = tk.StringVar(value=self.trans_config.get('api_base_url', ''))
-        ttk.Entry(url_model_frame, textvariable=self.api_url_var).pack(side='left', fill='x', expand=True)
+        ttk.Entry(api_url_frame, textvariable=self.api_url_var).pack(side='left', fill='x', expand=True)
 
-        ttk.Label(url_model_frame, text=get_text('lbl_model_name')).pack(side='left', padx=(20, 5))
+        # Model Name
+        model_name_frame = ttk.Frame(ai_frame)
+        model_name_frame.pack(fill='x', pady=1)
+        ttk.Label(model_name_frame, text=get_text('lbl_model_name'), width=20).pack(side='left', padx=(0, 6))
         self.model_name_var = tk.StringVar(value=self.trans_config.get('model_name', ''))
-        ttk.Entry(url_model_frame, textvariable=self.model_name_var, width=25).pack(side='left')
+        ttk.Entry(model_name_frame, textvariable=self.model_name_var).pack(side='left', fill='x', expand=True)
 
         # API Key
         key_frame = ttk.Frame(ai_frame)
-        key_frame.pack(fill='x', pady=2)
-        ttk.Label(key_frame, text=get_text('lbl_api_key'), width=20).pack(side='left')
+        key_frame.pack(fill='x', pady=1)
+        ttk.Label(key_frame, text=get_text('lbl_api_key'), width=20).pack(side='left', padx=(0, 6))
 
         self.api_key_var = tk.StringVar(value="")
         self.api_key_entry = ttk.Entry(key_frame, textvariable=self.api_key_var, show="*")
         self.api_key_entry.pack(side='left', fill='x', expand=True)
         
-        self.btn_test_api = ttk.Button(key_frame, text=get_text('btn_test_api'), command=self.test_trans_api)
-        self.btn_del_key = ttk.Button(key_frame, text=get_text('btn_delete_key'), command=self.delete_trans_key)
-        self.btn_test_api.pack(side='left', padx=(10, 0))
+        key_button_frame = ttk.Frame(ai_frame)
+        key_button_frame.pack(fill='x', pady=1)
+        self.btn_test_api = ttk.Button(key_button_frame, text=get_text('btn_test_api'), command=self.test_trans_api)
+        self.btn_del_key = ttk.Button(key_button_frame, text=get_text('btn_delete_key'), command=self.delete_trans_key)
+        self.btn_test_api.pack(side='left', fill='x', expand=True)
 
-        # Max Tokens & Save config button
+        # Max Tokens
         token_frame = ttk.Frame(ai_frame)
-        token_frame.pack(fill='x', pady=2)
-        ttk.Label(token_frame, text=get_text('lbl_tokens'), width=20).pack(side='left')
+        token_frame.pack(fill='x', pady=1)
+        ttk.Label(token_frame, text=get_text('lbl_tokens'), width=20).pack(side='left', padx=(0, 6))
         self.tokens_var = tk.StringVar(value=str(self.trans_config.get('tokens_per_chunk', '500000')))
-        ttk.Entry(token_frame, textvariable=self.tokens_var).pack(side='left')
+        ttk.Entry(token_frame, textvariable=self.tokens_var).pack(side='left', fill='x', expand=True)
         
-        ttk.Button(token_frame, text=get_text('btn_save_config'), command=self.save_trans_config).pack(side='left', padx=(20, 0))
+        ttk.Button(ai_frame, text=get_text('btn_save_config'), command=self.save_trans_config).pack(fill='x', pady=(2, 0))
 
         # Translation Options Group
-        opt_frame = ttk.LabelFrame(frame, text=get_text('grp_trans_opt'), padding=10)
-        opt_frame.pack(fill='x', pady=5)
+        opt_frame = ttk.LabelFrame(option_cols, text=get_text('grp_trans_opt'), padding=8)
+        opt_frame.grid(row=0, column=1, sticky='nsew', padx=(4, 0))
 
         # Target Language
         lang_frame = ttk.Frame(opt_frame)
-        lang_frame.pack(fill='x', pady=2)
-        ttk.Label(lang_frame, text=get_text('lbl_target_lang')).pack(side='left', padx=(0, 10))
+        lang_frame.pack(fill='x', pady=1)
+        ttk.Label(lang_frame, text=get_text('lbl_target_lang'), width=20).pack(side='left', padx=(0, 6))
         
         self.lang_var = tk.StringVar()
         self.lang_custom_var = tk.StringVar()
@@ -645,6 +660,7 @@ class SubtitleToolsApp:
         self.lang_var.trace_add("write", on_lang_change)
         
         langs = [get_text('opt_lang_zh'), get_text('opt_lang_en'), get_text('opt_lang_other')]
+        ttk.Combobox(lang_frame, textvariable=self.lang_var, values=langs, state="readonly", width=15).pack(side='left')
         target_lang = self.trans_config.get('target_language', 'Chinese')
         
         if target_lang == 'Chinese' or target_lang == '中文':
@@ -655,22 +671,22 @@ class SubtitleToolsApp:
             self.lang_var.set(get_text('opt_lang_other'))
             self.lang_custom_var.set(target_lang)
 
-        ttk.Combobox(lang_frame, textvariable=self.lang_var, values=langs, state="readonly", width=15).pack(side='left')
-
         # Checkboxes
         self.trans_search_subdirs = tk.BooleanVar(value=True)
         self.trans_skip_if_exists = tk.BooleanVar(value=True)
         self.trans_keep_orig = tk.BooleanVar(value=self.trans_config.get('keep_original', True))
         self.trans_adult_content = tk.BooleanVar(value=self.trans_config.get('adult_content', True))
+        self.trans_dubbing_optimized = tk.BooleanVar(value=self.trans_config.get('dubbing_optimized', False))
         
-        ttk.Checkbutton(opt_frame, text=get_text('chk_search_subdirs_trans'), variable=self.trans_search_subdirs).pack(anchor='w', pady=2)
-        ttk.Checkbutton(opt_frame, text=get_text('chk_skip_if_exists_trans'), variable=self.trans_skip_if_exists).pack(anchor='w', pady=2)
-        ttk.Checkbutton(opt_frame, text=get_text('chk_keep_orig'), variable=self.trans_keep_orig, command=self.on_option_toggled).pack(anchor='w', pady=2)
-        ttk.Checkbutton(opt_frame, text=get_text('chk_adult_content'), variable=self.trans_adult_content, command=self.on_option_toggled).pack(anchor='w', pady=2)
+        ttk.Checkbutton(opt_frame, text=get_text('chk_search_subdirs_trans'), variable=self.trans_search_subdirs).pack(anchor='w', pady=1)
+        ttk.Checkbutton(opt_frame, text=get_text('chk_skip_if_exists_trans'), variable=self.trans_skip_if_exists).pack(anchor='w', pady=1)
+        ttk.Checkbutton(opt_frame, text=get_text('chk_keep_orig'), variable=self.trans_keep_orig, command=self.on_option_toggled).pack(anchor='w', pady=1)
+        ttk.Checkbutton(opt_frame, text=get_text('chk_adult_content'), variable=self.trans_adult_content, command=self.on_option_toggled).pack(anchor='w', pady=1)
+        ttk.Checkbutton(opt_frame, text=get_text('chk_dubbing_optimized'), variable=self.trans_dubbing_optimized, command=self.on_option_toggled).pack(anchor='w', pady=1)
 
         # Action Buttons
-        btn_frame = ttk.Frame(frame, padding=10)
-        btn_frame.pack(fill='x', pady=5)
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill='x', pady=(2, 4))
         
         self.btn_start_trans = ttk.Button(btn_frame, text=get_text('btn_start_trans'), command=self.run_trans)
         self.btn_start_trans.pack(side='left', fill='x', expand=True, padx=(0, 5))
@@ -679,10 +695,10 @@ class SubtitleToolsApp:
         self.btn_stop_trans.pack(side='left', fill='x', expand=True, padx=(5, 0))
 
         # Log
-        log_frame = ttk.LabelFrame(frame, text=get_text('lbl_log'), padding=10)
-        log_frame.pack(fill='both', expand=True, pady=5)
+        log_frame = ttk.LabelFrame(frame, text=get_text('lbl_log'), padding=6)
+        log_frame.pack(fill='both', expand=True, pady=(0, 2))
         
-        self.trans_log = tk.Text(log_frame, height=12, state='disabled')
+        self.trans_log = tk.Text(log_frame, height=10, state='disabled')
         self.trans_log.pack(fill='both', expand=True)
         
         self.stop_event_trans = threading.Event()
@@ -711,7 +727,7 @@ class SubtitleToolsApp:
                         self.api_key_var.set(saved_key)
                     self.btn_test_api.pack_forget()
                     if not self.btn_del_key.winfo_ismapped():
-                        self.btn_del_key.pack(side='left', padx=(10, 0))
+                        self.btn_del_key.pack(side='left', fill='x', expand=True)
                 except tk.TclError:
                     pass
 
@@ -730,6 +746,13 @@ class SubtitleToolsApp:
     def on_option_toggled(self):
         self.trans_config['keep_original'] = self.trans_keep_orig.get()
         self.trans_config['adult_content'] = self.trans_adult_content.get()
+        self.trans_config['dubbing_optimized'] = self.trans_dubbing_optimized.get()
+        if hasattr(self, 'listen_keep_orig'):
+            self.listen_keep_orig.set(self.trans_keep_orig.get())
+        if hasattr(self, 'listen_adult_content'):
+            self.listen_adult_content.set(self.trans_adult_content.get())
+        if hasattr(self, 'listen_dubbing_optimized'):
+            self.listen_dubbing_optimized.set(self.trans_dubbing_optimized.get())
         logic.save_trans_config(self.trans_config)
 
     def save_trans_config(self):
@@ -737,6 +760,9 @@ class SubtitleToolsApp:
         self.trans_config['api_base_url'] = self.api_url_var.get()
         self.trans_config['model_name'] = self.model_name_var.get()
         self.trans_config['tokens_per_chunk'] = int(self.tokens_var.get())
+        self.trans_config['keep_original'] = self.trans_keep_orig.get()
+        self.trans_config['adult_content'] = self.trans_adult_content.get()
+        self.trans_config['dubbing_optimized'] = self.trans_dubbing_optimized.get()
         
         lang = self.lang_var.get()
         if lang == get_text('opt_lang_other'):
@@ -757,7 +783,7 @@ class SubtitleToolsApp:
                     pass
             self.api_key_var.set("")
             self.btn_del_key.pack_forget()
-            self.btn_test_api.pack(side='left', padx=(10, 0))
+            self.btn_test_api.pack(side='left', fill='x', expand=True)
             messagebox.showinfo("Success", get_text('msg_key_deleted'))
         except Exception as e:
             messagebox.showerror("Error", get_text('msg_key_del_warn').format(e))
@@ -782,7 +808,7 @@ class SubtitleToolsApp:
                     keyring.set_password("VR_Video_Toolbox", "deepseek_api_key", api_key)
                     def update_ui_success():
                         self.btn_test_api.pack_forget()
-                        self.btn_del_key.pack(side='left', padx=(10, 0))
+                        self.btn_del_key.pack(side='left', fill='x', expand=True)
                         messagebox.showinfo("Success", get_text('msg_api_test_success').format(response))
                     self.root.after(0, update_ui_success)
                 except Exception as e:
@@ -811,6 +837,7 @@ class SubtitleToolsApp:
             self.trans_config['target_language'] = "Chinese" if lang == get_text('opt_lang_zh') else "English"
         self.trans_config['keep_original'] = self.trans_keep_orig.get()
         self.trans_config['adult_content'] = self.trans_adult_content.get()
+        self.trans_config['dubbing_optimized'] = self.trans_dubbing_optimized.get()
 
         def task():
             start_time = time.time()
@@ -847,6 +874,224 @@ class SubtitleToolsApp:
         self.stop_event_trans.set()
         self.log(self.trans_log, get_text('msg_stop'))
         self.btn_stop_trans.config(state='disabled')
+
+    # --- One-click Listening Translation Tab ---
+    def setup_listen_tab(self):
+        frame = ttk.Frame(self.tab_listen, padding=10)
+        frame.pack(fill='both', expand=True)
+
+        info_lbl = ttk.Label(frame, text=get_text('lbl_listen_info'), wraplength=760, justify='left', foreground='dim gray')
+        info_lbl.pack(fill='x', pady=(0, 6))
+
+        # Input Directory
+        dir_frame = ttk.Frame(frame)
+        dir_frame.pack(fill='x', pady=(0, 4))
+        ttk.Label(dir_frame, text=get_text('lbl_input_dir')).pack(side='left', padx=(0, 8))
+        self.listen_dir_path = tk.StringVar()
+        ttk.Entry(dir_frame, textvariable=self.listen_dir_path).pack(side='left', fill='x', expand=True, padx=(0, 6))
+        ttk.Button(dir_frame, text=get_text('btn_browse'), command=self.browse_listen_dir).pack(side='left')
+
+        # File options
+        file_opt_frame = ttk.Frame(frame)
+        file_opt_frame.pack(fill='x', pady=(0, 4))
+
+        self.listen_search_subdirs = tk.BooleanVar(value=True)
+        self.listen_skip_if_translated = tk.BooleanVar(value=True)
+        self.listen_keep_jp_srt = tk.BooleanVar(value=False)
+
+        ttk.Checkbutton(file_opt_frame, text=get_text('chk_listen_search_videos'), variable=self.listen_search_subdirs).pack(anchor='w', pady=1)
+        ttk.Checkbutton(file_opt_frame, text=get_text('chk_skip_if_exists_trans'), variable=self.listen_skip_if_translated).pack(anchor='w', pady=1)
+        ttk.Checkbutton(file_opt_frame, text=get_text('chk_keep_jp_srt'), variable=self.listen_keep_jp_srt).pack(anchor='w', pady=1)
+
+        options_frame = ttk.Frame(frame)
+        options_frame.pack(fill='x', pady=(0, 4))
+        options_frame.grid_columnconfigure(0, weight=1, uniform='listen_opts')
+        options_frame.grid_columnconfigure(1, weight=1, uniform='listen_opts')
+
+        # Subtitle Generation Options
+        gen_frame = ttk.LabelFrame(options_frame, text=get_text('grp_listen_gen_opt'), padding=8)
+        gen_frame.grid(row=0, column=0, sticky='nsew', padx=(0, 4))
+
+        denoise_frame = ttk.Frame(gen_frame)
+        denoise_frame.pack(fill='x', pady=1)
+        ttk.Label(denoise_frame, text=get_text('lbl_denoise'), width=18).pack(side='left', padx=(0, 6))
+        self.listen_denoise_var = tk.StringVar(value=get_text('opt_mild'))
+        ttk.Combobox(
+            denoise_frame,
+            textvariable=self.listen_denoise_var,
+            values=list(self.denoise_mapping.keys()),
+            state="readonly",
+            width=24,
+        ).pack(side='left')
+
+        model_frame = ttk.Frame(gen_frame)
+        model_frame.pack(fill='x', pady=1)
+        ttk.Label(model_frame, text=get_text('lbl_model'), width=18).pack(side='left', padx=(0, 6))
+        self.listen_model_mapping = {
+            get_text('opt_kotoba'): "kotoba",
+            get_text('opt_large_v3'): "large-v3",
+            get_text('opt_large_v2'): "large-v2",
+        }
+        default_listen_model = next(
+            (label for label, key in self.listen_model_mapping.items() if key == self.model_var.get()),
+            get_text('opt_large_v3'),
+        )
+        self.listen_model_var = tk.StringVar(value=default_listen_model)
+        ttk.Combobox(
+            model_frame,
+            textvariable=self.listen_model_var,
+            values=list(self.listen_model_mapping.keys()),
+            state="readonly",
+            width=24,
+        ).pack(side='left')
+
+        # Translation Options
+        trans_frame = ttk.LabelFrame(options_frame, text=get_text('grp_trans_opt'), padding=8)
+        trans_frame.grid(row=0, column=1, sticky='nsew', padx=(4, 0))
+
+        lang_frame = ttk.Frame(trans_frame)
+        lang_frame.pack(fill='x', pady=1)
+        ttk.Label(lang_frame, text=get_text('lbl_target_lang'), width=18).pack(side='left', padx=(0, 6))
+
+        self.listen_lang_var = tk.StringVar()
+        self.listen_lang_custom_var = tk.StringVar()
+        self.listen_lang_custom_entry = ttk.Entry(lang_frame, textvariable=self.listen_lang_custom_var)
+
+        def on_lang_change(*args):
+            if self.listen_lang_var.get() == get_text('opt_lang_other'):
+                self.listen_lang_custom_entry.pack(side='left', padx=(10, 0))
+            else:
+                self.listen_lang_custom_entry.pack_forget()
+
+        self.listen_lang_var.trace_add("write", on_lang_change)
+
+        langs = [get_text('opt_lang_zh'), get_text('opt_lang_en'), get_text('opt_lang_other')]
+        ttk.Combobox(lang_frame, textvariable=self.listen_lang_var, values=langs, state="readonly", width=15).pack(side='left')
+
+        target_lang = self.trans_config.get('target_language', 'Chinese')
+        if target_lang == 'Chinese' or target_lang == '中文':
+            self.listen_lang_var.set(get_text('opt_lang_zh'))
+        elif target_lang == 'English' or target_lang == '英文':
+            self.listen_lang_var.set(get_text('opt_lang_en'))
+        else:
+            self.listen_lang_var.set(get_text('opt_lang_other'))
+            self.listen_lang_custom_var.set(target_lang)
+
+        self.listen_keep_orig = tk.BooleanVar(value=self.trans_config.get('keep_original', True))
+        self.listen_adult_content = tk.BooleanVar(value=self.trans_config.get('adult_content', True))
+        self.listen_dubbing_optimized = tk.BooleanVar(value=self.trans_config.get('dubbing_optimized', False))
+
+        ttk.Checkbutton(trans_frame, text=get_text('chk_keep_orig'), variable=self.listen_keep_orig, command=self.on_listen_option_toggled).pack(anchor='w', pady=1)
+        ttk.Checkbutton(trans_frame, text=get_text('chk_adult_content'), variable=self.listen_adult_content, command=self.on_listen_option_toggled).pack(anchor='w', pady=1)
+        ttk.Checkbutton(trans_frame, text=get_text('chk_dubbing_optimized'), variable=self.listen_dubbing_optimized, command=self.on_listen_option_toggled).pack(anchor='w', pady=1)
+
+        # Action Buttons
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill='x', pady=(2, 4))
+
+        self.btn_start_listen = ttk.Button(btn_frame, text=get_text('btn_start_listen'), command=self.run_listen)
+        self.btn_start_listen.pack(side='left', fill='x', expand=True, padx=(0, 5))
+
+        self.btn_stop_listen = ttk.Button(btn_frame, text=get_text('btn_stop'), command=self.stop_listen, state='disabled')
+        self.btn_stop_listen.pack(side='left', fill='x', expand=True, padx=(5, 0))
+
+        # Log
+        log_frame = ttk.LabelFrame(frame, text=get_text('lbl_log'), padding=6)
+        log_frame.pack(fill='both', expand=True, pady=(0, 2))
+
+        self.listen_log = tk.Text(log_frame, height=8, state='disabled')
+        self.listen_log.pack(fill='both', expand=True)
+
+        self.stop_event_listen = threading.Event()
+
+    def browse_listen_dir(self):
+        path = filedialog.askdirectory()
+        if path:
+            self.listen_dir_path.set(path)
+
+    def on_listen_option_toggled(self):
+        self.trans_config['keep_original'] = self.listen_keep_orig.get()
+        self.trans_config['adult_content'] = self.listen_adult_content.get()
+        self.trans_config['dubbing_optimized'] = self.listen_dubbing_optimized.get()
+        if hasattr(self, 'trans_keep_orig'):
+            self.trans_keep_orig.set(self.listen_keep_orig.get())
+        if hasattr(self, 'trans_adult_content'):
+            self.trans_adult_content.set(self.listen_adult_content.get())
+        if hasattr(self, 'trans_dubbing_optimized'):
+            self.trans_dubbing_optimized.set(self.listen_dubbing_optimized.get())
+        logic.save_trans_config(self.trans_config)
+
+    def _sync_listen_trans_config(self):
+        lang = self.listen_lang_var.get()
+        if lang == get_text('opt_lang_other'):
+            self.trans_config['target_language'] = self.listen_lang_custom_var.get()
+        else:
+            self.trans_config['target_language'] = "Chinese" if lang == get_text('opt_lang_zh') else "English"
+        self.trans_config['keep_original'] = self.listen_keep_orig.get()
+        self.trans_config['adult_content'] = self.listen_adult_content.get()
+        self.trans_config['dubbing_optimized'] = self.listen_dubbing_optimized.get()
+
+    def run_listen(self):
+        base_dir = self.listen_dir_path.get()
+        if not base_dir or not os.path.exists(base_dir):
+            messagebox.showerror("Error", get_text('err_dir'))
+            return
+
+        api_key = self.api_key_var.get()
+        if not api_key:
+            messagebox.showerror("Error", get_text('err_no_api_key'))
+            return
+
+        denoise_preset = self.denoise_mapping.get(self.listen_denoise_var.get(), "mild")
+        model_key = self.listen_model_mapping.get(self.listen_model_var.get(), "large-v3")
+        self._sync_listen_trans_config()
+
+        def task():
+            start_time = time.time()
+            self.log(self.listen_log, get_text('msg_start_listen'))
+            self.stop_event_listen.clear()
+            gen_holder = []
+            try:
+                logic.batch_listen_translate_srt(
+                    base_dir=base_dir,
+                    search_subdirs=self.listen_search_subdirs.get(),
+                    skip_if_translated=self.listen_skip_if_translated.get(),
+                    keep_jp_srt=self.listen_keep_jp_srt.get(),
+                    denoise_preset=denoise_preset,
+                    model_key=model_key,
+                    models_root=self.models_root,
+                    use_gpu=self.use_gpu_var.get(),
+                    api_key=api_key,
+                    config=self.trans_config,
+                    log_callback=lambda msg: self.log(self.listen_log, msg),
+                    stop_event=self.stop_event_listen,
+                    gen_holder=gen_holder,
+                )
+                if not self.stop_event_listen.is_set():
+                    self.log(self.listen_log, get_text('msg_done'))
+            except Exception as e:
+                self.log(self.listen_log, f"Error: {e}")
+            finally:
+                def cleanup_model():
+                    gen_holder.clear()
+                    gc.collect()
+                self.root.after(0, cleanup_model)
+                elapsed = time.time() - start_time
+                h = int(elapsed // 3600)
+                m = int((elapsed % 3600) // 60)
+                s = int(elapsed % 60)
+                self.log(self.listen_log, f"[System] Process completed. Total time elapsed: {h} hours, {m} minutes, {s} seconds.")
+                self.root.after(0, lambda: self.btn_start_listen.config(state='normal'))
+                self.root.after(0, lambda: self.btn_stop_listen.config(state='disabled'))
+
+        self.btn_start_listen.config(state='disabled')
+        self.btn_stop_listen.config(state='normal')
+        threading.Thread(target=task, daemon=True).start()
+
+    def stop_listen(self):
+        self.stop_event_listen.set()
+        self.log(self.listen_log, get_text('msg_stop_wait'))
+        self.btn_stop_listen.config(state='disabled')
 
     # ===============================
     # SRT to ASS Methods

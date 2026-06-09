@@ -4,6 +4,8 @@
     "tokens_per_chunk": 500000,
     "temperature": 0.5,
     "max_retries": 3,
+    "target_language": "Chinese",
     "keep_original": true,
-    "adult_content": true
+    "adult_content": true,
+    "dubbing_optimized": true
 }

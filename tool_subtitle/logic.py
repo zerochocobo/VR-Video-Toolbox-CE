@@ -1753,6 +1753,30 @@ def extract_audio(video_path: str, audio_path: str, denoise_preset: str, log_cal
 # The model is only freed when the Python interpreter exits, which CTranslate2 handles safely.
 _generator_cache: dict = {}  # key: (model_key, use_gpu) -> SubtitleGenerator
 
+
+def _get_or_create_subtitle_generator(model_key: str, models_root: str, use_gpu: bool, log_callback):
+    model_path = get_model_dir(model_key, models_root)
+    if not check_model_files(model_key, models_root):
+        log_callback(f"Error: Required model files missing in {model_path}. Please download them first.")
+        return None
+
+    cache_key = (model_key, use_gpu)
+    if cache_key in _generator_cache:
+        log_callback("Using cached ASR model...")
+        generator = _generator_cache[cache_key]
+        generator.log_callback = log_callback
+        return generator
+
+    log_callback("Initializing ASR model...")
+    try:
+        generator = SubtitleGenerator(model_path, model_key, log_callback, use_gpu)
+        _generator_cache[cache_key] = generator
+        return generator
+    except Exception as e:
+        log_callback(f"Failed to initialize model: {e}")
+        return None
+
+
 def batch_generate_srt(base_dir: str, search_subdirs: bool, skip_if_exists: bool, 
                        denoise_preset: str, model_key: str, models_root: str, 
                        use_gpu: bool, log_callback, stop_event=None, gen_holder=None):
@@ -1765,11 +1789,6 @@ def batch_generate_srt(base_dir: str, search_subdirs: bool, skip_if_exists: bool
         log_callback(f"Error: Directory not found: {base_dir}")
         return False
         
-    model_path = get_model_dir(model_key, models_root)
-    if not check_model_files(model_key, models_root):
-        log_callback(f"Error: Required model files missing in {model_path}. Please download them first.")
-        return False
-
     # Collect files
     tasks = []
     
@@ -1793,19 +1812,9 @@ def batch_generate_srt(base_dir: str, search_subdirs: bool, skip_if_exists: bool
         return True
 
     # Initialize model (use cached instance to avoid destroying CTranslate2 thread pool)
-    cache_key = (model_key, use_gpu)
-    if cache_key in _generator_cache:
-        log_callback("Using cached ASR model...")
-        generator = _generator_cache[cache_key]
-        generator.log_callback = log_callback  # update callback for this run
-    else:
-        log_callback("Initializing ASR model...")
-        try:
-            generator = SubtitleGenerator(model_path, model_key, log_callback, use_gpu)
-            _generator_cache[cache_key] = generator
-        except Exception as e:
-            log_callback(f"Failed to initialize model: {e}")
-            return False
+    generator = _get_or_create_subtitle_generator(model_key, models_root, use_gpu, log_callback)
+    if generator is None:
+        return False
 
     total_tasks = len(tasks)
     for task_idx, filepath in enumerate(tasks, start=1):
@@ -1858,7 +1867,8 @@ DEFAULT_TRANS_CONFIG = {
     "max_retries": 3,
     "target_language": "Chinese",
     "keep_original": True,
-    "adult_content": True
+    "adult_content": True,
+    "dubbing_optimized": False
 }
 
 DEFAULT_PROMPT = """\
@@ -1884,7 +1894,7 @@ def load_trans_config():
     config = dict(DEFAULT_TRANS_CONFIG)
     if os.path.exists(config_file):
         try:
-            with open(config_file, "r", encoding="utf-8") as f:
+            with open(config_file, "r", encoding="utf-8-sig") as f:
                 config.update(json.load(f))
         except Exception as e:
             print(f"Error loading trans config: {e}")
@@ -2010,11 +2020,12 @@ def deobfuscate_ids(response: str, mapping: dict) -> dict:
             results[mapping[tag_id]] = text.strip()
     return results
 
-def _load_prompt_template(adult_content: bool = True) -> str:
-    prompt_file = os.path.join(get_config_dir(), "translate_prompt.txt")
+def _load_prompt_template(adult_content: bool = True, dubbing_optimized: bool = False) -> str:
+    prompt_name = "translate_prompt_dubbing.txt" if dubbing_optimized else "translate_prompt.txt"
+    prompt_file = os.path.join(get_config_dir(), prompt_name)
     template = DEFAULT_PROMPT
     if os.path.isfile(prompt_file):
-        with open(prompt_file, encoding="utf-8") as f:
+        with open(prompt_file, encoding="utf-8-sig") as f:
             template = f.read()
             
     if not adult_content:
@@ -2057,8 +2068,8 @@ def _translate_chunk(client: LLMClient, chunk: dict, lang: str, template: str, m
 
 def translate_entries(client: LLMClient, entries: dict, lang: str,
                       tokens_per_chunk: int, keep_original: bool, adult_content: bool,
-                      max_retries: int, log_callback, stop_event) -> dict:
-    template = _load_prompt_template(adult_content)
+                      dubbing_optimized: bool, max_retries: int, log_callback, stop_event) -> dict:
+    template = _load_prompt_template(adult_content, dubbing_optimized)
     chunks = split_into_chunks(entries, tokens_per_chunk)
     log_callback(f"[INFO] Total chunks: {len(chunks)}")
 
@@ -2091,17 +2102,52 @@ def translate_entries(client: LLMClient, entries: dict, lang: str,
 
     return entries
 
+
+def _translate_srt_path(src_path: Path, out_path: Path, client: LLMClient, config: dict, log_callback, stop_event=None) -> bool:
+    target_lang = config["target_language"]
+    tokens_per_chunk = int(config["tokens_per_chunk"])
+    keep_original = config.get("keep_original", True)
+    adult_content = config.get("adult_content", True)
+    dubbing_optimized = config.get("dubbing_optimized", False)
+    max_retries = int(config.get("max_retries", 3))
+
+    log_callback(f"[INFO] Translating: {src_path.name}")
+    try:
+        with open(src_path, "r", encoding="utf-8-sig") as f:
+            srt_data = f.read()
+
+        entries = parse_srt(srt_data)
+        entries = translate_entries(
+            client,
+            entries,
+            target_lang,
+            tokens_per_chunk,
+            keep_original,
+            adult_content,
+            dubbing_optimized,
+            max_retries,
+            log_callback,
+            stop_event,
+        )
+
+        if stop_event and stop_event.is_set():
+            return False
+
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(render_srt(entries))
+        log_callback(f"[INFO] Written: {out_path.name}")
+        return True
+    except Exception as e:
+        log_callback(f"[ERROR] Failed to translate {src_path.name}: {e}")
+        return False
+
+
 def batch_translate_srt(base_dir: str, search_subdirs: bool, skip_if_exists: bool, api_key: str, config: dict, log_callback, stop_event=None):
     if not os.path.exists(base_dir):
         log_callback(f"Error: Directory not found: {base_dir}")
         return False
         
     client = LLMClient(config["api_base_url"], api_key, config["model_name"], config.get("temperature", 0.5))
-    target_lang = config["target_language"]
-    tokens_per_chunk = int(config["tokens_per_chunk"])
-    keep_original = config.get("keep_original", True)
-    adult_content = config.get("adult_content", True)
-    max_retries = int(config.get("max_retries", 3))
 
     # Collect .jp.srt files
     tasks = []
@@ -2135,24 +2181,119 @@ def batch_translate_srt(base_dir: str, search_subdirs: bool, skip_if_exists: boo
             log_callback(f"[INFO] Skipping {src_path.name}: Output SRT already exists. (取消勾选“忽略已存在翻译”复选框可重新生成)")
             continue
             
-        log_callback(f"[INFO] Translating: {src_path.name}")
-        try:
-            with open(src_path, "r", encoding="utf-8") as f:
-                srt_data = f.read()
-
-            entries = parse_srt(srt_data)
-            entries = translate_entries(
-                client, entries, target_lang, tokens_per_chunk, keep_original, adult_content, max_retries, log_callback, stop_event
-            )
-            
-            if not (stop_event and stop_event.is_set()):
-                with open(out_path, "w", encoding="utf-8") as f:
-                    f.write(render_srt(entries))
-                log_callback(f"[INFO] Written: {out_path.name}")
-        except Exception as e:
-            log_callback(f"[ERROR] Failed to translate {src_path.name}: {e}")
+        _translate_srt_path(src_path, out_path, client, config, log_callback, stop_event)
 
     log_callback(f"[INFO] Batch Translation Completed. API usage — input: {client.input_tokens} tokens, output: {client.output_tokens} tokens")
+    return True
+
+
+def _collect_listen_translate_videos(base_dir: str, search_subdirs: bool, log_callback) -> list[Path] | None:
+    tasks = []
+    if search_subdirs:
+        for root, _, files in os.walk(base_dir):
+            for file in files:
+                filepath = Path(root) / file
+                if filepath.is_file() and is_subtitle_video_candidate(filepath):
+                    tasks.append(filepath)
+    else:
+        try:
+            for file in os.listdir(base_dir):
+                filepath = Path(base_dir) / file
+                if filepath.is_file() and is_subtitle_video_candidate(filepath):
+                    tasks.append(filepath)
+        except Exception as e:
+            log_callback(f"Error reading directory: {e}")
+            return None
+    return tasks
+
+
+def batch_listen_translate_srt(base_dir: str, search_subdirs: bool, skip_if_translated: bool,
+                               keep_jp_srt: bool, denoise_preset: str, model_key: str,
+                               models_root: str, use_gpu: bool, api_key: str, config: dict,
+                               log_callback, stop_event=None, gen_holder=None):
+    if not os.path.exists(base_dir):
+        log_callback(f"Error: Directory not found: {base_dir}")
+        return False
+
+    tasks = _collect_listen_translate_videos(base_dir, search_subdirs, log_callback)
+    if tasks is None:
+        return False
+
+    if not tasks:
+        log_callback("No valid video files found.")
+        return True
+
+    pending = []
+    for filepath in tasks:
+        jp_srt_file = filepath.with_name(f"{filepath.stem}.jp.srt")
+        out_srt_file = filepath.with_name(f"{filepath.stem}.srt")
+        if skip_if_translated and out_srt_file.exists():
+            log_callback(f"[INFO] Skipping {filepath.name}: Output SRT already exists.")
+            continue
+        pending.append((filepath, jp_srt_file, out_srt_file))
+
+    if not pending:
+        log_callback("[INFO] No videos need one-click listening translation.")
+        return True
+
+    generator = None
+    needs_transcription = any(not jp_srt_file.exists() for _, jp_srt_file, _ in pending)
+    if needs_transcription:
+        if not check_ffmpeg():
+            log_callback("[!] Error: ffmpeg or ffprobe not found. Please refer to '说明.txt' or 'readme.txt' for installation steps.")
+            return False
+        generator = _get_or_create_subtitle_generator(model_key, models_root, use_gpu, log_callback)
+        if generator is None:
+            return False
+
+    client = LLMClient(config["api_base_url"], api_key, config["model_name"], config.get("temperature", 0.5))
+    total_tasks = len(pending)
+
+    for task_idx, (filepath, jp_srt_file, out_srt_file) in enumerate(pending, start=1):
+        if stop_event and stop_event.is_set():
+            log_callback("Process stopped by user.")
+            break
+
+        log_callback(f"[{task_idx}/{total_tasks}] One-click listening translation: {filepath.name}")
+
+        if not jp_srt_file.exists():
+            audio_file = filepath.with_name(f"{filepath.stem}.asr.wav")
+            if not extract_audio(str(filepath), str(audio_file), denoise_preset, log_callback, stop_event):
+                continue
+
+            if stop_event and stop_event.is_set():
+                break
+
+            log_callback("Transcription started...")
+            try:
+                generator.transcribe(str(audio_file), str(jp_srt_file))
+                log_callback(f"[{task_idx}/{total_tasks}] Transcription complete.")
+            except Exception as e:
+                log_callback(f"Transcription failed: {e}")
+                continue
+        else:
+            log_callback(f"[INFO] Using existing Japanese subtitle: {jp_srt_file.name}")
+
+        if stop_event and stop_event.is_set():
+            break
+
+        if not jp_srt_file.exists():
+            log_callback(f"[WARN] Japanese subtitle missing after transcription: {jp_srt_file.name}")
+            continue
+
+        if skip_if_translated and out_srt_file.exists():
+            log_callback(f"[INFO] Skipping translation for {jp_srt_file.name}: Output SRT already exists.")
+            continue
+
+        translated = _translate_srt_path(jp_srt_file, out_srt_file, client, config, log_callback, stop_event)
+        if translated and not keep_jp_srt:
+            try:
+                jp_srt_file.unlink()
+                log_callback(f"[INFO] Removed Japanese subtitle: {jp_srt_file.name}")
+            except Exception as e:
+                log_callback(f"[WARN] Could not remove Japanese subtitle {jp_srt_file.name}: {e}")
+
+    log_callback(f"[INFO] One-click Listening Translation Completed. API usage — input: {client.input_tokens} tokens, output: {client.output_tokens} tokens")
     return True
 
 # ===============================
