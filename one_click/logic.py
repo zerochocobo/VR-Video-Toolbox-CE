@@ -341,6 +341,91 @@ def _remove_file_quiet(path: str | Path | None, log_callback=None) -> None:
         pass
 
 
+def _cut_subrange_keyframe(input_path: str, output_path: str,
+                           start_sec: float | None, end_sec: float | None,
+                           log_callback=None, process_callback=None) -> None:
+    """Fast keyframe-aligned subrange cut preserving both video and audio.
+
+    Uses input-side ``-ss`` plus ``-c copy`` so this is essentially I/O bound:
+    a one-minute 4K HEVC clip finishes in a few seconds, no NVENC/NVDEC load.
+    The trade-off is that the output aligns to the nearest preceding keyframe
+    of the source, so the actual start/duration can drift a few seconds from
+    what the user requested. The UI surfaces this to the user next to the
+    end-time input so the drift is not mistaken for a bug.
+
+    Both video and audio streams are copied unchanged, so the pre-clip
+    carries the full audio track that the rest of the OneClick pipeline
+    relies on. This pre-cut is also why audio survives all downstream mux
+    hops in source-scan / native-stream / legacy fallback.
+    """
+    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-stats", "-y"]
+    # -ss before -i: input-side seek, snaps to nearest preceding keyframe.
+    if start_sec is not None and start_sec > 0.0:
+        cmd += ["-ss", f"{float(start_sec):.6f}"]
+    cmd += ["-i", str(input_path)]
+    if end_sec is not None:
+        duration = max(0.001, float(end_sec) - float(start_sec or 0.0))
+        cmd += ["-t", f"{duration:.6f}"]
+    cmd += [
+        "-map", "0:v:0",
+        "-map", "0:a?",
+        "-c", "copy",
+        "-avoid_negative_ts", "make_zero",
+        str(output_path),
+    ]
+    if log_callback:
+        log_callback(
+            f"[preclip] keyframe cut "
+            f"{start_sec if start_sec is not None else 'START'}->"
+            f"{end_sec if end_sec is not None else 'END'} -> {output_path}"
+        )
+    run_process(cmd, log_callback, process_callback)
+
+
+def _prepare_subrange_preclip(input_file: str, output_dir: str,
+                              start_time, end_time,
+                              log_callback=None, process_callback=None) -> tuple[str, str | None]:
+    """If start/end are set, pre-cut the source once with audio preserved and
+    return (new_input_file, preclip_path_for_cleanup). Otherwise return the
+    original input and None.
+
+    The pre-clip is named ``<source_stem>_S<ss>_E<to><source_ext>`` and placed
+    in ``output_dir`` (same folder as the final output). Using the source's
+    original extension keeps ``-c copy`` always valid. The rest of the
+    OneClick pipeline (source-scan / native-stream / legacy fallback) then
+    runs against this clipped file as if no start/end had been requested,
+    eliminating the legacy ``start_time/end_time`` code path that used to
+    silently drop audio across split/lada/merge mux hops.
+    """
+    if not (start_time or end_time):
+        return input_file, None
+    start_sec = _time_to_sec(start_time)
+    end_sec = _time_to_sec(end_time)
+    src_stem, src_ext = os.path.splitext(os.path.basename(input_file))
+    src_ext = src_ext or ".mp4"
+    ss_part = start_time.replace(":", "") if start_time else "START"
+    to_part = end_time.replace(":", "") if end_time else "END"
+    suffix = f"_S{ss_part}_E{to_part}"
+    os.makedirs(output_dir, exist_ok=True)
+    preclip_path = os.path.join(output_dir, f"{src_stem}{suffix}{src_ext}")
+    if os.path.exists(preclip_path):
+        if log_callback:
+            log_callback(f"[preclip] reusing existing preclip: {preclip_path}")
+    else:
+        _cut_subrange_keyframe(
+            input_file, preclip_path, start_sec, end_sec,
+            log_callback=log_callback, process_callback=process_callback,
+        )
+        if log_callback:
+            try:
+                size_mb = os.path.getsize(preclip_path) / (1024 * 1024)
+                log_callback(f"[preclip] done: {preclip_path} ({size_mb:.1f} MB)")
+            except OSError:
+                log_callback(f"[preclip] done: {preclip_path}")
+    return preclip_path, preclip_path
+
+
 def _cleanup_run_artifacts(input_file: str, final_output: str | None = None,
                            process_log_path: str | None = None,
                            log_callback=None) -> None:
@@ -2628,6 +2713,7 @@ def run_single_file_pipeline(input_file, start_time, end_time, use_fisheye, keep
     log_callback = process_logger
     cleanup_success_artifacts = False
     cleanup_final_output = None
+    preclip_path: str | None = None
     try:
         directory = os.path.dirname(input_file)
         filename = os.path.splitext(os.path.basename(input_file))[0]
@@ -2664,6 +2750,19 @@ def run_single_file_pipeline(input_file, start_time, end_time, use_fisheye, keep
         )
         pre_extract_enabled = _pre_extract_supported(pre_extract, log_callback)
         source_scan_enabled = _source_scan_supported(source_scan, log_callback)
+
+        # When start/end is set, pre-cut once with -c copy so the whole
+        # downstream pipeline (source-scan / native-stream / legacy fallback)
+        # runs against a self-contained clipped file that already carries the
+        # audio track. This bypasses the legacy start_time/end_time code path
+        # in which audio was silently lost across split/lada/merge mux hops.
+        input_file, preclip_path = _prepare_subrange_preclip(
+            input_file, directory, start_time, end_time,
+            log_callback=log_callback, process_callback=process_callback,
+        )
+        if preclip_path is not None:
+            start_time = None
+            end_time = None
 
         if source_scan_enabled:
             result = _run_source_scan_branch(
@@ -2753,6 +2852,8 @@ def run_single_file_pipeline(input_file, start_time, end_time, use_fisheye, keep
         if log_callback: log_callback(f"Error: {e}")
         raise e
     finally:
+        if preclip_path is not None and not keep_intermediate:
+            _remove_file_quiet(preclip_path, log_callback=log_callback)
         process_logger.close()
         if cleanup_success_artifacts and not keep_intermediate:
             _cleanup_run_artifacts(
@@ -2770,6 +2871,7 @@ def run_single_eye_pipeline(input_file, eye_mode, start_time, end_time, use_fish
     log_callback = process_logger
     cleanup_success_artifacts = False
     cleanup_final_output = None
+    preclip_path: str | None = None
     try:
         directory = os.path.dirname(input_file)
         filename = os.path.splitext(os.path.basename(input_file))[0]
@@ -2806,6 +2908,16 @@ def run_single_eye_pipeline(input_file, eye_mode, start_time, end_time, use_fish
         split_max_kbps = _bitrate_bps_to_kbps(split_max_bps)
         pre_extract_enabled = _pre_extract_supported(pre_extract, log_callback)
         source_scan_enabled = _source_scan_supported(source_scan, log_callback)
+
+        # See run_single_file_pipeline: pre-cut once with -c copy so audio
+        # survives all downstream mux hops.
+        input_file, preclip_path = _prepare_subrange_preclip(
+            input_file, directory, start_time, end_time,
+            log_callback=log_callback, process_callback=process_callback,
+        )
+        if preclip_path is not None:
+            start_time = None
+            end_time = None
 
         if source_scan_enabled:
             result = _run_source_scan_branch(
@@ -2904,6 +3016,8 @@ def run_single_eye_pipeline(input_file, eye_mode, start_time, end_time, use_fish
         if log_callback: log_callback(f"Error: {e}")
         raise e
     finally:
+        if preclip_path is not None and not keep_intermediate:
+            _remove_file_quiet(preclip_path, log_callback=log_callback)
         process_logger.close()
         if cleanup_success_artifacts and not keep_intermediate:
             _cleanup_run_artifacts(

@@ -174,6 +174,7 @@
       "lbl_dir": "Input Directory:",
       "lbl_start": "Start Time (HH:MM:SS):",
       "lbl_end": "End Time (HH:MM:SS):",
+      "lbl_end_hint": "(keyframe fast cut, a few seconds drift)",
       "lbl_eye": "Select Eye:",
       "lbl_left": "Left File:",
       "lbl_right": "Right File:",

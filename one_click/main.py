@@ -221,8 +221,11 @@ class VRMosaicOneClickApp:
         
         ttk.Label(tab, text=get_text('lbl_end')).grid(row=2, column=0, padx=5, pady=5, sticky='w')
         self.s_auto_end = tk.StringVar()
-        ttk.Entry(tab, textvariable=self.s_auto_end, validate='key', validatecommand=vcmd).grid(row=2, column=1, sticky='w', padx=5)
-        
+        end_frame_s_auto = ttk.Frame(tab)
+        end_frame_s_auto.grid(row=2, column=1, sticky='w', padx=5)
+        ttk.Entry(end_frame_s_auto, textvariable=self.s_auto_end, validate='key', validatecommand=vcmd).pack(side='left')
+        ttk.Label(end_frame_s_auto, text=get_text('lbl_end_hint'), foreground='gray').pack(side='left', padx=(8, 0))
+
         self.s_auto_fisheye = tk.BooleanVar()
         self.s_auto_pre_extract = tk.BooleanVar(value=True)
         self.s_auto_fine_conf = tk.StringVar(value=_DEFAULT_FINE_CONF)
@@ -334,8 +337,11 @@ class VRMosaicOneClickApp:
         
         ttk.Label(tab, text=get_text('lbl_end')).grid(row=3, column=0, padx=5, pady=5, sticky='w')
         self.s_eye_end = tk.StringVar()
-        ttk.Entry(tab, textvariable=self.s_eye_end, validate='key', validatecommand=vcmd).grid(row=3, column=1, sticky='w', padx=5)
-        
+        end_frame_s_eye = ttk.Frame(tab)
+        end_frame_s_eye.grid(row=3, column=1, sticky='w', padx=5)
+        ttk.Entry(end_frame_s_eye, textvariable=self.s_eye_end, validate='key', validatecommand=vcmd).pack(side='left')
+        ttk.Label(end_frame_s_eye, text=get_text('lbl_end_hint'), foreground='gray').pack(side='left', padx=(8, 0))
+
         self.s_eye_fisheye = tk.BooleanVar()
         self.s_eye_pre_extract = tk.BooleanVar(value=True)
         self.s_eye_fine_conf = tk.StringVar(value=_DEFAULT_FINE_CONF)
