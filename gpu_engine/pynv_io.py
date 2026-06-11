@@ -97,6 +97,85 @@ def _keyframe_times_for_path(src: Path) -> tuple[float, ...]:
     return _ffprobe_keyframe_times_cached(str(path), int(stat.st_mtime_ns), int(stat.st_size))
 
 
+def _frame_timestamp_int(frame: dict, *names: str) -> int | None:
+    for name in names:
+        value = frame.get(name)
+        if value in (None, "", "N/A"):
+            continue
+        try:
+            return int(value)
+        except Exception:
+            continue
+    return None
+
+
+@functools.lru_cache(maxsize=64)
+def _ffprobe_first_frame_pts_cached(path: str, mtime_ns: int, size: int) -> int | None:
+    ffprobe = shutil.which("ffprobe") or "ffprobe"
+    cmd = [
+        ffprobe,
+        "-hide_banner", "-v", "error",
+        "-select_streams", "v:0",
+        "-read_intervals", "%+#1",
+        "-show_frames",
+        "-show_entries", "frame=pts,best_effort_timestamp",
+        "-of", "json",
+        path,
+    ]
+    try:
+        raw = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, **_hidden_subprocess_kwargs())
+        data = json.loads(raw)
+    except Exception:
+        return None
+    for frame in data.get("frames", []):
+        pts = _frame_timestamp_int(frame, "best_effort_timestamp", "pts")
+        if pts is not None and pts >= 0:
+            return pts
+    return None
+
+
+def _first_frame_pts_for_path(src: Path) -> int | None:
+    try:
+        path = Path(src).resolve()
+        stat = path.stat()
+    except OSError:
+        return None
+    return _ffprobe_first_frame_pts_cached(str(path), int(stat.st_mtime_ns), int(stat.st_size))
+
+
+def _pts_match_tolerance_from_probe(
+    probe: "PyNvSimpleDecoder",
+    frame_idx: int,
+    expected_pts: int,
+    total_frames: int,
+) -> int:
+    """Allow small timestamp residuals without accepting a whole-frame mismatch."""
+    neighbors: list[int] = []
+    idx = int(frame_idx)
+    total = int(total_frames)
+    if idx + 1 < total:
+        neighbors.append(idx + 1)
+    if idx - 1 >= 0:
+        neighbors.append(idx - 1)
+
+    steps: list[int] = []
+    for neighbor in neighbors:
+        try:
+            frame = probe.frame_at(neighbor)
+            pts = int(getattr(frame, "pts", -1))
+        except Exception:
+            continue
+        step = abs(pts - int(expected_pts))
+        if step > 0:
+            steps.append(step)
+    if not steps:
+        return 0
+    frame_step = min(steps)
+    if frame_step < 10:
+        return 0
+    return max(1, int(round(frame_step * 0.10)))
+
+
 def _threaded_decoder_preroll_frame(
     src: Path,
     target_frame: int,
@@ -473,20 +552,38 @@ class PyNvThreadedSerialDecoder:
         # frames, this PTS check catches any remaining seek/state mismatch before
         # wrong content is encoded downstream.
         self._expected_first_pts: int | None = None
+        self._pts_origin_delta = 0
+        self._threaded_pts_delta = 0
+        self._pts_match_tolerance = 0
         self._preroll_pts_to_frame: dict[int, int] = {}
         probe = PyNvSimpleDecoder(self.src, gpu_id=self.gpu_id, bit_depth=self.bit_depth)
         try:
             self.info = probe.info
             self._len = len(probe)
             self._decode_start_frame = self.start_frame
+            try:
+                simple_origin = int(getattr(probe.frame_at(0), "pts", -1))
+            except Exception:
+                simple_origin = -1
+            stream_origin = _first_frame_pts_for_path(self.src)
+            if simple_origin >= 0 and stream_origin is not None:
+                self._pts_origin_delta = int(stream_origin) - simple_origin
+                self._threaded_pts_delta = self._pts_origin_delta
             if 0 < self.start_frame < self._len:
                 try:
                     probe_frame = probe.frame_at(self.start_frame)
                     pts_value = int(getattr(probe_frame, "pts", -1))
                     if pts_value >= 0:
                         self._expected_first_pts = pts_value
+                        self._pts_match_tolerance = _pts_match_tolerance_from_probe(
+                            probe,
+                            self.start_frame,
+                            pts_value,
+                            self._len,
+                        )
                 except Exception:
                     self._expected_first_pts = None
+                    self._pts_match_tolerance = 0
                 self._decode_start_frame = _threaded_decoder_preroll_frame(
                     self.src,
                     self.start_frame,
@@ -575,7 +672,15 @@ class PyNvThreadedSerialDecoder:
             actual_pts = int(get_pts())
         except Exception:
             return
-        actual_frame = self._preroll_pts_to_frame.get(actual_pts)
+        actual_frame = None
+        if self._pts_origin_delta:
+            actual_frame = self._preroll_pts_to_frame.get(actual_pts - self._pts_origin_delta)
+            if actual_frame is not None:
+                self._threaded_pts_delta = self._pts_origin_delta
+        if actual_frame is None:
+            actual_frame = self._preroll_pts_to_frame.get(actual_pts)
+            if actual_frame is not None:
+                self._threaded_pts_delta = 0
         if actual_frame is None:
             return
         if actual_frame < self._decode_start_frame:
@@ -597,13 +702,21 @@ class PyNvThreadedSerialDecoder:
             return
         if actual == self._expected_first_pts:
             return
+        normalized = actual - self._threaded_pts_delta
+        if normalized == self._expected_first_pts:
+            return
+        normalized_delta = normalized - self._expected_first_pts
+        if self._pts_match_tolerance > 0 and abs(normalized_delta) <= self._pts_match_tolerance:
+            return
         # PTS diff can hint at the keyframe distance (90kHz timebase: 1s = 90000;
         # ms timebase: 1s = 1000). Surface the raw delta and let logs disambiguate.
         delta = actual - self._expected_first_pts
         raise RuntimeError(
             "PyNvThreadedSerialDecoder NVDEC seek check failed: "
             f"start_frame={self.start_frame}, expected_pts={self._expected_first_pts}, "
-            f"got_pts={actual} (delta={delta}), decode_start_frame="
+            f"got_pts={actual} (delta={delta}, normalized_delta={normalized_delta}, "
+            f"pts_origin_delta={self._threaded_pts_delta}, pts_tolerance={self._pts_match_tolerance}), "
+            f"decode_start_frame="
             f"{getattr(self, '_decode_start_frame', self.start_frame)}. "
             "Likely decoder seek/pre-roll mismatch or concurrent NVDEC/CUDA "
             "pollution; serialize NVDEC use and keep threaded decode starts "

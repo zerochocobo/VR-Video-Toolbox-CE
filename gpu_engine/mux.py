@@ -7,9 +7,11 @@ information is preserved end to end.
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from .probe import ColorMetadata
@@ -87,6 +89,121 @@ def should_use_faststart(candidate_size_bytes: int | None = None, mode: object |
 
 def faststart_args(candidate_size_bytes: int | None = None, mode: object | None = None) -> list[str]:
     return ["-movflags", "+faststart"] if should_use_faststart(candidate_size_bytes, mode) else []
+
+
+def _has_audio_stream(path: str | Path) -> bool:
+    ffprobe = shutil.which("ffprobe") or "ffprobe"
+    cmd = [
+        ffprobe,
+        "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=index",
+        "-of", "csv=p=0",
+        str(path),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **_hidden_kwargs(),
+        )
+    except Exception:
+        return False
+    return proc.returncode == 0 and bool((proc.stdout or "").strip())
+
+
+def _restore_audio_from_source(
+    video_mp4: Path,
+    audio_source: str | Path,
+    *,
+    audio_start_sec: float | None = None,
+    audio_duration: float | None = None,
+    faststart: object | None = None,
+    log_callback=None,
+) -> None:
+    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    video_mp4 = Path(video_mp4)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f"{video_mp4.stem}.video_only.",
+        suffix=video_mp4.suffix,
+        dir=str(video_mp4.parent),
+    )
+    try:
+        os.close(fd)
+    except Exception:
+        pass
+    Path(temp_name).unlink(missing_ok=True)
+    temp_video = Path(temp_name)
+    video_mp4.replace(temp_video)
+
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-stats", "-y", "-i", str(temp_video)]
+    if audio_start_sec and audio_start_sec > 0.001:
+        cmd += ["-ss", f"{audio_start_sec:.3f}"]
+    if audio_duration and audio_duration > 0:
+        cmd += ["-t", f"{audio_duration:.3f}"]
+    cmd += [
+        "-i", str(audio_source),
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "copy",
+    ]
+    size_hint = temp_video.stat().st_size if temp_video.exists() else None
+    cmd += faststart_args(size_hint, faststart)
+    cmd += [str(video_mp4)]
+    if log_callback:
+        log_callback("[mux] output has no audio; retrying source-audio remux without -shortest")
+        log_callback(f"[mux] {' '.join(cmd)}")
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        **_hidden_kwargs(),
+    )
+    if proc.returncode != 0:
+        try:
+            if video_mp4.exists():
+                video_mp4.unlink()
+            temp_video.replace(video_mp4)
+        except OSError:
+            pass
+        raise RuntimeError(f"ffmpeg audio restore failed (code {proc.returncode}): {proc.stdout}")
+    try:
+        temp_video.unlink()
+    except OSError:
+        pass
+
+
+def _ensure_output_audio(
+    out_path: Path,
+    audio_source: str | Path,
+    *,
+    audio_start_sec: float | None = None,
+    audio_duration: float | None = None,
+    faststart: object | None = None,
+    log_callback=None,
+) -> None:
+    if _has_audio_stream(out_path):
+        return
+    if not _has_audio_stream(audio_source):
+        return
+    _restore_audio_from_source(
+        out_path,
+        audio_source,
+        audio_start_sec=audio_start_sec,
+        audio_duration=audio_duration,
+        faststart=faststart,
+        log_callback=log_callback,
+    )
+    if not _has_audio_stream(out_path):
+        raise RuntimeError(f"ffmpeg mux produced no audio stream after source-audio restore: {out_path}")
 
 
 def mux_hevc_with_audio(
@@ -171,3 +288,12 @@ def mux_hevc_with_audio(
     )
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg mux failed (code {proc.returncode}): {proc.stdout}")
+    if has_audio:
+        _ensure_output_audio(
+            final_out,
+            audio_source,
+            audio_start_sec=audio_start_sec,
+            audio_duration=audio_duration,
+            faststart=faststart,
+            log_callback=log_callback,
+        )

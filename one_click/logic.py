@@ -830,6 +830,7 @@ class PreExtractResult:
     NO_MOSAIC = "no_mosaic"
     SCAN_FAILED = "scan_failed"
     CANCELLED = "cancelled"
+    BYPASS_CROP = "bypass_crop"
 
 
 def _pre_extract_supported(pre_extract, log_callback=None) -> bool:
@@ -1088,6 +1089,46 @@ def _segment_frame_bounds(seg, fps: float) -> tuple[int, int]:
     start = max(0, int(round(float(seg.start_s) * fps)))
     end = max(start + 1, int(round(float(seg.end_s) * fps)))
     return start, end
+
+
+def _pre_extract_bypass_crop_area_threshold() -> float:
+    default = 1.0 / 3.0
+    try:
+        value = app_config.get("pre_extract_bypass_crop_area_ratio", default)
+        threshold = float(default if value is None else value)
+    except (TypeError, ValueError):
+        threshold = default
+    return threshold
+
+
+def _paired_pre_extract_should_bypass_crop(left_segments, right_segments,
+                                           eye_w: int, eye_h: int,
+                                           *, use_fisheye: bool = False,
+                                           log_callback=None) -> bool:
+    threshold = _pre_extract_bypass_crop_area_threshold()
+    if threshold <= 0.0:
+        return False
+    eye_area = max(1, int(eye_w) * int(eye_h))
+    best = None
+    for side_name, side_segments in (("L", left_segments), ("R", right_segments)):
+        for seg in side_segments:
+            area = max(0, int(seg.w)) * max(0, int(seg.h))
+            ratio = float(area) / float(eye_area)
+            if best is None or ratio > best["ratio"]:
+                best = {"side": side_name, "seg": seg, "ratio": ratio, "area": area}
+    if best is None or float(best["ratio"]) <= threshold:
+        return False
+    seg = best["seg"]
+    if log_callback:
+        space_note = " fisheye-space area estimate;" if use_fisheye else ""
+        log_callback(
+            "[source-scan] paired fine crop bypassed for this segment: "
+            f"side={best['side']} seg={int(seg.seg_id)} "
+            f"ratio={float(best['ratio']):.3f} threshold={threshold:.3f} "
+            f"rect={int(seg.x)},{int(seg.y)},{int(seg.w)}x{int(seg.h)} "
+            f"eye={int(eye_w)}x{int(eye_h)};{space_note} using full-eye restore path"
+        )
+    return True
 
 
 def _paired_segment_cache_key(seg, fps: float) -> str:
@@ -1412,6 +1453,17 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
     paste_segments = []
     meta = gpu_probe.probe_video(base_clip)
     fps = meta.source_fps or 30.0
+    eye_w = int(meta.width // 2)
+    eye_h = int(meta.height)
+    if _paired_pre_extract_should_bypass_crop(
+        left_segments,
+        right_segments,
+        eye_w,
+        eye_h,
+        use_fisheye=use_fisheye,
+        log_callback=log_callback,
+    ):
+        return PreExtractResult.BYPASS_CROP
 
     save_segments_json(
         left_segments,
@@ -1425,7 +1477,6 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
         source=base_clip,
         fps=fps,
     )
-    eye_w = int(meta.width // 2)
     rect_source_bitrate = int(original_bitrate or meta.bitrate_bps or 0)
     final_source_bitrate = int(original_bitrate or meta.bitrate_bps or 0)
     bitrate_bps = _resolve_pipeline_bitrate(
@@ -2159,7 +2210,22 @@ def _run_source_scan_branch(input_file, final_output, *, use_fisheye: bool,
                         )
                         if paired_result == PreExtractResult.CANCELLED:
                             raise OperationCancelled("cancelled by user")
-                        if paired_result == PreExtractResult.SCAN_FAILED:
+                        elif paired_result == PreExtractResult.BYPASS_CROP:
+                            if log_callback:
+                                log_callback("[source-scan] paired fine crop bypass applies only to this timeline segment")
+                            _process_sbs_clip_to_output(
+                                str(entry.path),
+                                str(restored),
+                                use_fisheye=use_fisheye,
+                                pre_extract_inner=False,
+                                keep_intermediate=keep_intermediate,
+                                original_bitrate=original_bitrate,
+                                keep_original_bitrate=keep_original_bitrate,
+                                log_callback=log_callback,
+                                process_callback=process_callback,
+                                fine_conf=fine_conf,
+                            )
+                        elif paired_result == PreExtractResult.SCAN_FAILED:
                             if log_callback:
                                 log_callback("[source-scan] paired fine path failed; falling back to full-eye restore")
                             _process_sbs_clip_to_output(

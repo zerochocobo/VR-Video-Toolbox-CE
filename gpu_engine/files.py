@@ -410,6 +410,7 @@ def process_video(
     mux.mux_hevc_with_audio(
         raw, dst, fps=meta.source_fps, color=meta.color,
         audio_source=str(src) if keep_audio else None,
+        log_callback=log_callback,
     )
     try:
         raw.unlink()
@@ -622,6 +623,7 @@ def process_video_multi(
             st["raw"], Path(st["job"]["dst"]), fps=meta.source_fps, color=meta.color,
             audio_source=str(src) if keep_audio else None,
             audio_start_sec=audio_start, audio_duration=audio_dur,
+            log_callback=log_callback,
         )
         try:
             st["raw"].unlink()
@@ -781,8 +783,15 @@ def combine_video(
             pass
         raise OperationCancelled("cancelled by user")
 
-    mux.mux_hevc_with_audio(raw, dst, fps=meta.source_fps, color=meta.color,
-                            audio_source=str(src_a) if keep_audio else None)
+    mux.mux_hevc_with_audio(
+        raw,
+        dst,
+        fps=meta.source_fps,
+        color=meta.color,
+        audio_source=str(src_a) if keep_audio else None,
+        shortest=False,
+        log_callback=log_callback,
+    )
     try:
         raw.unlink()
     except OSError:
@@ -1460,6 +1469,7 @@ def replace_timeline_segments_gpu(
         fps=fps,
         color=meta.color,
         audio_source=str(audio_source) if audio_source is not None else None,
+        shortest=False,
         log_callback=log_callback,
     )
     try:

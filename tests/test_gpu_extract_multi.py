@@ -9,7 +9,7 @@ import numpy as np
 
 from gpu_engine.fallback import OperationCancelled
 from gpu_engine import files as gpu_files
-from gpu_engine.probe import VideoMetadata
+from gpu_engine.probe import BackendDecision, VideoMetadata
 
 
 class ExtractMultiRectTests(unittest.TestCase):
@@ -183,6 +183,154 @@ class ExtractMultiRectTests(unittest.TestCase):
             self.assertFalse(any(path.exists() for path in raw_paths))
             self.assertFalse(out_l.exists())
             self.assertFalse(out_r.exists())
+
+    def test_timeline_merge_muxes_source_audio_without_shortest(self) -> None:
+        import tempfile
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "cupy": types.SimpleNamespace(
+                    cuda=types.SimpleNamespace(
+                        Device=lambda: types.SimpleNamespace(synchronize=lambda: None)
+                    )
+                )
+            },
+        ):
+            class FakeFrame:
+                def y_uv_cupy(self):
+                    y = np.zeros((4, 8), dtype=np.uint8)
+                    uv = np.zeros((2, 4, 2), dtype=np.uint8)
+                    return y, uv
+
+            class FakeDecoder:
+                def __init__(self, _src, bit_depth=8, start_frame=0):
+                    self.info = types.SimpleNamespace(width=8, height=4, fps=30.0)
+
+                def __len__(self):
+                    return 1
+
+                def frame_at(self, _index):
+                    return FakeFrame()
+
+                def stop(self):
+                    pass
+
+            class FakeEncoder:
+                def __init__(self, *_args, **_kwargs):
+                    pass
+
+                def encode(self, _app, force_idr=False):
+                    return b"frame"
+
+                def flush(self):
+                    return b"tail"
+
+            mux_kwargs = {}
+
+            def fake_mux(raw_hevc, out_path, **kwargs):
+                mux_kwargs.update(kwargs)
+                self.assertTrue(Path(raw_hevc).exists())
+                Path(out_path).write_bytes(b"mp4")
+
+            with tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                src = root / "base.mp4"
+                audio = root / "source_audio.mp4"
+                out = root / "out.mp4"
+                src.write_bytes(b"base")
+                audio.write_bytes(b"audio")
+                meta = VideoMetadata(path=str(src), width=8, height=4, source_fps=30.0, bitrate_bps=3000)
+
+                with (
+                    patch("gpu_engine.files.probe.route", return_value=(meta, BackendDecision("gpu_nv12", "ok"))),
+                    patch("gpu_engine.files.PyNvThreadedSerialDecoder", FakeDecoder),
+                    patch("gpu_engine.files.PyNvEncoderSession", FakeEncoder),
+                    patch("gpu_engine.files._pack_planes", return_value="app"),
+                    patch("gpu_engine.files.runtime.free_memory_pool"),
+                    patch("gpu_engine.files.mux.mux_hevc_with_audio", side_effect=fake_mux),
+                ):
+                    gpu_files.replace_timeline_segments_gpu(
+                        src,
+                        out,
+                        [],
+                        audio_source=audio,
+                    )
+
+            self.assertEqual(mux_kwargs["audio_source"], str(audio))
+            self.assertIs(mux_kwargs["shortest"], False)
+
+    def test_combine_video_muxes_first_input_audio_without_shortest(self) -> None:
+        import tempfile
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "cupy": types.SimpleNamespace(
+                    cuda=types.SimpleNamespace(
+                        Device=lambda: types.SimpleNamespace(synchronize=lambda: None)
+                    )
+                )
+            },
+        ):
+            class FakeFrame:
+                def y_uv_cupy(self):
+                    y = np.zeros((4, 8), dtype=np.uint8)
+                    uv = np.zeros((2, 4, 2), dtype=np.uint8)
+                    return y, uv
+
+            class FakeDecoder:
+                def __init__(self, _src, bit_depth=8):
+                    self.info = types.SimpleNamespace(width=8, height=4, fps=30.0)
+
+                def __len__(self):
+                    return 2
+
+                def frame_at(self, _index):
+                    return FakeFrame()
+
+                def stop(self):
+                    pass
+
+            class FakeEncoder:
+                def __init__(self, *_args, **_kwargs):
+                    pass
+
+                def encode(self, _app, force_idr=False):
+                    return b"frame"
+
+                def flush(self):
+                    return b"tail"
+
+            mux_kwargs = {}
+
+            def fake_mux(raw_hevc, out_path, **kwargs):
+                mux_kwargs.update(kwargs)
+                self.assertTrue(Path(raw_hevc).exists())
+                Path(out_path).write_bytes(b"mp4")
+
+            with tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                left = root / "left.mp4"
+                right = root / "right.mp4"
+                out = root / "combined.mp4"
+                left.write_bytes(b"left")
+                right.write_bytes(b"right")
+                meta = VideoMetadata(path=str(left), width=8, height=4, source_fps=30.0, bitrate_bps=3000)
+
+                with (
+                    patch("gpu_engine.files.probe.probe_video", return_value=meta),
+                    patch("gpu_engine.files.PyNvThreadedSerialDecoder", FakeDecoder),
+                    patch("gpu_engine.files.PyNvEncoderSession", FakeEncoder),
+                    patch("gpu_engine.files.nv12_kernels.hstack_planes", side_effect=lambda a, b: np.concatenate([a, b], axis=1)),
+                    patch("gpu_engine.files._pack_planes", return_value="app"),
+                    patch("gpu_engine.files.runtime.free_memory_pool"),
+                    patch("gpu_engine.files.mux.mux_hevc_with_audio", side_effect=fake_mux),
+                ):
+                    gpu_files.combine_video(left, right, out, "left_right", keep_audio=True)
+
+            self.assertEqual(mux_kwargs["audio_source"], str(left))
+            self.assertIs(mux_kwargs["shortest"], False)
 
 
 if __name__ == "__main__":
