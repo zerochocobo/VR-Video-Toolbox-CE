@@ -23,6 +23,10 @@ reference
 runtime_cache
 debug_output
 videos
+!/models/
 /models/*
+!/models/*.txt
+/models/**/*
+!/models/**/
 !/models/**/*.txt
 

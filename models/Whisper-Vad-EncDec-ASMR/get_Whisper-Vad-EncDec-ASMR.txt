@@ -1,0 +1,11 @@
+You can visit https://huggingface.co/TransWithAI/Whisper-Vad-EncDec-ASMR-onnx/tree/main , download all files in this page and put them in this directory.
+你可以访问 https://hf-mirror.com/TransWithAI/Whisper-Vad-EncDec-ASMR-onnx/tree/main 下载将该页面的所有文件并放入当前文件夹内。
+
+
+@misc{whisper-vad,
+  title={Whisper-VAD: Whisper-based Voice Activity Detection},
+  author={Grider},
+  year={2025},
+  publisher={Hugging Face},
+  howpublished={\url{https://huggingface.co/TransWithAI/Whisper-Vad-EncDec-ASMR-onnx}}
+}

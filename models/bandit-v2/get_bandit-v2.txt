@@ -1,0 +1,5 @@
+Project：https://github.com/kwatcharasupat/bandit-v2
+
+Download checkpoint-multi.slim.pt  from https://huggingface.co/zerochocobo/bandit-v2/tree/main
+
+

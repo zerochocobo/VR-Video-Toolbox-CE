@@ -1,0 +1,27 @@
+Speaker-embedding model for tool_clonevoice offline diarization (no pyannote token needed).
+说话人嵌入模型，供 tool_clonevoice 离线分离聚类使用（无需 pyannote token）。
+
+Source / 下载来源:
+    https://huggingface.co/k2-fsa/TTS_eval_models
+
+Place the two files into this folder, keeping this structure:
+将以下两个文件放入本目录，保持如下结构：
+
+    models/OmniVoice_ECAPA/
+        speaker_similarity/
+            wavlm_large_finetune.pth          (ECAPA-TDNN head, the fine-tuned SV checkpoint)
+            wavlm_large/
+                wavlm_large.pt                (WavLM-Large self-supervised backbone, ~1.2GB)
+
+In the TTS_eval_models repo these live under:
+在 TTS_eval_models 仓库中对应路径为：
+    speaker_similarity/wavlm_large_finetune.pth
+    speaker_similarity/wavlm_large/wavlm_large.pt
+
+Runtime dependency / 运行依赖:
+    pip install s3prl
+    (Loaded by omnivoice.eval.models.ecapa_tdnn_wavlm via torch.hub "wavlm_local".)
+    (由 omnivoice.eval.models.ecapa_tdnn_wavlm 通过 torch.hub 的 "wavlm_local" 入口加载。)
+
+Note: open-source code does NOT ship these weights; they are bundled in the release ZIP only.
+说明：开源代码不包含权重；仅在软件发布 ZIP 中直接打包。

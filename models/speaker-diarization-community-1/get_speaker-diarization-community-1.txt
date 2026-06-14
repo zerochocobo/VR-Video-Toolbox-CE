@@ -1,0 +1,44 @@
+Pyannote speaker-diarization pipeline for tool_clonevoice.
+tool_clonevoice 使用的 pyannote 说话人分离模型。
+
+Source / 下载来源:
+    https://huggingface.co/pyannote/speaker-diarization-community-1
+
+Mirror / 镜像:
+    https://hf-mirror.com/pyannote/speaker-diarization-community-1
+
+Place the repository files into this folder, keeping this structure:
+将仓库文件放入本目录，保持如下结构：
+
+    models/speaker-diarization-community-1/
+        config.yaml
+        embedding/
+            pytorch_model.bin
+        plda/
+            plda.npz
+            xvec_transform.npz
+        segmentation/
+            pytorch_model.bin
+
+Minimum file checked by the software:
+软件用于判断本地 pyannote 模型是否可用的最低检查文件：
+
+    models/speaker-diarization-community-1/config.yaml
+
+Recommended download command / 推荐下载命令:
+
+    huggingface-cli download pyannote/speaker-diarization-community-1 --local-dir models/speaker-diarization-community-1
+
+If Hugging Face is slow in your region, set the mirror endpoint first:
+如果 Hugging Face 访问较慢，可先设置镜像端点：
+
+    set HF_ENDPOINT=https://hf-mirror.com
+    huggingface-cli download pyannote/speaker-diarization-community-1 --local-dir models/speaker-diarization-community-1
+
+Runtime dependency / 运行依赖:
+    pyannote.audio 4.x
+
+Note: this bundle is used for local/offline diarization. Keep the embedding,
+plda, and segmentation subdirectories at the top level of this folder.
+说明：该模型包用于本地/离线说话人分离。请将 embedding、plda、segmentation
+三个子目录直接放在本目录下。

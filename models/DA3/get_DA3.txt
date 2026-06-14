@@ -1,0 +1,42 @@
+Depth Anything 3 model files for the 2D-to-depth-VR tool.
+2D 转深度 VR 功能使用的 Depth Anything 3 模型文件。
+
+Project page / 项目页面:
+    https://github.com/ByteDance-Seed/Depth-Anything-3
+
+Model source / 模型下载来源:
+    https://huggingface.co/depth-anything/da3-small
+    https://huggingface.co/depth-anything/da3-base
+
+Place the model files into this folder, keeping this structure:
+将模型文件放入本目录，保持如下结构：
+
+    models/DA3/
+        Small/
+            config.json
+            model.safetensors
+        Base/
+            config.json
+            model.safetensors
+
+Minimum files checked by the current software:
+当前软件实际运行时至少检查并加载：
+
+    models/DA3/Small/config.json
+    models/DA3/Small/model.safetensors
+
+Recommended download commands / 推荐下载命令:
+
+    huggingface-cli download depth-anything/da3-small --local-dir models/DA3/Small
+    huggingface-cli download depth-anything/da3-base --local-dir models/DA3/Base
+
+If Hugging Face is slow in your region, set the mirror endpoint first:
+如果 Hugging Face 访问较慢，可先设置镜像端点：
+
+    set HF_ENDPOINT=https://hf-mirror.com
+    huggingface-cli download depth-anything/da3-small --local-dir models/DA3/Small
+    huggingface-cli download depth-anything/da3-base --local-dir models/DA3/Base
+
+Note: the current 2DVR pipeline loads DA3 Small by default. DA3 Base can be kept
+here for future use or manual experiments.
+说明：当前 2DVR 流程默认加载 DA3 Small。DA3 Base 可放在这里供后续功能或手动测试使用。

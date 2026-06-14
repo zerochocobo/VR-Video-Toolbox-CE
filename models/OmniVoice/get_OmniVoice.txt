@@ -1,0 +1,42 @@
+Voice-clone synthesis model for tool_clonevoice.
+克隆翻译配音使用的 OmniVoice 语音克隆合成模型。
+
+Source / 下载来源:
+    https://huggingface.co/k2-fsa/OmniVoice
+
+Mirror / 镜像:
+    https://hf-mirror.com/k2-fsa/OmniVoice/
+
+Place the repository files into this folder, keeping this structure:
+将仓库文件放入本目录，保持如下结构：
+
+    models/OmniVoice/
+        config.json
+        model.safetensors
+        tokenizer.json
+        tokenizer_config.json
+        chat_template.jinja
+        audio_tokenizer/
+            config.json
+            model.safetensors
+            preprocessor_config.json
+
+Minimum files checked by the software:
+软件启动合成时至少检查：
+
+    models/OmniVoice/config.json
+    models/OmniVoice/model.safetensors
+
+Recommended download command / 推荐下载命令:
+
+    huggingface-cli download k2-fsa/OmniVoice --local-dir models/OmniVoice
+
+If Hugging Face is slow in your region, set the mirror endpoint first:
+如果 Hugging Face 访问较慢，可先设置镜像端点：
+
+    set HF_ENDPOINT=https://hf-mirror.com
+    huggingface-cli download k2-fsa/OmniVoice --local-dir models/OmniVoice
+
+Note: keep the nested audio_tokenizer directory. Do not put files under an extra
+OmniVoice/OmniVoice subdirectory.
+说明：请保留 audio_tokenizer 子目录；不要多套一层 OmniVoice/OmniVoice 目录。

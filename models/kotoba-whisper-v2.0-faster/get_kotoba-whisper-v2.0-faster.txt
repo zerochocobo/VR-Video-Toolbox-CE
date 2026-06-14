@@ -1,0 +1,2 @@
+You can visit https://huggingface.co/kotoba-tech/kotoba-whisper-v2.0-faster/tree/main , download all files in this page and put them in this directory.
+你可以访问 https://hf-mirror.com/kotoba-tech/kotoba-whisper-v2.0-faster/tree/main 下载将该页面的所有文件并放入当前文件夹内。

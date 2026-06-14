@@ -1,0 +1,2 @@
+You can visit https://huggingface.co/Systran/faster-whisper-large-v3/tree/main , download all files in this page and put them in this directory.
+你可以访问 https://hf-mirror.com/Systran/faster-whisper-large-v3/tree/main 下载将该页面的所有文件并放入当前文件夹内，需要梯子才能访问。
