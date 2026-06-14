@@ -1,0 +1,5 @@
+lada的模型
+可以在lada的安装目录下的model_weights中找到
+
+用于VR的测试解码、恢复模型下载
+https://huggingface.co/zelefans/vrmr/tree/main

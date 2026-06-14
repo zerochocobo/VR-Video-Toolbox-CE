@@ -7,9 +7,13 @@ dist
 *.jpg
 *.pt
 .claude
+.pyannote4-deps
 .pytest_cache
 .venv/
 .base/
+/.*
+/_*
+.venv-np24
 .base 
 .vscode/settings.json
 /prompt
@@ -19,10 +23,6 @@ reference
 runtime_cache
 debug_output
 videos
-models/
-!tool_si/_vendor/qwen_tts/core/models/
-!tool_si/_vendor/qwen_tts/core/models/**
-tool_si/_vendor/qwen_tts/core/models/__pycache__/
-!tool_si/_vendor/qwen_tts_legacy/core/models/
-!tool_si/_vendor/qwen_tts_legacy/core/models/**
-tool_si/_vendor/qwen_tts_legacy/core/models/__pycache__/
+/models/*
+!/models/**/*.txt
+

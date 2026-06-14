@@ -114,7 +114,7 @@ UI_LANGUAGE_TO_TTS = {
 }
 
 LogCallback = Callable[[str], None]
-SI_MIX_CHANNELS = ("left", "right")
+SI_MIX_CHANNELS = ("left", "right", "both")
 ORIGINAL_VOLUME_CHOICES = (70, 80, 90, 100)
 SI_VOLUME_CHOICES = (50, 60, 70, 80, 90, 100)
 SI_DELAY_SECONDS_CHOICES = (0.0, 0.3, 0.5, 0.7, 1.0, 1.2, 1.5, 2.0)
@@ -499,6 +499,34 @@ def build_si_mix_filter(
     original_volume = _filter_number(_validate_original_volume(original_volume_percent) / 100.0)
     si_volume = _filter_number(_validate_si_volume(si_volume_percent) / 100.0)
     si_delay_ms = int(round(_validate_si_delay_seconds(si_delay_seconds) * 1000))
+
+    if channel == "both":
+        # SI overlaid equally on BOTH channels (no channel split).
+        if duck_original:
+            compressor = (
+                f"threshold={SI_DUCK_THRESHOLD}:"
+                f"ratio={SI_DUCK_RATIO}:"
+                f"attack={SI_DUCK_ATTACK_MS}:"
+                f"release={SI_DUCK_RELEASE_MS}:"
+                f"makeup={SI_DUCK_MAKEUP}"
+            )
+            return (
+                "[0:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                f"volume={original_volume}[orig_base];"
+                "[1:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=mono,"
+                f"adelay={si_delay_ms},volume={si_volume},apad,asplit=2[si_key][si_mono];"
+                f"[orig_base][si_key]sidechaincompress={compressor}[orig];"
+                "[si_mono]aformat=channel_layouts=stereo[si];"
+                "[orig][si]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+                "alimiter=limit=0.95[si_track]"
+            )
+        return (
+            f"[0:a:0]aresample=48000,aformat=channel_layouts=stereo,volume={original_volume}[orig];"
+            f"[1:a:0]aresample=48000,aformat=channel_layouts=mono,adelay={si_delay_ms},"
+            f"volume={si_volume},aformat=channel_layouts=stereo[si];"
+            "[orig][si]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+            "alimiter=limit=0.95[si_track]"
+        )
 
     if channel == "left":
         mix_part = (

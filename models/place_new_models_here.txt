@@ -1,0 +1,5 @@
+lada models
+you can find all models in  lada install directory  -> model_weights
+
+VR models for test
+https://huggingface.co/zelefans/vrmr/tree/main

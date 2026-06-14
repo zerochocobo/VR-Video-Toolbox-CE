@@ -9,9 +9,10 @@ dependencies = [
     "pyinstaller>=6.11.1",
     "ffmpy3>=0.2.4",
     "faster-whisper>=1.1.1",
-    # numpy <2.1 keeps CuPy 12.x and PyNvVideoCodec wheels compatible.
-    # PTMediaServer uses the same upper bound; see reference/PTMediaServer/pyproject.toml.
-    "numpy>=1.26,<2.1",
+    # numpy >=2.2.2 is required by pyannote.audio 4.x (community-1 diarization).
+    # Verified: CuPy 14.1 + PyNvVideoCodec + torch cu128 + faster-whisper all work
+    # under numpy 2.4.6 (the old <2.1 bound was for CuPy 12.x, no longer used here).
+    "numpy>=2.2.2",
     "auditok>=0.3.0",
     "onnxruntime-gpu",
     "huggingface-hub>=1.8.0",
@@ -48,10 +49,23 @@ dependencies = [
     "einops>=0.8.0",
     "safetensors>=0.4.5",
     "opencv-python>=4.13.0.92",
+    "whisperx",
+    "omnivoice",
+    "s3prl>=0.4.0",
+    "scikit-learn>=1.4",
+    "pyannote.audio>=4",
+    "setuptools<81",
 ]
 
 [tool.uv]
 package = false
+# whisperx 3.4.x conservatively caps ctranslate2<4.5 (the 4.4 wheels link cuDNN 8,
+# which torch 2.8/cu128 does not ship -> GPU transcription hard-crashes on the
+# missing cudnn_*64_8.dll). faster-whisper 1.2.1 already supports ctranslate2>=4.5,
+# whose wheels use cuDNN 9 — exactly what torch bundles. Force 4.5+ so faster-whisper
+# transcription runs on GPU via torch's cuDNN 9. whisperx only forwards audio to
+# faster-whisper, so its <4.5 cap is safe to override.
+override-dependencies = ["ctranslate2>=4.5.0"]
 
 [[tool.uv.index]]
 name = "pytorch-cu128"

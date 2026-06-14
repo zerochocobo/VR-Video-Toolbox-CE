@@ -368,7 +368,8 @@ class VRVideoToolboxLauncher:
         subtitle_frame = self.create_group(get_text('grp_subtitle'))
         ttk.Button(subtitle_frame, text=get_text('btn_subtitle_tools'), style='Big.TButton', command=self.launch_subtitle_tools).grid(row=1, column=0, sticky='ew', padx=4, pady=2)
         ttk.Button(subtitle_frame, text=get_text('btn_subembed_tools'), style='Big.TButton', command=self.launch_subembed_tools).grid(row=1, column=1, sticky='ew', padx=4, pady=2)
-        ttk.Button(subtitle_frame, text=get_text('btn_si_voice'), style='Big.TButton', command=self.launch_si_voice).grid(row=2, column=0, columnspan=2, sticky='ew', padx=4, pady=2)
+        ttk.Button(subtitle_frame, text=get_text('btn_si_voice'), style='Big.TButton', command=self.launch_si_voice).grid(row=2, column=0, sticky='ew', padx=4, pady=2)
+        ttk.Button(subtitle_frame, text=get_text('btn_clonevoice'), style='Big.TButton', command=self.launch_clonevoice).grid(row=2, column=1, sticky='ew', padx=4, pady=2)
         subtitle_frame.columnconfigure(0, weight=1)
         subtitle_frame.columnconfigure(1, weight=1)
         
@@ -578,6 +579,12 @@ class VRVideoToolboxLauncher:
 
         self.clear_frame()
         self.app = tool_si_gui.SimultaneousInterpretationApp(self.root, on_return=self.request_show_launcher)
+
+    def launch_clonevoice(self):
+        from tool_clonevoice import gui as tool_clonevoice_gui
+
+        self.clear_frame()
+        self.app = tool_clonevoice_gui.ClonevoiceToolsApp(self.root, on_return=self.request_show_launcher)
 
     def launch_subembed_tools(self):
         from tool_subembed import main as tool_subembed_main

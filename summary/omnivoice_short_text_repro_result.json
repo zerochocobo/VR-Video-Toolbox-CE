@@ -1,0 +1,51 @@
+[
+  {
+    "case": "long",
+    "target": "你好，今天天气真不错，我们一起出去散步聊聊天吧。",
+    "gen_dur_s": 3.72,
+    "asr_lang": "zh",
+    "asr_text": "喂 你好 今天天气真不错我们一起出去散步聊聊天吧"
+  },
+  {
+    "case": "medium",
+    "target": "后辈一下子多了好多。",
+    "gen_dur_s": 2.0,
+    "asr_lang": "zh",
+    "asr_text": "好歹一生是多了好多"
+  },
+  {
+    "case": "short",
+    "target": "加班多吧。",
+    "gen_dur_s": 1.6,
+    "asr_lang": "zh",
+    "asr_text": "整理&字幕志愿者 杨茜茜"
+  },
+  {
+    "case": "short2",
+    "target": "厉害啊。",
+    "gen_dur_s": 1.44,
+    "asr_lang": "zh",
+    "asr_text": "很厲害"
+  },
+  {
+    "case": "short_lang=zh",
+    "target": "加班多吧。",
+    "gen_dur_s": 1.6,
+    "asr_lang": "zh",
+    "asr_text": "嗯好玩多了"
+  },
+  {
+    "case": "short_lang=Chinese",
+    "target": "加班多吧。",
+    "gen_dur_s": 1.6,
+    "asr_lang": "zh",
+    "asr_text": "嗯就這麼多吧"
+  },
+  {
+    "case": "short_lang=None",
+    "target": "加班多吧。",
+    "gen_dur_s": 1.6,
+    "asr_lang": "zh",
+    "asr_text": "嗯好玩的"
+  }
+]
