@@ -430,6 +430,8 @@ def collect_paired_si_mix_tasks(base_dir: str | os.PathLike[str], recursive: boo
     for video in candidates:
         if not video.is_file() or video.suffix.lower() not in {".mp4", ".mkv"}:
             continue
+        if video.name.lower().endswith(("_si.mp4", "_dub.mp4")):
+            continue
         resolved = video.resolve()
         if resolved in seen:
             continue
@@ -885,6 +887,8 @@ def collect_paired_srt_tasks(base_dir: str | os.PathLike[str], recursive: bool =
     candidates = root_path.rglob("*") if recursive else root_path.iterdir()
     for video in candidates:
         if not video.is_file() or video.suffix.lower() not in {".mp4", ".mkv"}:
+            continue
+        if video.name.lower().endswith(("_si.mp4", "_dub.mp4")):
             continue
         srt_path = video.with_suffix(".srt")
         if not srt_path.is_file():

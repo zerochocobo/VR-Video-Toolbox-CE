@@ -97,6 +97,20 @@ class SimultaneousInterpretationLogicTests(unittest.TestCase):
 
         self.assertEqual([path.name for path in tasks], ["a.srt", "b.srt"])
 
+    def test_collect_paired_srt_tasks_ignores_generated_mp4_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "a.mp4").write_bytes(b"")
+            (root / "a.srt").write_text("x", encoding="utf-8")
+            (root / "a_SI.mp4").write_bytes(b"")
+            (root / "a_SI.srt").write_text("x", encoding="utf-8")
+            (root / "a_DUB.mp4").write_bytes(b"")
+            (root / "a_DUB.srt").write_text("x", encoding="utf-8")
+
+            tasks = logic.collect_paired_srt_tasks(root)
+
+        self.assertEqual([path.name for path in tasks], ["a.srt"])
+
     def test_collect_paired_srt_tasks_can_skip_subdirectories(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -127,6 +141,20 @@ class SimultaneousInterpretationLogicTests(unittest.TestCase):
         self.assertEqual([task.video_path.name for task in tasks], ["a.mp4", "b.mkv"])
         self.assertEqual([task.si_audio_path.name for task in tasks], ["a.si.wav", "b.si.wav"])
         self.assertEqual([task.output_path.name for task in tasks], ["a_SI.mp4", "b_SI.mp4"])
+
+    def test_collect_paired_si_mix_tasks_ignores_generated_mp4_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "a.mp4").write_bytes(b"")
+            (root / "a.si.wav").write_bytes(b"wav")
+            (root / "a_SI.mp4").write_bytes(b"")
+            (root / "a_SI.si.wav").write_bytes(b"wav")
+            (root / "a_DUB.mp4").write_bytes(b"")
+            (root / "a_DUB.si.wav").write_bytes(b"wav")
+
+            tasks = logic.collect_paired_si_mix_tasks(root)
+
+        self.assertEqual([task.video_path.name for task in tasks], ["a.mp4"])
 
     def test_collect_paired_si_mix_tasks_can_skip_subdirectories(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

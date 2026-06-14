@@ -18,6 +18,7 @@
 - 马赛克去除
 - 字幕生成、翻译、嵌入
 - 同声传译（SI）语音生成与视频 SI 音轨混合
+- 按说话人音色克隆的翻译配音，并支持移除原始人声
 - 2D 视频转深度 VR180 SBS
 - **轻量级局域网 VR 视频 DLNA 服务器**（支持 180° SBS 格式自适应诱导、外部字幕自动关联与多物理目录映射）
 - VR 视频拆分、合并、投影转换等辅助工具
@@ -31,6 +32,7 @@
 - 想批量处理 VR 视频的用户
 - 想给 VR 视频生成字幕、翻译字幕或嵌入字幕的用户
 - 想把字幕转换成同声传译语音，并将 SI 音轨混入视频的用户
+- 想翻译对白、克隆原视频中不同说话人音色，并在保留音乐音效的同时替换原始人声的用户
 - 想把普通 2D 视频转换成基于深度估计的 VR180 SBS 视频的用户
 - 想要在 VR 头显（如 Quest/Pico）中用 Skybox 等播放器直接无线播放电脑本地视频并自动关联字幕的用户
 - 想尝试用 AI 工具去除视频马赛克的用户
@@ -95,7 +97,23 @@
 
 SI 的同步和响度仍建议人工试听校对。部分 TTS 结果本身已经包含翻译延迟，此时额外 SI 延迟需要按素材调整。
 
-### 4. 2D 转深度 VR
+### 4. 克隆翻译配音
+
+克隆翻译配音工具面向「翻译后重新配音」流程，不同于使用预设音色的同声传译旁白：
+
+- 对源视频做语音转录，并按说话人分离对白
+- 为每个检测到的说话人提取参考音色片段
+- 将识别出的对白翻译成目标语言
+- 使用 OmniVoice 按对应说话人的克隆音色合成翻译后语音
+- 将克隆语音按时间线拼接为 `<视频名>.si.wav`
+- 回混时支持两种模式：
+  - 同声传译模式：保留原始音频，叠加克隆/翻译后的音轨，输出 `_SI.mp4`
+  - 配音模式：使用 Bandit-v2 移除原始人声，保留音乐和音效背景，再叠加克隆音轨，输出 `_DUB.mp4`
+- 支持单文件和批量目录、跳过已存在结果、保留中间文件、本地 ECAPA 聚类、可选 pyannote 说话人分离，以及平铺直叙、整句匹配、语调起伏等输出响度模式
+
+克隆配音质量受源音频质量、说话人分离准确度、参考片段选择，以及模型对短翻译句的表现影响。正式使用前建议人工试听生成的 `.si.wav`、`_SI.mp4` 或 `_DUB.mp4`。
+
+### 5. 2D 转深度 VR
 
 2D 转深度 VR 工具使用本地 Depth Anything 3 Small 模型，把普通 2D 视频转换为立体 VR 输出：
 
@@ -109,7 +127,7 @@ SI 的同步和响度仍建议人工试听校对。部分 TTS 结果本身已经
 
 基于单目深度的 2D 转 VR 是近似效果。大遮挡、快速运动、强模糊或深度估计不准确的场景可能出现立体伪影，建议先用短片段试算。
 
-### 5. VR 视频辅助工具
+### 6. VR 视频辅助工具
 
 项目还包含一些常用小工具：
 
@@ -119,7 +137,7 @@ SI 的同步和响度仍建议人工试听校对。部分 TTS 结果本身已经
 - 视频截图、局部放大检查等辅助功能
 - 批量处理脚本
 
-### 6. VR 视频 DLNA 服务器
+### 7. VR 视频 DLNA 服务器
 
 一个高内聚、轻量级的局域网 DLNA / UPnP 视频流媒体服务器：
 
@@ -154,6 +172,7 @@ python main.py
 - **VR 视频 DLNA 服务器**：一键开启/停止局域网 DLNA 共享，提供独立的配置窗口（管理共享目录、端口及字幕关联）
 - `日语批量字幕工具`：字幕生成与翻译相关工具
 - `同声传译语音`：从字幕生成 `.si.wav`，并将 SI 音频混入 MP4/MKV 视频
+- `克隆翻译配音`：转录并翻译视频对白，按说话人克隆音色生成 `<视频名>.si.wav`，并可回混为 `_SI.mp4` 或 `_DUB.mp4`
 - `2D转深度VR`：将 2D 视频转换成基于深度估计的 VR180 SBS 输出
 - `VR Hard Subtitle Embed Tool`：VR 硬字幕嵌入
 - 其他按钮：VR 拆分合并、投影转换、小工具箱
@@ -180,6 +199,11 @@ python main.py
 - 内置 AI/GPU 包：`torch==2.8.0`、`torchvision==0.23.0` 和 `torchaudio==2.8.0`（来自 PyTorch `cu128` wheel 源），以及 `ultralytics==8.4.4`、`mmengine==0.10.7`、`omegaconf`、`einops`、`safetensors`、`opencv-python`
 - 可选/本地模型：
   - 同声传译语音需要将 Qwen3-TTS 12Hz CustomVoice 放到 `models/Qwen3-TTS-12Hz-0.6B-CustomVoice`
+  - 克隆翻译配音需要将 OmniVoice 放到 `models/OmniVoice`
+  - 克隆翻译配音的本地说话人聚类需要将 OmniVoice ECAPA 放到 `models/OmniVoice_ECAPA`
+  - 克隆翻译配音的转录可使用 `models/kotoba-whisper-v2.0-faster` 下的 Kotoba Whisper，或 `models/faster-whisper-*` 下的 faster-whisper 模型
+  - 如使用 pyannote 说话人分离，需要将 `speaker-diarization-community-1` 放到 `models/speaker-diarization-community-1`
+  - 配音模式移除原始人声需要将 Bandit-v2 放到 `models/bandit-v2`
   - 2D 转深度 VR 需要将 Depth Anything 3 Small 放到 `models/DA3/Small`
 
 Python 依赖安装：
@@ -205,6 +229,7 @@ FFmpeg 和 AI 引擎（Lada / Jasna）需要能被程序找到。可以放到系
 │     ├─ tool_subtitle/         字幕生成、翻译、批量处理
 │     ├─ tool_subembed/         VR 字幕嵌入
 │     ├─ tool_si/               同声传译语音与 SI 音轨混合
+│     ├─ tool_clonevoice/       克隆翻译配音与配音回混
 │     ├─ tool_2dvr/             2D 转深度 VR
 │     ├─ tool_dlna/             局域网 DLNA/UPnP 视频服务器
 │     ├─ tool_split_combine/    VR 拆分与合并
@@ -227,6 +252,7 @@ FFmpeg 和 AI 引擎（Lada / Jasna）需要能被程序找到。可以放到系
 - `_L` / `_R`：左眼或右眼视频
 - 字幕工具会根据任务生成 `.srt`、翻译后的字幕文件或嵌入字幕后的视频
 - 同声传译语音工具会生成 `.si.wav`；混合 SI 视频音轨会输出 `_SI.mp4`
+- 克隆翻译配音会生成 `<视频名>.si.wav`；回混后同声传译模式输出 `_SI.mp4`，配音模式输出 `_DUB.mp4`
 - 2D 转深度 VR 会输出类似 `_2dvr_flat3d_LR_SBS.mp4` 或 `_2dvr_hequirect_LR_180_SBS.mp4` 的文件
 
 实际命名以所选工具界面提示为准。

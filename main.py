@@ -863,9 +863,38 @@ def _selftest_gpu() -> int:
         return 2
 
 
+def _selftest_import() -> int:
+    """Diagnose transformers lazy-import resolution in the frozen build.
+
+    Usage: VR_Video_Toolbox.exe --selftest-import
+    """
+    import os
+    import traceback
+    try:
+        import transformers
+        print(f"[selftest] transformers.__file__ = {getattr(transformers, '__file__', None)!r}")
+        tdir = os.path.dirname(getattr(transformers, "__file__", "") or "")
+        print(f"[selftest] transformers dir isdir={os.path.isdir(tdir)} : {tdir}")
+        higgs_init = os.path.join(tdir, "models", "higgs_audio_v2_tokenizer", "__init__.py")
+        print(f"[selftest] higgs __init__.py on disk = {os.path.isfile(higgs_init)} : {higgs_init}")
+    except Exception:
+        traceback.print_exc()
+        return 2
+    try:
+        from transformers import HiggsAudioV2TokenizerModel
+        print(f"[selftest] HiggsAudioV2TokenizerModel OK -> {HiggsAudioV2TokenizerModel}")
+        return 0
+    except Exception:
+        print("[selftest] HiggsAudioV2TokenizerModel FAILED, full chained traceback:")
+        traceback.print_exc()
+        return 1
+
+
 if __name__ == "__main__":
     if "--selftest-gpu" in sys.argv:
         sys.exit(_selftest_gpu())
+    if "--selftest-import" in sys.argv:
+        sys.exit(_selftest_import())
     if _startup_gpu_warmup_enabled():
         _start_gpu_warmup()
     root = tk.Tk()

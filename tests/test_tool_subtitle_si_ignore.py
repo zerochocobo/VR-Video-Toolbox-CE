@@ -65,9 +65,14 @@ class ToolSubtitleSISidecarIgnoreTests(unittest.TestCase):
         self.assertTrue(logic.is_si_sidecar_media_file("movie.SI.MP4"))
         self.assertFalse(logic.is_si_sidecar_media_file("movie.wav"))
         self.assertFalse(logic.is_si_sidecar_media_file("movie.mp4"))
+        self.assertTrue(logic.is_generated_output_mp4("movie_SI.mp4"))
+        self.assertTrue(logic.is_generated_output_mp4("movie_DUB.MP4"))
+        self.assertFalse(logic.is_generated_output_mp4("movie.mp4"))
 
         self.assertFalse(logic.is_supported_source_media_file("movie.si.wav"))
         self.assertFalse(logic.is_supported_source_media_file("movie.si.mp4"))
+        self.assertFalse(logic.is_supported_source_media_file("movie_SI.mp4"))
+        self.assertFalse(logic.is_supported_source_media_file("movie_DUB.mp4"))
         self.assertTrue(logic.is_supported_source_media_file("movie.wav"))
         self.assertTrue(logic.is_supported_source_media_file("movie.mp4"))
 
@@ -78,6 +83,10 @@ class ToolSubtitleSISidecarIgnoreTests(unittest.TestCase):
             (root / "movie.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\nA\n", encoding="utf-8")
             (root / "movie.si.mp4").write_bytes(b"si video")
             (root / "movie.si.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\nSI\n", encoding="utf-8")
+            (root / "movie_SI.mp4").write_bytes(b"si output")
+            (root / "movie_SI.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\nSI\n", encoding="utf-8")
+            (root / "movie_DUB.mp4").write_bytes(b"dub output")
+            (root / "movie_DUB.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\nDUB\n", encoding="utf-8")
             commands: list[list[str]] = []
 
             with patch.object(logic, "check_ffmpeg", return_value=True), patch.object(
@@ -89,6 +98,8 @@ class ToolSubtitleSISidecarIgnoreTests(unittest.TestCase):
         self.assertEqual(len(commands), 1)
         self.assertIn(str(root / "movie.mp4"), commands[0])
         self.assertNotIn(str(root / "movie.si.mp4"), commands[0])
+        self.assertNotIn(str(root / "movie_SI.mp4"), commands[0])
+        self.assertNotIn(str(root / "movie_DUB.mp4"), commands[0])
 
     def test_batch_generate_srt_ignores_si_wav_and_si_mp4(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -96,6 +107,8 @@ class ToolSubtitleSISidecarIgnoreTests(unittest.TestCase):
             (root / "movie.wav").write_bytes(b"audio")
             (root / "movie.si.wav").write_bytes(b"si audio")
             (root / "clip.si.mp4").write_bytes(b"si video")
+            (root / "movie_SI.mp4").write_bytes(b"si output")
+            (root / "movie_DUB.mp4").write_bytes(b"dub output")
             fake_generator = FakeSubtitleGenerator()
             cache_key = ("large-v3", False)
             old_cache = dict(logic._generator_cache)

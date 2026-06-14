@@ -2,6 +2,13 @@
 
 ## English
 
+### 2026-06-14
+
+- New: Added Clone Translation Dubbing documentation and workflow notes, covering per-speaker voice cloning, SI remix output `_SI.mp4`, and dubbing output `_DUB.mp4`.
+- Major update: Improved clonevoice loudness matching by aligning synthesized speech to the source sentence RMS, with bounded gain and a UI toggle.
+- Major update: Completed dubbing remix behavior: SI-only controls are hidden in dubbing mode, ducking is disabled, and DUB audio can optionally be added as an independent track.
+- Fix: Batch scans now ignore generated `_SI.mp4` and `_DUB.mp4` outputs so they are not reprocessed as source videos.
+
 ### 2026-06-05
 
 - New: Added the grouped OneClick paired pre-extract pipeline. Rects sharing the same frame window can now share one GPU decode, and restored rects can use raw HEVC plus sidecar metadata instead of temporary MP4 muxes.
@@ -36,6 +43,13 @@
 - Major optimization: GPU-accelerated VR split/merge, fisheye/equirectangular conversion, VR-to-flat projection, and OneClick geometry stages.
 
 ## 中文
+
+### 2026-06-14
+
+- 新功能：补充克隆翻译配音文档与流程说明，覆盖按说话人音色克隆、同声传译输出 `_SI.mp4`、配音输出 `_DUB.mp4`。
+- 重大更新：改进 clonevoice 响度匹配，合成语音会按原句 RMS 对齐，并加入增益保护和界面开关。
+- 重大更新：完善配音回混行为：配音模式隐藏 SI 专用控件、禁用 ducking，并支持将 DUB 音频作为独立音轨加入。
+- 修复：批量扫描会忽略已生成的 `_SI.mp4` / `_DUB.mp4`，避免把输出文件再次当作源视频处理。
 
 ### 2026-06-05
 

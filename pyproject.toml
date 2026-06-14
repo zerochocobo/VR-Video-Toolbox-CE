@@ -54,6 +54,13 @@ dependencies = [
     "s3prl>=0.4.0",
     "scikit-learn>=1.4",
     "pyannote.audio>=4",
+    # pyannote 4.x pulls torchcodec transitively; left unpinned uv grabs 0.14.x,
+    # which is built for torch 2.9 and imports the symbol torch_parse_device_string
+    # that torch 2.8 does not export loader crash (also kills
+    # the PyInstaller build). 0.7 is the highest torchcodec compatible with torch 2.8.
+    # Its native lib needs FFmpeg 7 DLLs, already shipped via _internal\PyNvVideoCodec
+    # and put on the DLL search path by packaging/runtime_hook_cuda.py.
+    "torchcodec==0.7.0",
     "setuptools<81",
 ]
 

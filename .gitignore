@@ -3,6 +3,7 @@ CLAUDE.md
 GEMINI.md
 __pycache__
 build
+build_full.log
 dist
 *.jpg
 *.pt
@@ -30,3 +31,4 @@ videos
 !/models/**/
 !/models/**/*.txt
 
+tool_clonevoice/gui.py

@@ -13,6 +13,7 @@ Current main features:
 - Mosaic removal
 - Subtitle generation, translation, and embedding
 - Simultaneous interpretation (SI) voice generation and SI video audio-track mixing
+- Clone translation dubbing with per-speaker voice cloning and original-vocal removal
 - 2D video to depth-based VR180 SBS conversion
 - **Lightweight LAN VR Video DLNA Server** (supports 180° SBS format auto-inducing, external subtitle auto-association, and multi-root mapping)
 - VR split/combine, projection conversion, and other helper tools
@@ -26,6 +27,7 @@ The goal is to make complex video workflows usable through a GUI and batch scrip
 - Users who batch-process VR videos
 - Users who generate, translate, or embed subtitles for VR videos
 - Users who want to turn subtitles into simultaneous-interpretation audio and mix it into videos as an SI track
+- Users who want to translate dialogue and create voice-cloned dubbing that replaces the original vocals while keeping music and effects
 - Users who want to convert ordinary 2D videos into depth-based VR180 SBS videos
 - Users who want to play local PC videos wirelessly on VR headsets (e.g. Oculus Quest, Pico) with player apps like Skybox and load subtitles automatically
 - Users who want to try AI-assisted mosaic removal
@@ -88,7 +90,23 @@ The simultaneous interpretation tool builds on Qwen3-TTS and FFmpeg:
 
 SI timing and loudness still need human review. Generated TTS may already contain translation delay, so the extra SI delay should be adjusted per source.
 
-### 4. 2D to Depth VR
+### 4. Clone Translation Dubbing
+
+The clone translation dubbing tool is designed for translated dubbing workflows, not preset-speaker SI narration:
+
+- Transcribe the source video and split dialogue by speaker
+- Extract reference voice samples for each detected speaker
+- Translate recognized dialogue into the target language
+- Use OmniVoice to synthesize translated speech with the corresponding speaker's cloned voice
+- Assemble the cloned speech into a timeline-aligned `<video>.si.wav`
+- Remix the result in two modes:
+  - Simultaneous interpretation mode: keep the original audio and overlay the cloned/translated track, producing `_SI.mp4`
+  - Dubbing mode: remove original vocals with Bandit-v2, keep music/effects as a background bed, then add the cloned track, producing `_DUB.mp4`
+- Support single-file and batch-directory processing, skip-existing output, intermediate-file retention, local ECAPA clustering, optional pyannote diarization, and output loudness modes such as flat narration, sentence match, and intonation follow
+
+Voice cloning quality depends on source audio quality, diarization accuracy, reference sample selection, and model behavior on short translated sentences. Review the generated `.si.wav`, `_SI.mp4`, or `_DUB.mp4` before using them as final output.
+
+### 5. 2D to Depth VR
 
 The 2D to Depth VR tool converts ordinary 2D videos into stereoscopic VR output using a local Depth Anything 3 Small model:
 
@@ -102,7 +120,7 @@ The 2D to Depth VR tool converts ordinary 2D videos into stereoscopic VR output 
 
 Depth-based 2D-to-VR conversion is an approximation. Scenes with large occlusions, fast motion, strong blur, or inaccurate monocular depth may show stereo artifacts, so short test clips are recommended.
 
-### 5. VR Video Utilities
+### 6. VR Video Utilities
 
 The toolkit also includes common VR helpers:
 
@@ -112,7 +130,7 @@ The toolkit also includes common VR helpers:
 - Take screenshots and inspect local areas
 - Run batch processing scripts
 
-### 6. VR Video DLNA Server
+### 7. VR Video DLNA Server
 
 A highly cohesive and lightweight LAN DLNA / UPnP video streaming server:
 
@@ -136,6 +154,7 @@ From the launcher, choose the tool you need:
 - **VR Video DLNA Server**: One-click startup/shutdown for LAN DLNA sharing, providing an independent config window for directories, port, and subtitles.
 - `Japanese Batch Subtitle Tools`: subtitle generation, translation, and batch tools
 - `Simultaneous Interpretation Voice`: generate `.si.wav` from subtitles and mix SI audio into MP4/MKV videos
+- `Clone Translation Dubbing`: transcribe and translate a video, clone per-speaker voices, generate `<video>.si.wav`, and remix it as `_SI.mp4` or `_DUB.mp4`
 - `2D to Depth VR`: convert 2D videos into depth-based VR180 SBS output
 - `VR Hard Subtitle Embed Tool`: hard subtitle embedding for VR video
 - Other buttons: split/combine, projection conversion, flat conversion, and small utilities
@@ -162,6 +181,11 @@ Required executables and packages:
 - Native AI/GPU packages: `torch==2.8.0`, `torchvision==0.23.0`, and `torchaudio==2.8.0` from the PyTorch `cu128` wheel index, plus `ultralytics==8.4.4`, `mmengine==0.10.7`, `omegaconf`, `einops`, `safetensors`, and `opencv-python`
 - Optional/local models:
   - Qwen3-TTS 12Hz CustomVoice under `models/Qwen3-TTS-12Hz-0.6B-CustomVoice` for SI voice generation
+  - OmniVoice under `models/OmniVoice` for clone translation dubbing
+  - OmniVoice ECAPA under `models/OmniVoice_ECAPA` for local speaker clustering in clone translation dubbing
+  - Kotoba Whisper under `models/kotoba-whisper-v2.0-faster` and/or faster-whisper models under `models/faster-whisper-*` for clone translation transcription
+  - pyannote `speaker-diarization-community-1` under `models/speaker-diarization-community-1` if using pyannote diarization
+  - Bandit-v2 under `models/bandit-v2` for dubbing mode vocal removal
   - Depth Anything 3 Small under `models/DA3/Small` for 2D to Depth VR
 
 Install Python dependencies:
@@ -187,6 +211,7 @@ FFmpeg and the AI engine (Lada or Jasna) must be discoverable by the program. Yo
 │     ├─ tool_subtitle/         Subtitle generation, translation, batch processing
 │     ├─ tool_subembed/         VR subtitle embedding
 │     ├─ tool_si/               Simultaneous interpretation voice and SI audio mixing
+│     ├─ tool_clonevoice/       Clone translation dubbing and dubbing remix
 │     ├─ tool_2dvr/             2D to depth-based VR conversion
 │     ├─ tool_dlna/             LAN DLNA/UPnP video server
 │     ├─ tool_split_combine/    VR split/combine tools
@@ -209,6 +234,7 @@ Processed files are usually written next to the input video or to the output dir
 - `_L` / `_R`: left-eye or right-eye video
 - Subtitle tools may generate `.srt`, translated subtitle files, or videos with embedded subtitles
 - SI voice tools generate `.si.wav`; SI video audio mixing outputs `_SI.mp4`
+- Clone translation dubbing generates `<video>.si.wav`; remix outputs `_SI.mp4` for SI mode or `_DUB.mp4` for dubbing mode
 - 2D to Depth VR outputs files such as `_2dvr_flat3d_LR_SBS.mp4` or `_2dvr_hequirect_LR_180_SBS.mp4`
 
 Exact names depend on the selected tool and settings.

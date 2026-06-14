@@ -16,6 +16,11 @@ def get_text(key: str) -> str:
 
 
 VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v")
+GENERATED_MP4_SUFFIXES = ("_si.mp4", "_dub.mp4")
+
+
+def _is_generated_output_mp4(path: str) -> bool:
+    return os.path.basename(path).lower().endswith(GENERATED_MP4_SUFFIXES)
 
 
 class ClonevoiceToolsApp:
@@ -42,6 +47,24 @@ class ClonevoiceToolsApp:
         self._setup_ui()
         self._refresh_asr_model_status()
         self._refresh_voice_model_status()
+        self._start_backend_warmup()
+
+    def _start_backend_warmup(self):
+        """Preload heavy backends in the background so the first run isn't cold.
+
+        Opening this window is light, but the clone pipeline then pays a large
+        one-time `import torch` (~tens of seconds in the packaged build) plus
+        transformers. Warm them on a daemon thread while the user picks files,
+        so clicking Start no longer blocks on the cold import. Best-effort.
+        """
+        def _run():
+            try:
+                import torch  # noqa: F401  -- the expensive cold import
+                import transformers  # noqa: F401
+            except Exception:
+                pass
+
+        threading.Thread(target=_run, name="clonevoice-warmup", daemon=True).start()
 
     # --- UI ---
     def _setup_ui(self):
@@ -844,7 +867,7 @@ class ClonevoiceToolsApp:
         videos = []
         for root, _dirs, files in os.walk(base_dir):
             for name in files:
-                if name.lower().endswith(VIDEO_EXTENSIONS):
+                if name.lower().endswith(VIDEO_EXTENSIONS) and not _is_generated_output_mp4(name):
                     videos.append(os.path.join(root, name))
         return sorted(videos, key=lambda p: p.lower())
 

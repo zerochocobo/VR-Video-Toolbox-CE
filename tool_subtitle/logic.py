@@ -233,6 +233,7 @@ PROFILE_CONFIGS = {
 VIDEO_EXTENSIONS = {".mp4", ".mkv"}
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus"}
 SI_SIDECAR_MEDIA_SUFFIXES = (".si.wav", ".si.mp4")
+GENERATED_MP4_SUFFIXES = ("_si.mp4", "_dub.mp4")
 
 # --- Utility Functions ---
 
@@ -240,14 +241,22 @@ def is_si_sidecar_media_file(path: str | os.PathLike[str]) -> bool:
     return Path(path).name.lower().endswith(SI_SIDECAR_MEDIA_SUFFIXES)
 
 
+def is_generated_output_mp4(path: str | os.PathLike[str]) -> bool:
+    return Path(path).name.lower().endswith(GENERATED_MP4_SUFFIXES)
+
+
 def is_supported_source_media_file(path: str | os.PathLike[str]) -> bool:
     candidate = Path(path)
-    return candidate.suffix.lower() in (VIDEO_EXTENSIONS | AUDIO_EXTENSIONS) and not is_si_sidecar_media_file(candidate)
+    return (
+        candidate.suffix.lower() in (VIDEO_EXTENSIONS | AUDIO_EXTENSIONS)
+        and not is_si_sidecar_media_file(candidate)
+        and not is_generated_output_mp4(candidate)
+    )
 
 
 def is_subtitle_video_candidate(path: str | os.PathLike[str]) -> bool:
     candidate = Path(path)
-    if is_si_sidecar_media_file(candidate):
+    if is_si_sidecar_media_file(candidate) or is_generated_output_mp4(candidate):
         return False
     name = candidate.name.lower()
     return candidate.suffix.lower() in VIDEO_EXTENSIONS and not name.endswith("_srt.mkv")

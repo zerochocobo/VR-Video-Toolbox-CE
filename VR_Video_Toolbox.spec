@@ -103,6 +103,20 @@ for pkg in (
     "torch", "torchvision",
     "ultralytics", "mmengine",
     "faster_whisper", "auditok",
+    # --- tool_clonevoice (voice clone / dubbing) runtime deps ---
+    # These are imported lazily/dynamically inside functions, so PyInstaller's
+    # static graph misses their submodules and sibling native DLLs.
+    #   whisperx : whisperx.audio/asr/alignment accessed via attribute ->
+    #              "No module named 'whisperx.audio'" without collect_all.
+    #   pyannote : pyannote.audio loads pipelines/models by dotted string.
+    #   omnivoice: OmniVoice TTS + ECAPA-WavLM speaker model, config-driven
+    #              instantiation through transformers.
+    #   ctranslate2: faster-whisper's native backend; ships ctranslate2.dll +
+    #              cudnn64_9.dll + libiomp5md.dll that static analysis won't grab.
+    #   torio    : backs torchaudio.io.StreamReader used by the Bandit vocal
+    #              separator (separate.py); separate top-level pkg.
+    #   keyring  : translation API keys via entry-point-discovered backends.
+    "whisperx", "pyannote", "omnivoice", "ctranslate2", "torio", "keyring",
     "nvidia",
     # 2D->Depth VR DA3 runtime deps. DA3 source is vendored under tool_2dvr;
     # model weights stay outside the exe under models/DA3/Small.
@@ -138,9 +152,32 @@ a = Analysis(
         "packaging/runtime_hook_logging.py",
         "packaging/runtime_hook_cuda.py",
     ],
-    excludes=[],
+    # torchcodec is a half-usable dependency in this build: pyannote imports it for
+    # built-in audio decoding, but the diarization path here always feeds an in-memory
+    # waveform (tool_clonevoice/diarize.py), so its decoder is never used. Leaving the
+    # package in (without its .dist-info metadata and with a native libtorchcodec*.dll
+    # that needs FFmpeg 7 on the DLL path) causes the recurring noise/crashes:
+    #   - importlib.metadata.version("torchcodec") -> PackageNotFoundError, surfaced as
+    #     "Could not import module 'HiggsAudioV2TokenizerModel'" (transformers audio_utils);
+    #   - "Could not load libtorchcodec ... FFmpeg version 7" warning every run.
+    # Excluding it makes find_spec("torchcodec") return None everywhere, so:
+    #   transformers is_torchcodec_available() -> False (skips the metadata call),
+    #   torchaudio imports it lazily in try/except (load_with_torchcodec) -> fine,
+    #   pyannote's guarded `import torchcodec` -> clean ModuleNotFoundError -> waveform path.
+    # omnivoice decodes via soundfile/librosa/torchaudio and never touches torchcodec.
+    excludes=["torchcodec"],
     cipher=block_cipher,
     noarchive=False,
+    # NOTE: transformers >=4.55 builds its lazy import map at runtime via
+    # define_import_structure(), which os.scandir()s the package dir using the
+    # module's __file__. This already works under the contrib hook-transformers
+    # default 'pyz+py' mode: PyInstaller's frozen importer sets __file__ to the
+    # on-disk .py (pyimod02_importers.py, NOT a .pyc), and pyz+py keeps that
+    # source on disk, so the scan succeeds while bytecode still loads fast from
+    # the PYZ. Do NOT force {'transformers': 'py'} -- that drops transformers out
+    # of the PYZ and recompiles ~2000 source files on first import, badly slowing
+    # the synthesis step. The "Could not import module 'HiggsAudioV2TokenizerModel'"
+    # crash was the torchcodec metadata issue, fixed by excludes=['torchcodec'].
 )
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)

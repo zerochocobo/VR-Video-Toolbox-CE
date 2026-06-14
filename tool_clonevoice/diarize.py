@@ -11,11 +11,22 @@ A turn is ``(start, end, speaker)``. Backends:
 from __future__ import annotations
 
 import sys
+import warnings
 import wave
 import shutil
 import gc
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
+
+# pyannote.audio.core.io warns at import time when torchcodec can't be loaded.
+# torchcodec is deliberately excluded from the packaged build (we always feed an
+# in-memory waveform, never pyannote's file decoder), so the warning is pure
+# noise. Silence it before pyannote is imported anywhere below.
+warnings.filterwarnings(
+    "ignore",
+    message=r"(?s).*torchcodec is not installed correctly.*",
+    category=UserWarning,
+)
 
 LogCallback = Callable[[str], None]
 Turn = Tuple[float, float, str]
