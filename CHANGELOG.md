@@ -2,6 +2,10 @@
 
 ## English
 
+### 2026-06-21
+
+- Change: Removed the local 2D-to-VR implementation. The launcher button now shows a migration notice and links to the VR Passthrough Server download at https://wapok.com.
+
 ### 2026-06-14
 
 - New: Added Clone Translation Dubbing documentation and workflow notes, covering per-speaker voice cloning, SI remix output `_SI.mp4`, and dubbing output `_DUB.mp4`.

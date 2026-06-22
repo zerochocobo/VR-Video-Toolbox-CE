@@ -176,10 +176,148 @@ class ContentDirectoryTests(unittest.TestCase):
         self.assertEqual(status, 200)
         text = html.unescape(payload.decode("utf-8"))
         self.assertIn('id="v_movie.mp4"', text)
-        self.assertIn('id="vs_movie.mp4"', text)
+        self.assertIn('<container id="vs_movie.mp4"', text)
+        self.assertIn('childCount="2"', text)
         self.assertIn("<dc:title>[SI] movie_LR_180_SBS</dc:title>", text)
-        self.assertIn("/media_si/movie.mp4", text)
-        self.assertIn("DLNA.ORG_CI=1", text)
+        self.assertNotIn("/media_si/movie.mp4", text)
+
+    def test_browse_si_directory_lists_time_index_and_live_chapter(self) -> None:
+        class FakeSIService:
+            def current_config(self):
+                return SIMixConfig(enabled=True)
+
+            def has_si_source(self, video):
+                candidate = Path(video).with_suffix(".si.wav")
+                return candidate if candidate.is_file() else None
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            video = root / "movie.mp4"
+            video.write_bytes(b"video")
+            video.with_suffix(".si.wav").write_bytes(b"wav")
+            library = MediaLibrary(build_media_roots([root]))
+
+            with patch.object(
+                cds,
+                "probe_cached",
+                return_value={"width": 3840, "height": 1920, "duration": 60.0, "size": 5, "bitrate": 1000},
+            ):
+                payload, status = cds.handle_soap(
+                    '"urn:schemas-upnp-org:service:ContentDirectory:1#Browse"',
+                    _browse_body("vs_movie.mp4"),
+                    "http://127.0.0.1:8090",
+                    library,
+                    True,
+                    si_service=FakeSIService(),
+                )
+
+        self.assertEqual(status, 200)
+        text = html.unescape(payload.decode("utf-8"))
+        self.assertIn('<container id="vst_movie.mp4"', text)
+        self.assertIn("<dc:title>[Select Time Index]_[SI] movie_LR_180_SBS</dc:title>", text)
+        self.assertIn('id="vsc_movie.mp4@0"', text)
+        self.assertIn("/si_live/movie.mp4.ts?t=0", text)
+        self.assertIn("video/MP2T", text)
+        self.assertIn("DLNA.ORG_OP=00", text)
+        self.assertNotIn("DLNA.ORG_FLAGS", text)
+        self.assertNotIn("duration=", text)
+        self.assertNotIn("bitrate=", text)
+        self.assertNotIn("/media_si/movie.mp4", text)
+
+    def test_browse_si_directory_uses_deovr_legacy_live_shape(self) -> None:
+        class FakeSIService:
+            def current_config(self):
+                return SIMixConfig(enabled=True)
+
+            def has_si_source(self, video):
+                candidate = Path(video).with_suffix(".si.wav")
+                return candidate if candidate.is_file() else None
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            video = root / "movie.mp4"
+            video.write_bytes(b"video")
+            video.with_suffix(".si.wav").write_bytes(b"wav")
+            library = MediaLibrary(build_media_roots([root]))
+
+            with patch.object(
+                cds,
+                "probe_cached",
+                return_value={"width": 3840, "height": 1920, "duration": 60.0, "size": 5, "bitrate": 1000},
+            ):
+                payload, status = cds.handle_soap(
+                    '"urn:schemas-upnp-org:service:ContentDirectory:1#Browse"',
+                    _browse_body("vs_movie.mp4"),
+                    "http://127.0.0.1:8090",
+                    library,
+                    True,
+                    si_service=FakeSIService(),
+                    client_profile="deovr",
+                    language="zh-CN",
+                )
+
+        self.assertEqual(status, 200)
+        text = html.unescape(payload.decode("utf-8"))
+        self.assertIn("<dc:title>[选择时间索引]_[SI] movie_LR_180_SBS</dc:title>", text)
+        self.assertIn("/si_live/movie.mp4?t=0", text)
+        self.assertNotIn("/si_live/movie.mp4.ts", text)
+        self.assertIn("DLNA.ORG_OP=10", text)
+        self.assertIn("DLNA.ORG_FLAGS=41700000000000000000000000000000", text)
+        self.assertIn('duration="0:01:00.000"', text)
+        self.assertIn('bitrate="1000"', text)
+
+    def test_browse_si_time_index_leaf_plays_si_live(self) -> None:
+        class FakeSIService:
+            def current_config(self):
+                return SIMixConfig(enabled=True)
+
+            def has_si_source(self, video):
+                candidate = Path(video).with_suffix(".si.wav")
+                return candidate if candidate.is_file() else None
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            video = root / "movie.mp4"
+            video.write_bytes(b"video")
+            video.with_suffix(".si.wav").write_bytes(b"wav")
+            library = MediaLibrary(build_media_roots([root]))
+
+            with patch.object(
+                cds,
+                "probe_cached",
+                return_value={"width": 3840, "height": 1920, "duration": 60.0, "size": 5, "bitrate": 1000},
+            ):
+                minute_payload, minute_status = cds.handle_soap(
+                    '"urn:schemas-upnp-org:service:ContentDirectory:1#Browse"',
+                    _browse_body("vst_movie.mp4"),
+                    "http://127.0.0.1:8090",
+                    library,
+                    True,
+                    si_service=FakeSIService(),
+                )
+                leaf_payload, leaf_status = cds.handle_soap(
+                    '"urn:schemas-upnp-org:service:ContentDirectory:1#Browse"',
+                    _browse_body("vsm_movie.mp4@0"),
+                    "http://127.0.0.1:8090",
+                    library,
+                    True,
+                    si_service=FakeSIService(),
+                )
+
+        self.assertEqual(minute_status, 200)
+        minute_text = html.unescape(minute_payload.decode("utf-8"))
+        self.assertIn('<container id="vsm_movie.mp4@0"', minute_text)
+        self.assertIn("<dc:title>00:00_[SI] movie_LR_180_SBS</dc:title>", minute_text)
+
+        self.assertEqual(leaf_status, 200)
+        leaf_text = html.unescape(leaf_payload.decode("utf-8"))
+        self.assertIn('id="vsp_movie.mp4@0"', leaf_text)
+        self.assertIn("/si_live/movie.mp4.ts?t=0", leaf_text)
+        self.assertIn('id="vsp_movie.mp4@55"', leaf_text)
+        self.assertIn("/si_live/movie.mp4.ts?t=55", leaf_text)
+        self.assertIn("video/MP2T", leaf_text)
+        self.assertIn("DLNA.ORG_OP=00", leaf_text)
+        self.assertNotIn("DLNA.ORG_FLAGS", leaf_text)
 
     def test_browse_omits_si_entry_when_disabled(self) -> None:
         class FakeSIService:
@@ -249,9 +387,10 @@ class ContentDirectoryTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         text = html.unescape(payload.decode("utf-8"))
-        self.assertIn('id="vs_movie.mp4"', text)
+        self.assertIn('<container id="vs_movie.mp4"', text)
+        self.assertIn('childCount="2"', text)
         self.assertIn("<dc:title>[SI] movie_LR_180_SBS</dc:title>", text)
-        self.assertIn("/media_si/movie.mp4", text)
+        self.assertNotIn("/media_si/movie.mp4", text)
 
     def test_browse_metadata_for_disabled_si_entry_reports_zero_matches(self) -> None:
         class FakeSIService:

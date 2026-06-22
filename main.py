@@ -38,6 +38,7 @@ from tkinter import messagebox
 
 ver_name = "v1.0 (build 2026-06-14)"
 DLNA_SERVER_EXE_NAME = "vr_dlna_server.exe"
+TWO_DVR_DOWNLOAD_URL = "https://wapok.com"
 
 
 def build_hidden_startupinfo():
@@ -360,7 +361,7 @@ class VRVideoToolboxLauncher:
             cursor="hand2"
         )
         link_lbl.pack(anchor='w')
-        link_lbl.bind("<Button-1>", lambda e: webbrowser.open("https://wapok.com"))
+        link_lbl.bind("<Button-1>", lambda e: webbrowser.open(TWO_DVR_DOWNLOAD_URL))
         
         dlna_frame.columnconfigure(0, weight=1)
         dlna_frame.columnconfigure(1, weight=1)
@@ -548,10 +549,41 @@ class VRVideoToolboxLauncher:
         self.app = v360_trans_main.VRTransApp(self.root, on_return=self.request_show_launcher)
 
     def launch_2dvr(self):
-        from tool_2dvr import main as two_d_vr_main
+        self.show_2dvr_migration_dialog()
 
-        self.clear_frame()
-        self.app = two_d_vr_main.TwoDToVRApp(self.root, on_return=self.request_show_launcher)
+    def show_2dvr_migration_dialog(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title(get_text('title_2dvr_migrated'))
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill='both', expand=True)
+
+        ttk.Label(
+            frame,
+            text=get_text('msg_2dvr_migrated'),
+            wraplength=440,
+            justify='left',
+        ).pack(anchor='w', fill='x')
+
+        link = ttk.Label(
+            frame,
+            text=get_text('link_2dvr_download'),
+            style="Link.TLabel",
+            cursor="hand2",
+        )
+        link.pack(anchor='w', pady=(10, 12))
+        link.bind("<Button-1>", lambda _e: webbrowser.open(TWO_DVR_DOWNLOAD_URL))
+
+        ttk.Button(frame, text=get_text('btn_close'), command=dialog.destroy, width=10).pack(anchor='e')
+        dialog.bind('<Escape>', lambda _e: dialog.destroy())
+
+        dialog.update_idletasks()
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - dialog.winfo_width()) // 2)
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - dialog.winfo_height()) // 2)
+        dialog.geometry(f"+{x}+{y}")
 
     def launch_tools(self):
         from tools import gui as tools_gui
@@ -661,21 +693,41 @@ class VRVideoToolboxLauncher:
 
     def show_dlna_config_dialog(self, require_dirs=False):
         """Show dynamic dialog for server config with path scanner."""
+        from tool_si import logic as si_logic
+
         current_name = app_config.get('dlna_server_name', 'VR Video Server')
         current_port = app_config.get('dlna_port', 8090)
         current_auto_sub = app_config.get('dlna_auto_subnotes', True) if app_config.get('dlna_auto_subnotes') is not None else app_config.get('dlna_auto_subtitles', True)
         current_dirs_str = app_config.get('dlna_video_dirs', '') or ''
         current_dirs = [d.strip() for d in str(current_dirs_str).split('|') if d.strip()]
+        current_si_enabled = bool(app_config.get('dlna_si_enabled', True))
+
+        def _saved_si_value(key, default):
+            return app_config.get(key, default) if current_si_enabled else default
+
+        def _int_choice(value, choices, default):
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                return default
+            return value if value in choices else default
+
+        def _float_choice(value, choices, default):
+            try:
+                value = round(float(value), 1)
+            except (TypeError, ValueError):
+                return default
+            return value if value in choices else default
 
         dialog = tk.Toplevel(self.root)
         dialog.title(get_text('dlna_config_title'))
-        dialog.geometry("640x550")
-        dialog.minsize(560, 490)
+        dialog.geometry("700x680")
+        dialog.minsize(620, 620)
         dialog.resizable(True, True)
         dialog.transient(self.root)
         dialog.grab_set()
         dialog.columnconfigure(1, weight=1)
-        dialog.rowconfigure(5, weight=1)
+        dialog.rowconfigure(6, weight=1)
         saved = {'ok': False}
 
         # Name
@@ -700,11 +752,106 @@ class VRVideoToolboxLauncher:
         auto_sub_var = tk.BooleanVar(value=current_auto_sub)
         ttk.Checkbutton(dialog, text=get_text('lbl_dlna_auto_sub'), variable=auto_sub_var).grid(row=3, column=0, columnspan=2, sticky='w', padx=18, pady=6)
 
+        # Simultaneous interpretation audio
+        si_frame = ttk.LabelFrame(dialog, text=get_text('grp_dlna_si_audio'), padding=(10, 8))
+        si_frame.grid(row=4, column=0, columnspan=2, sticky='ew', padx=18, pady=(4, 8))
+        si_frame.columnconfigure(1, weight=1)
+        si_frame.columnconfigure(3, weight=1)
+
+        si_enabled_var = tk.BooleanVar(value=current_si_enabled)
+        si_enabled_check = ttk.Checkbutton(
+            si_frame,
+            text=get_text('lbl_dlna_si_enabled'),
+            variable=si_enabled_var,
+        )
+        si_enabled_check.grid(row=0, column=0, columnspan=4, sticky='w', pady=(0, 6))
+
+        si_options_frame = ttk.Frame(si_frame)
+        si_options_frame.grid(row=1, column=0, columnspan=4, sticky='ew')
+        si_options_frame.columnconfigure(1, weight=1)
+        si_options_frame.columnconfigure(3, weight=1)
+
+        channel_map = {
+            get_text('opt_dlna_si_channel_both'): 'both',
+            get_text('opt_dlna_si_channel_left'): 'left',
+            get_text('opt_dlna_si_channel_right'): 'right',
+        }
+        channel_label_by_value = {value: label for label, value in channel_map.items()}
+        current_channel = str(_saved_si_value('dlna_si_mix_channel', 'both')).strip().lower()
+        si_channel_var = tk.StringVar(value=channel_label_by_value.get(current_channel, channel_label_by_value['both']))
+
+        current_orig_vol = _int_choice(
+            _saved_si_value('dlna_si_original_volume_percent', 100),
+            si_logic.ORIGINAL_VOLUME_CHOICES,
+            100,
+        )
+        current_si_vol = _int_choice(
+            _saved_si_value('dlna_si_volume_percent', 100),
+            si_logic.SI_VOLUME_CHOICES,
+            100,
+        )
+        current_si_delay = _float_choice(
+            _saved_si_value('dlna_si_delay_seconds', 1.0),
+            si_logic.SI_DELAY_SECONDS_CHOICES,
+            1.0,
+        )
+        si_origvol_var = tk.StringVar(value=f"{current_orig_vol}%")
+        si_volume_var = tk.StringVar(value=f"{current_si_vol}%")
+        si_delay_var = tk.StringVar(value=f"{current_si_delay:g}s")
+        si_duck_var = tk.BooleanVar(value=bool(_saved_si_value('dlna_si_duck_original', True)))
+
+        ttk.Label(si_options_frame, text=get_text('lbl_dlna_si_channel')).grid(row=0, column=0, sticky='w', padx=(0, 6), pady=2)
+        ttk.Combobox(
+            si_options_frame,
+            textvariable=si_channel_var,
+            values=list(channel_map),
+            width=18,
+            state='readonly',
+        ).grid(row=0, column=1, sticky='w', pady=2)
+        ttk.Label(si_options_frame, text=get_text('lbl_dlna_si_original_volume')).grid(row=0, column=2, sticky='w', padx=(14, 6), pady=2)
+        ttk.Combobox(
+            si_options_frame,
+            textvariable=si_origvol_var,
+            values=[f"{v}%" for v in si_logic.ORIGINAL_VOLUME_CHOICES],
+            width=10,
+            state='readonly',
+        ).grid(row=0, column=3, sticky='w', pady=2)
+        ttk.Label(si_options_frame, text=get_text('lbl_dlna_si_volume')).grid(row=1, column=0, sticky='w', padx=(0, 6), pady=2)
+        ttk.Combobox(
+            si_options_frame,
+            textvariable=si_volume_var,
+            values=[f"{v}%" for v in si_logic.SI_VOLUME_CHOICES],
+            width=10,
+            state='readonly',
+        ).grid(row=1, column=1, sticky='w', pady=2)
+        ttk.Label(si_options_frame, text=get_text('lbl_dlna_si_delay')).grid(row=1, column=2, sticky='w', padx=(14, 6), pady=2)
+        ttk.Combobox(
+            si_options_frame,
+            textvariable=si_delay_var,
+            values=[f"{v:g}s" for v in si_logic.SI_DELAY_SECONDS_CHOICES],
+            width=10,
+            state='readonly',
+        ).grid(row=1, column=3, sticky='w', pady=2)
+        ttk.Checkbutton(
+            si_options_frame,
+            text=get_text('lbl_dlna_si_duck_original'),
+            variable=si_duck_var,
+        ).grid(row=2, column=0, columnspan=4, sticky='w', pady=(4, 0))
+
+        def refresh_si_options():
+            if si_enabled_var.get():
+                si_options_frame.grid()
+            else:
+                si_options_frame.grid_remove()
+
+        si_enabled_check.config(command=refresh_si_options)
+        refresh_si_options()
+
         # Path List
-        ttk.Label(dialog, text=get_text('lbl_dlna_dirs')).grid(row=4, column=0, columnspan=2, sticky='w', padx=18, pady=(12, 4))
+        ttk.Label(dialog, text=get_text('lbl_dlna_dirs')).grid(row=5, column=0, columnspan=2, sticky='w', padx=18, pady=(12, 4))
 
         list_frame = ttk.Frame(dialog)
-        list_frame.grid(row=5, column=0, columnspan=2, sticky='nsew', padx=18, pady=4)
+        list_frame.grid(row=6, column=0, columnspan=2, sticky='nsew', padx=18, pady=4)
         
         listbox = tk.Listbox(list_frame, height=10, font=('Arial', 10))
         listbox.pack(side='left', fill='both', expand=True)
@@ -718,7 +865,7 @@ class VRVideoToolboxLauncher:
 
         # Add/Del
         btn_dirs_frame = ttk.Frame(dialog)
-        btn_dirs_frame.grid(row=6, column=0, columnspan=2, sticky='e', padx=18, pady=(8, 6))
+        btn_dirs_frame.grid(row=7, column=0, columnspan=2, sticky='e', padx=18, pady=(8, 6))
         
         def add_directory():
             chosen = filedialog.askdirectory(parent=dialog)
@@ -738,7 +885,7 @@ class VRVideoToolboxLauncher:
 
         # Bottom Buttons
         bottom_btn_frame = ttk.Frame(dialog)
-        bottom_btn_frame.grid(row=7, column=0, columnspan=2, sticky='e', padx=18, pady=(10, 18))
+        bottom_btn_frame.grid(row=8, column=0, columnspan=2, sticky='e', padx=18, pady=(10, 18))
 
         def save_config():
             name = name_var.get().strip()
@@ -762,9 +909,12 @@ class VRVideoToolboxLauncher:
             app_config.set('dlna_port', port)
             app_config.set('dlna_auto_subtitles', auto_sub)
             app_config.set('dlna_auto_subnotes', auto_sub)  # Dual save for compat
-            # DLNA SI live-mix feature is currently disabled (UI hidden). Force the
-            # flag off on every save so any previously-enabled config gets cleared.
-            app_config.set('dlna_si_enabled', False)
+            app_config.set('dlna_si_enabled', bool(si_enabled_var.get()))
+            app_config.set('dlna_si_mix_channel', channel_map.get(si_channel_var.get(), 'both'))
+            app_config.set('dlna_si_original_volume_percent', int(si_origvol_var.get().rstrip('%')))
+            app_config.set('dlna_si_volume_percent', int(si_volume_var.get().rstrip('%')))
+            app_config.set('dlna_si_delay_seconds', float(si_delay_var.get().rstrip('s')))
+            app_config.set('dlna_si_duck_original', bool(si_duck_var.get()))
             app_config.set('dlna_video_dirs', dirs_str)
 
             saved['ok'] = True

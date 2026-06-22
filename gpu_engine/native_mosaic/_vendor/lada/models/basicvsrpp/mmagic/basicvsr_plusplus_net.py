@@ -324,6 +324,21 @@ class SecondOrderDeformableAlignment(ModulatedDeformConv2d):
         # mask
         mask = torch.sigmoid(mask)
 
+        # CUDA-graph-/TRT-friendly DCNv2: torchvision.ops.deform_conv2d is a fused
+        # native op that cannot be captured in a CUDA graph (Windows 0xc0000409)
+        # nor expressed by TRT without a custom plugin. Default to the capturable
+        # pure-PyTorch equivalent; set VRVT_NATIVE_DCN=0 to use torchvision.
+        try:
+            from gpu_engine.native_mosaic._deform_conv_native import (
+                deform_conv2d_native, native_dcn_enabled,
+            )
+            _use_native = native_dcn_enabled()
+        except Exception:
+            _use_native = False
+        if _use_native:
+            return deform_conv2d_native(x, offset, self.weight, self.bias,
+                                        self.stride, self.padding,
+                                        self.dilation, mask)
         return torchvision.ops.deform_conv2d(x, offset, self.weight, self.bias,
                                              self.stride, self.padding,
                                              self.dilation, mask)
@@ -492,9 +507,14 @@ class SPyNet(BaseModule):
             mode='bilinear',
             align_corners=False)
 
-        # adjust the flow values
-        flow[:, 0, :, :] *= float(w) / float(w_up)
-        flow[:, 1, :, :] *= float(h) / float(h_up)
+        # adjust the flow values. Out-of-place + scalar muls + cat, chosen to be
+        # both export-friendly and CUDA-graph-capturable: in-place slice mutation
+        # (flow[:, 0] *= ...) becomes slice_scatter (breaks torch.export), while
+        # new_tensor([..]) does a host allocation that is illegal during graph
+        # capture. Scalar*tensor and cat avoid both. Mathematically identical.
+        fx = flow[:, 0:1, :, :] * (float(w) / float(w_up))
+        fy = flow[:, 1:2, :, :] * (float(h) / float(h_up))
+        flow = torch.cat([fx, fy], dim=1)
 
         return flow
 

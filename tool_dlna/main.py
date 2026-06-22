@@ -54,11 +54,12 @@ def main() -> int:
         "dlna_port": 8090,
         "dlna_video_dirs": "",
         "dlna_auto_subtitles": True,
-        "dlna_si_enabled": False,
-        "dlna_si_mix_channel": "left",
+        "dlna_si_enabled": True,
+        "dlna_si_mix_channel": "both",
         "dlna_si_original_volume_percent": 100,
-        "dlna_si_volume_percent": 50,
+        "dlna_si_volume_percent": 100,
         "dlna_si_delay_seconds": 1.0,
+        "dlna_si_duck_original": True,
     }
 
     # 3. Read persists config

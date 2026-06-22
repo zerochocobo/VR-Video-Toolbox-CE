@@ -33,6 +33,18 @@ class AppConfigLanguageTests(unittest.TestCase):
         with patch.object(app_config, "get_system_language", return_value="zh"):
             self.assertEqual(app_config.get_language(), "zh")
 
+    def test_dlna_si_defaults_match_live_mix_ui(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            app_config._cache = {}
+            app_config._CONFIG_PATH = str(Path(raw) / "config.json")
+
+            self.assertTrue(app_config.get("dlna_si_enabled"))
+            self.assertEqual(app_config.get("dlna_si_mix_channel"), "both")
+            self.assertEqual(app_config.get("dlna_si_original_volume_percent"), 100)
+            self.assertEqual(app_config.get("dlna_si_volume_percent"), 100)
+            self.assertEqual(app_config.get("dlna_si_delay_seconds"), 1.0)
+            self.assertTrue(app_config.get("dlna_si_duck_original"))
+
     def test_set_language_persists_global_language(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             app_config._cache = {}

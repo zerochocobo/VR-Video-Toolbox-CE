@@ -25,9 +25,6 @@ PROJECT_ROOT = os.path.abspath(os.getcwd())
 _VENDOR_ABS = os.path.join(PROJECT_ROOT, "gpu_engine", "native_mosaic", "_vendor")
 if _VENDOR_ABS not in sys.path:
     sys.path.insert(0, _VENDOR_ABS)
-_DA3_VENDOR_ABS = os.path.join(PROJECT_ROOT, "tool_2dvr", "_vender", "da3")
-if os.path.isdir(_DA3_VENDOR_ABS) and _DA3_VENDOR_ABS not in sys.path:
-    sys.path.insert(0, _DA3_VENDOR_ABS)
 _QWEN_TTS_VENDOR_ABS = os.path.join(PROJECT_ROOT, "tool_si", "_vendor", "qwen_tts")
 
 datas = [
@@ -61,18 +58,6 @@ except TypeError:
 _LADA_CSV = os.path.join(_VENDOR_ABS, "lada", "utils", "encoding_presets.csv")
 if os.path.isfile(_LADA_CSV):
     datas.append((_LADA_CSV, os.path.join("lada", "utils")))
-
-# Vendored Depth Anything 3 is imported as the top-level package
-# `depth_anything_3`. Its config creates modules dynamically from strings, so
-# collect all submodules explicitly and ship YAML configs as data.
-if os.path.isdir(_DA3_VENDOR_ABS):
-    try:
-        hiddenimports += collect_submodules("depth_anything_3", on_error="ignore")
-    except TypeError:
-        hiddenimports += collect_submodules("depth_anything_3")
-    _DA3_CONFIGS = os.path.join(_DA3_VENDOR_ABS, "depth_anything_3", "configs")
-    if os.path.isdir(_DA3_CONFIGS):
-        datas.append((_DA3_CONFIGS, os.path.join("depth_anything_3", "configs")))
 
 # Vendored Qwen3-TTS is imported through tool_si._vendor.qwen_tts. Compile all
 # modules into the PYZ, and also mirror the source files under _internal because
@@ -118,8 +103,7 @@ for pkg in (
     #   keyring  : translation API keys via entry-point-discovered backends.
     "whisperx", "pyannote", "omnivoice", "ctranslate2", "torio", "keyring",
     "nvidia",
-    # 2D->Depth VR DA3 runtime deps. DA3 source is vendored under tool_2dvr;
-    # model weights stay outside the exe under models/DA3/Small.
+    # Qwen/Whisper/Transformers config and checkpoint helpers.
     "omegaconf", "safetensors", "einops",
     # Qwen3-TTS runtime deps. The model weights stay outside the exe under
     # models/Qwen3-TTS-12Hz-0.6B-CustomVoice.
@@ -143,7 +127,7 @@ for pkg in (
 
 a = Analysis(
     ["main.py"],
-    pathex=[PROJECT_ROOT, _VENDOR_ABS, _DA3_VENDOR_ABS],
+    pathex=[PROJECT_ROOT, _VENDOR_ABS],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,

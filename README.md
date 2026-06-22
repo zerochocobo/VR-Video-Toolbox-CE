@@ -106,19 +106,9 @@ The clone translation dubbing tool is designed for translated dubbing workflows,
 
 Voice cloning quality depends on source audio quality, diarization accuracy, reference sample selection, and model behavior on short translated sentences. Review the generated `.si.wav`, `_SI.mp4`, or `_DUB.mp4` before using them as final output.
 
-### 5. 2D to Depth VR
+### 5. 2D to 3D/VR
 
-The 2D to Depth VR tool converts ordinary 2D videos into stereoscopic VR output using a local Depth Anything 3 Small model:
-
-- Estimate per-frame depth locally and render left/right eye views
-- Output VR180 side-by-side MP4 files
-- Support flat 3D, half-equirectangular VR180, and fisheye projection outputs
-- Select start time and duration, including short test windows before processing a full video
-- Adjust eye distance and choose production-oriented hole-fill modes
-- Use temporal stabilization options to reduce depth flicker
-- Prefer the PyNvVideoCodec/CUDA path where available, with FFmpeg fallback
-
-Depth-based 2D-to-VR conversion is an approximation. Scenes with large occlusions, fast motion, strong blur, or inaccurate monocular depth may show stereo artifacts, so short test clips are recommended.
+2D to 3D/VR conversion has moved to the VR Passthrough Server project. It supports real-time and offline 2D to 3D conversion with better quality and faster speed. Download it from https://wapok.com.
 
 ### 6. VR Video Utilities
 
@@ -155,7 +145,7 @@ From the launcher, choose the tool you need:
 - `Japanese Batch Subtitle Tools`: subtitle generation, translation, and batch tools
 - `Simultaneous Interpretation Voice`: generate `.si.wav` from subtitles and mix SI audio into MP4/MKV videos
 - `Clone Translation Dubbing`: transcribe and translate a video, clone per-speaker voices, generate `<video>.si.wav`, and remix it as `_SI.mp4` or `_DUB.mp4`
-- `2D to Depth VR`: convert 2D videos into depth-based VR180 SBS output
+- `2D to 3D/VR`: opens the migration notice for the VR Passthrough Server download
 - `VR Hard Subtitle Embed Tool`: hard subtitle embedding for VR video
 - Other buttons: split/combine, projection conversion, flat conversion, and small utilities
 
@@ -186,7 +176,6 @@ Required executables and packages:
   - Kotoba Whisper under `models/kotoba-whisper-v2.0-faster` and/or faster-whisper models under `models/faster-whisper-*` for clone translation transcription
   - pyannote `speaker-diarization-community-1` under `models/speaker-diarization-community-1` if using pyannote diarization
   - Bandit-v2 under `models/bandit-v2` for dubbing mode vocal removal
-  - Depth Anything 3 Small under `models/DA3/Small` for 2D to Depth VR
 
 Install Python dependencies:
 
@@ -212,7 +201,6 @@ FFmpeg and the AI engine (Lada or Jasna) must be discoverable by the program. Yo
 │     ├─ tool_subembed/         VR subtitle embedding
 │     ├─ tool_si/               Simultaneous interpretation voice and SI audio mixing
 │     ├─ tool_clonevoice/       Clone translation dubbing and dubbing remix
-│     ├─ tool_2dvr/             2D to depth-based VR conversion
 │     ├─ tool_dlna/             LAN DLNA/UPnP video server
 │     ├─ tool_split_combine/    VR split/combine tools
 │     ├─ tool_v360_trans/       VR projection conversion
@@ -235,7 +223,6 @@ Processed files are usually written next to the input video or to the output dir
 - Subtitle tools may generate `.srt`, translated subtitle files, or videos with embedded subtitles
 - SI voice tools generate `.si.wav`; SI video audio mixing outputs `_SI.mp4`
 - Clone translation dubbing generates `<video>.si.wav`; remix outputs `_SI.mp4` for SI mode or `_DUB.mp4` for dubbing mode
-- 2D to Depth VR outputs files such as `_2dvr_flat3d_LR_SBS.mp4` or `_2dvr_hequirect_LR_180_SBS.mp4`
 
 Exact names depend on the selected tool and settings.
 

@@ -4,6 +4,7 @@ import logging
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 try:
     from tool_dlna import dlna_server
@@ -39,7 +40,87 @@ class DlnaServerTests(unittest.TestCase):
         self.assertIn((("POST",), "/control/cm"), routes)
         self.assertIn((("GET",), "/media/{name:path}"), routes)
         self.assertIn((("GET",), "/media_si/{name:path}"), routes)
+        self.assertIn((("GET",), "/si_live/{name:path}"), routes)
         self.assertIn((("POST",), "/admin/reload_si_config"), routes)
+
+    def test_si_live_route_streams_mpegts_and_accepts_ts_hint_suffix(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from tool_dlna.media_library import MediaLibrary, build_media_roots
+        from tool_dlna.si_stream import ConfigHolder, SIMixConfig
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            video = root / "movie.mp4"
+            wav = root / "movie.si.wav"
+            video.write_bytes(b"video")
+            wav.write_bytes(b"wav")
+            app = dlna_server.create_app(
+                server_name="Test DLNA",
+                port=8090,
+                media_library=MediaLibrary(build_media_roots([root])),
+                subtitles_enabled=True,
+                device_uuid="00000000-0000-0000-0000-000000000000",
+                lan_ip="127.0.0.1",
+                cache_dir=Path(raw) / "cache",
+                si_config_holder=ConfigHolder(SIMixConfig(enabled=True)),
+            )
+
+            with patch("tool_dlna.si_stream.iter_si_mpegts", return_value=iter([b"tsdata"])) as stream:
+                with TestClient(app) as client:
+                    response = client.get("/si_live/movie.mp4.ts?t=12")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b"tsdata")
+        self.assertEqual(response.headers["x-si-transport"], "mpegts-live")
+        self.assertIn("video/MP2T", response.headers["content-type"])
+        self.assertIn("DLNA.ORG_OP=00", response.headers["contentfeatures.dlna.org"])
+        self.assertEqual(stream.call_args.args[0], video.resolve())
+        self.assertEqual(stream.call_args.args[1], wav)
+        self.assertAlmostEqual(stream.call_args.args[3], 12.0)
+
+    def test_si_live_route_uses_deovr_time_seek_headers(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from tool_dlna.media_library import MediaLibrary, build_media_roots
+        from tool_dlna.si_stream import ConfigHolder, SIMixConfig
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            video = root / "movie.mp4"
+            wav = root / "movie.si.wav"
+            video.write_bytes(b"video")
+            wav.write_bytes(b"wav")
+            app = dlna_server.create_app(
+                server_name="Test DLNA",
+                port=8090,
+                media_library=MediaLibrary(build_media_roots([root])),
+                subtitles_enabled=True,
+                device_uuid="00000000-0000-0000-0000-000000000000",
+                lan_ip="127.0.0.1",
+                cache_dir=Path(raw) / "cache",
+                si_config_holder=ConfigHolder(SIMixConfig(enabled=True)),
+            )
+
+            with patch("tool_dlna.si_stream.iter_si_mpegts", return_value=iter([b"tsdata"])):
+                with TestClient(app) as client:
+                    response = client.get("/si_live/movie.mp4?t=0", headers={"User-Agent": "DeoVR/14.0"})
+
+        self.assertEqual(response.status_code, 200)
+        features = response.headers["contentfeatures.dlna.org"]
+        self.assertIn("DLNA.ORG_OP=10", features)
+        self.assertIn("DLNA.ORG_CI=1", features)
+        self.assertIn("DLNA.ORG_FLAGS=41700000000000000000000000000000", features)
+
+    def test_cds_client_profile_detects_deovr_filter_without_user_agent(self) -> None:
+        fields = {
+            "BrowseFlag": "BrowseDirectChildren",
+            "RequestedCount": "0",
+            "Filter": "res,res@size,res@duration,dc:date,upnp:albumArtURI",
+        }
+
+        self.assertEqual(dlna_server._cds_client_profile({}, fields), "deovr")
+        self.assertIsNone(dlna_server._cds_client_profile({"user-agent": "SKYBOX/2.0"}, fields))
 
     def test_loopback_host_detection(self) -> None:
         self.assertTrue(dlna_server.is_loopback_host("127.0.0.1"))

@@ -449,6 +449,25 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def seed_user_config() -> None:
+    """Place config/ beside the exe, where the app actually reads/writes it.
+
+    tool_subtitle.logic.get_config_dir() resolves to <exe_dir>/config when frozen
+    (next to the exe, so users can edit prompts and the GUI can persist settings).
+    The .spec bundles config/ as data, which PyInstaller drops into _internal/config
+    instead -- a different directory the app never looks at. Without this copy the
+    app finds no <exe>/config/translate_prompt.txt and writes a minimal built-in
+    DEFAULT_PROMPT, silently ignoring the real config/translate_prompt*.txt.
+    """
+    src = ROOT / "config"
+    dst = DIST / "config"
+    if not src.exists():
+        info("WARNING: project config/ not found; skipping beside-exe config seed.")
+        return
+    copy_tree(src, dst)
+    info(f"seeded user config beside exe: {dst}")
+
+
 def main() -> int:
     args = parse_args()
     # Disable UPX because it corrupts CUDA DLLs.
@@ -464,6 +483,7 @@ def main() -> int:
         if not args.skip_dlna:
             build_dlna(pyi)
         merge_dlna_into_main()
+        seed_user_config()
         ensure_cuda_headers()
         # Dedupe + prune to slim the release. The runtime hook adds torch/lib +
         # nvidia/*/bin to the DLL search path, so no DLL needs to live at the

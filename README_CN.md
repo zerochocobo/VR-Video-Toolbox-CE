@@ -113,19 +113,9 @@ SI 的同步和响度仍建议人工试听校对。部分 TTS 结果本身已经
 
 克隆配音质量受源音频质量、说话人分离准确度、参考片段选择，以及模型对短翻译句的表现影响。正式使用前建议人工试听生成的 `.si.wav`、`_SI.mp4` 或 `_DUB.mp4`。
 
-### 5. 2D 转深度 VR
+### 5. 2D 转 3D/VR
 
-2D 转深度 VR 工具使用本地 Depth Anything 3 Small 模型，把普通 2D 视频转换为立体 VR 输出：
-
-- 本地逐帧估计深度，并渲染左右眼画面
-- 输出 VR180 side-by-side MP4
-- 支持 3D 平面、半球等距 VR180 和鱼眼投影输出
-- 可选择开始时间和处理时长，方便先做短片段测试
-- 可调眼距，并提供面向正式输出的空洞填充模式
-- 可选择时序稳定选项，降低深度闪烁
-- 优先使用 PyNvVideoCodec/CUDA 路径，可在不支持时回退 FFmpeg
-
-基于单目深度的 2D 转 VR 是近似效果。大遮挡、快速运动、强模糊或深度估计不准确的场景可能出现立体伪影，建议先用短片段试算。
+2D 转 3D/VR 功能已经迁移到 VR 透视服务器项目。新项目支持实时和离线 2D 转 3D，转换效果更好、速度更快，请访问 https://wapok.com 下载。
 
 ### 6. VR 视频辅助工具
 
@@ -173,7 +163,7 @@ python main.py
 - `日语批量字幕工具`：字幕生成与翻译相关工具
 - `同声传译语音`：从字幕生成 `.si.wav`，并将 SI 音频混入 MP4/MKV 视频
 - `克隆翻译配音`：转录并翻译视频对白，按说话人克隆音色生成 `<视频名>.si.wav`，并可回混为 `_SI.mp4` 或 `_DUB.mp4`
-- `2D转深度VR`：将 2D 视频转换成基于深度估计的 VR180 SBS 输出
+- `2D转3D/VR`：打开 VR 透视服务器下载提示
 - `VR Hard Subtitle Embed Tool`：VR 硬字幕嵌入
 - 其他按钮：VR 拆分合并、投影转换、小工具箱
 
@@ -204,7 +194,6 @@ python main.py
   - 克隆翻译配音的转录可使用 `models/kotoba-whisper-v2.0-faster` 下的 Kotoba Whisper，或 `models/faster-whisper-*` 下的 faster-whisper 模型
   - 如使用 pyannote 说话人分离，需要将 `speaker-diarization-community-1` 放到 `models/speaker-diarization-community-1`
   - 配音模式移除原始人声需要将 Bandit-v2 放到 `models/bandit-v2`
-  - 2D 转深度 VR 需要将 Depth Anything 3 Small 放到 `models/DA3/Small`
 
 Python 依赖安装：
 
@@ -230,7 +219,6 @@ FFmpeg 和 AI 引擎（Lada / Jasna）需要能被程序找到。可以放到系
 │     ├─ tool_subembed/         VR 字幕嵌入
 │     ├─ tool_si/               同声传译语音与 SI 音轨混合
 │     ├─ tool_clonevoice/       克隆翻译配音与配音回混
-│     ├─ tool_2dvr/             2D 转深度 VR
 │     ├─ tool_dlna/             局域网 DLNA/UPnP 视频服务器
 │     ├─ tool_split_combine/    VR 拆分与合并
 │     ├─ tool_v360_trans/       VR 投影转换
@@ -253,7 +241,6 @@ FFmpeg 和 AI 引擎（Lada / Jasna）需要能被程序找到。可以放到系
 - 字幕工具会根据任务生成 `.srt`、翻译后的字幕文件或嵌入字幕后的视频
 - 同声传译语音工具会生成 `.si.wav`；混合 SI 视频音轨会输出 `_SI.mp4`
 - 克隆翻译配音会生成 `<视频名>.si.wav`；回混后同声传译模式输出 `_SI.mp4`，配音模式输出 `_DUB.mp4`
-- 2D 转深度 VR 会输出类似 `_2dvr_flat3d_LR_SBS.mp4` 或 `_2dvr_hequirect_LR_180_SBS.mp4` 的文件
 
 实际命名以所选工具界面提示为准。
 

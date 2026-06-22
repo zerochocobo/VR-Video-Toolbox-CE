@@ -2,6 +2,8 @@
 
 The service exposes a virtual MP4 stream where the original video is copied and
 the first audio track is mixed with the sibling ``.si.wav`` file on demand.
+DLNA directory entries use the separate MPEG-TS live iterator because common VR
+players handle it more reliably than fragmented MP4 for live playback.
 """
 from __future__ import annotations
 
@@ -58,17 +60,18 @@ def _coerce_choice(value: object, choices: tuple[Any, ...], default: Any) -> Any
 @dataclass(frozen=True)
 class SIMixConfig:
     enabled: bool = False
-    mix_channel: str = "left"
+    mix_channel: str = "both"
     original_volume_percent: int = si_logic.DEFAULT_ORIGINAL_VOLUME_PERCENT
-    si_volume_percent: int = si_logic.DEFAULT_SI_VOLUME_PERCENT
+    si_volume_percent: int = 100
     si_delay_seconds: float = si_logic.DEFAULT_SI_DELAY_SECONDS
+    duck_original: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "enabled", _coerce_bool(self.enabled, False))
         object.__setattr__(
             self,
             "mix_channel",
-            _coerce_choice(str(self.mix_channel).strip().lower(), si_logic.SI_MIX_CHANNELS, "left"),
+            _coerce_choice(str(self.mix_channel).strip().lower(), si_logic.SI_MIX_CHANNELS, "both"),
         )
         object.__setattr__(
             self,
@@ -82,7 +85,7 @@ class SIMixConfig:
         object.__setattr__(
             self,
             "si_volume_percent",
-            _coerce_choice(self.si_volume_percent, si_logic.SI_VOLUME_CHOICES, si_logic.DEFAULT_SI_VOLUME_PERCENT),
+            _coerce_choice(self.si_volume_percent, si_logic.SI_VOLUME_CHOICES, 100),
         )
         object.__setattr__(
             self,
@@ -93,6 +96,7 @@ class SIMixConfig:
                 si_logic.DEFAULT_SI_DELAY_SECONDS,
             ),
         )
+        object.__setattr__(self, "duck_original", _coerce_bool(self.duck_original, True))
 
     @classmethod
     def from_app_config(cls, getter: Callable[..., Any]) -> "SIMixConfig":
@@ -104,31 +108,33 @@ class SIMixConfig:
                 return default if value is None else value
 
         return cls(
-            enabled=read("dlna_si_enabled", False),
-            mix_channel=read("dlna_si_mix_channel", "left"),
+            enabled=read("dlna_si_enabled", True),
+            mix_channel=read("dlna_si_mix_channel", "both"),
             original_volume_percent=read("dlna_si_original_volume_percent", si_logic.DEFAULT_ORIGINAL_VOLUME_PERCENT),
-            si_volume_percent=read("dlna_si_volume_percent", si_logic.DEFAULT_SI_VOLUME_PERCENT),
+            si_volume_percent=read("dlna_si_volume_percent", 100),
             si_delay_seconds=read("dlna_si_delay_seconds", si_logic.DEFAULT_SI_DELAY_SECONDS),
+            duck_original=read("dlna_si_duck_original", True),
         )
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any] | None) -> "SIMixConfig":
         source = data or {}
         return cls(
-            enabled=source.get("enabled", source.get("dlna_si_enabled", False)),
-            mix_channel=source.get("mix_channel", source.get("dlna_si_mix_channel", "left")),
+            enabled=source.get("enabled", source.get("dlna_si_enabled", True)),
+            mix_channel=source.get("mix_channel", source.get("dlna_si_mix_channel", "both")),
             original_volume_percent=source.get(
                 "original_volume_percent",
                 source.get("dlna_si_original_volume_percent", si_logic.DEFAULT_ORIGINAL_VOLUME_PERCENT),
             ),
             si_volume_percent=source.get(
                 "si_volume_percent",
-                source.get("dlna_si_volume_percent", si_logic.DEFAULT_SI_VOLUME_PERCENT),
+                source.get("dlna_si_volume_percent", 100),
             ),
             si_delay_seconds=source.get(
                 "si_delay_seconds",
                 source.get("dlna_si_delay_seconds", si_logic.DEFAULT_SI_DELAY_SECONDS),
             ),
+            duck_original=source.get("duck_original", source.get("dlna_si_duck_original", True)),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -138,6 +144,7 @@ class SIMixConfig:
             "original_volume_percent": self.original_volume_percent,
             "si_volume_percent": self.si_volume_percent,
             "si_delay_seconds": self.si_delay_seconds,
+            "duck_original": self.duck_original,
         }
 
     def filter_string(self) -> str:
@@ -146,6 +153,7 @@ class SIMixConfig:
             self.original_volume_percent,
             self.si_volume_percent,
             self.si_delay_seconds,
+            duck_original=self.duck_original,
         )
 
 
@@ -328,8 +336,18 @@ class SIStreamService:
         return self._config_holder.get()
 
     def has_si_source(self, video: Path) -> Path | None:
-        sibling = Path(video).with_suffix(".si.wav")
-        return sibling if sibling.is_file() else None
+        video = Path(video)
+        sibling = video.with_suffix(".si.wav")
+        if sibling.is_file():
+            return sibling
+        target_name = f"{video.stem}.si.wav".casefold()
+        try:
+            for child in video.parent.iterdir():
+                if child.name.casefold() == target_name and child.is_file():
+                    return child
+        except OSError:
+            pass
+        return None
 
     def estimate_output_size(self, video: Path) -> int:
         video = Path(video).resolve()
@@ -511,3 +529,92 @@ class SIStreamService:
             self._sessions.clear()
         for session in sessions:
             self._close_session(session)
+
+
+def iter_si_mpegts(
+    video: Path,
+    si_wav: Path,
+    config: SIMixConfig,
+    start_time: float,
+    *,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+) -> Iterator[bytes]:
+    """Yield a realtime MPEG-TS SI mix stream from ``start_time`` seconds."""
+    seek = f"{max(0.0, float(start_time or 0.0)):.3f}"
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        seek,
+        "-i",
+        str(video),
+        "-ss",
+        seek,
+        "-i",
+        str(si_wav),
+        "-filter_complex",
+        config.filter_string(),
+        "-map",
+        "0:v",
+        "-c:v",
+        "copy",
+        "-map",
+        "[si_track]",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
+        "-muxpreload",
+        "0",
+        "-muxdelay",
+        "0",
+        "-f",
+        "mpegts",
+        "pipe:1",
+    ]
+    proc: subprocess.Popen[bytes] | None = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            **hidden_subprocess_kwargs(),
+        )
+        log.info("Started SI MPEG-TS stream video=%s si=%s seek=%s", video, si_wav, seek)
+        if proc.stdout is None:
+            return
+        read_size = max(1, int(chunk_size))
+        while True:
+            try:
+                chunk = proc.stdout.read(read_size)
+            except (OSError, ValueError):
+                break
+            if not chunk:
+                break
+            yield chunk
+    finally:
+        if proc is not None:
+            for pipe in (getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
+                try:
+                    if pipe is not None:
+                        pipe.close()
+                except Exception:
+                    pass
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=2)
+            except Exception as exc:
+                log.warning("Failed to terminate SI MPEG-TS stream for %s: %s", video, exc)

@@ -7,6 +7,7 @@ from __future__ import annotations
 import html
 import json
 import logging
+import math
 import re
 import subprocess
 from pathlib import Path
@@ -19,7 +20,25 @@ ROOT_ID = "0"
 FOLDER_PREFIX = "d_"
 VIDEO_PREFIX = "v_"
 VIDEO_SI_PREFIX = "vs_"
+SI_CHAPTER_PREFIX = "vsc_"
+SI_TIME_INDEX_PREFIX = "vst_"
+SI_TIME_GROUP_PREFIX = "vsg_"
+SI_TIME_MINUTE_PREFIX = "vsm_"
+SI_TIME_POINT_PREFIX = "vsp_"
 DLNA_FLAGS_BASE = "01700000000000000000000000000000"
+DLNA_FLAGS_TIME_SEEK = "41700000000000000000000000000000"
+DLNA_OP_TIME_SEEK = "10"
+SI_LIVE_CHAPTER_MAX_ITEMS = 10
+SI_LIVE_CHAPTER_MIN_INTERVAL_SEC = 600
+SI_TIME_INDEX_GROUP_SEC = 600
+SI_TIME_INDEX_MINUTE_SEC = 60
+SI_TIME_INDEX_POINT_SEC = 5
+CDS_CLIENT_DEOVR = "deovr"
+_SELECT_TIME_INDEX_LABELS = {
+    "en_US": "Select Time Index",
+    "zh_CN": "选择时间索引",
+    "ja_JP": "時間インデックス選択",
+}
 
 _VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".m4v"}
 _probe_cache: dict[str, dict] = {}
@@ -36,6 +55,119 @@ def _fmt_duration(sec: float) -> str:
     m = int((sec % 3600) // 60)
     s = sec - h * 3600 - m * 60
     return f"{h}:{m:02d}:{s:06.3f}"
+
+
+def _fmt_title_time(sec: int) -> str:
+    sec = max(0, int(sec))
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    return f"{h:02d}:{m:02d}"
+
+
+def _fmt_index_time(sec: int, force_hours: bool = False) -> str:
+    sec = max(0, int(sec))
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    if force_hours or h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def _normalise_ui_language(language: str | None) -> str:
+    value = str(language or "").strip().lower().replace("-", "_")
+    if value.startswith("zh"):
+        return "zh_CN"
+    if value.startswith("ja"):
+        return "ja_JP"
+    return "en_US"
+
+
+def _select_time_index_label(language: str | None = None) -> str:
+    return _SELECT_TIME_INDEX_LABELS[_normalise_ui_language(language)]
+
+
+def _is_deovr_cds_client(client_profile: str | None) -> bool:
+    return str(client_profile or "").strip().lower() == CDS_CLIENT_DEOVR
+
+
+def _si_live_route_hint_suffix(client_profile: str | None = None) -> str:
+    return "" if _is_deovr_cds_client(client_profile) else ".ts"
+
+
+def _duration_seconds(duration: float) -> int:
+    return max(0, int(math.ceil(float(duration or 0.0))))
+
+
+def _si_chapter_offsets(duration: float) -> list[int]:
+    max_items = max(1, int(SI_LIVE_CHAPTER_MAX_ITEMS))
+    min_interval = max(1, int(SI_LIVE_CHAPTER_MIN_INTERVAL_SEC))
+    if duration <= min_interval or max_items == 1:
+        return [0]
+    duration_sec = _duration_seconds(duration)
+    raw_interval = int(math.ceil(duration_sec / max_items))
+    interval_sec = max(min_interval, int(math.ceil(raw_interval / 60.0)) * 60)
+    offsets: list[int] = []
+    offset = 0
+    while len(offsets) < max_items and offset < duration_sec:
+        if duration_sec - offset <= 60 and offset != 0:
+            break
+        offsets.append(offset)
+        offset += interval_sec
+    return offsets or [0]
+
+
+def _si_time_group_ranges(duration: float) -> list[tuple[int, int]]:
+    duration_sec = _duration_seconds(duration)
+    if duration_sec <= 0:
+        return [(0, 0)]
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    while start < duration_sec:
+        end = min(start + SI_TIME_INDEX_GROUP_SEC, duration_sec)
+        ranges.append((start, end))
+        start += SI_TIME_INDEX_GROUP_SEC
+    return ranges or [(0, 0)]
+
+
+def _si_time_minute_offsets(start: int, end: int) -> list[int]:
+    start = max(0, int(start))
+    end = max(start, int(end))
+    offsets = list(range(start, end, SI_TIME_INDEX_MINUTE_SEC))
+    return offsets or [start]
+
+
+def _si_time_point_offsets(minute_start: int, duration: float) -> list[int]:
+    duration_sec = _duration_seconds(duration)
+    minute_start = max(0, int(minute_start))
+    if duration_sec <= 0:
+        return [minute_start]
+    if minute_start >= duration_sec:
+        return []
+    minute_end = min(minute_start + SI_TIME_INDEX_MINUTE_SEC, duration_sec)
+    offsets = list(range(minute_start, minute_end, SI_TIME_INDEX_POINT_SEC))
+    return offsets or [minute_start]
+
+
+def _si_time_force_hours(duration: float) -> bool:
+    return _duration_seconds(duration) >= 3600
+
+
+def _si_time_index_child_count(duration: float, level: str, start: int = 0, end: int = 0) -> int:
+    if level == "index":
+        groups = _si_time_group_ranges(duration)
+        if len(groups) == 1:
+            return len(_si_time_minute_offsets(*groups[0]))
+        return len(groups)
+    if level == "group":
+        return len(_si_time_minute_offsets(start, end))
+    if level == "minute":
+        return len(_si_time_point_offsets(start, duration))
+    return 0
+
+
+def _si_directory_child_count(duration: float) -> int:
+    return len(_si_chapter_offsets(duration)) + 1
 
 
 def _probe_video(path: Path) -> dict:
@@ -119,6 +251,301 @@ def _get_mime(path: Path) -> str:
     return "video/mp4"
 
 
+def _si_live_protocol_info(client_profile: str | None = None) -> str:
+    if _is_deovr_cds_client(client_profile):
+        return (
+            "http-get:*:video/MP2T:DLNA.ORG_PN=HEVC_TS_NA_ISO;"
+            f"DLNA.ORG_OP={DLNA_OP_TIME_SEEK};"
+            f"DLNA.ORG_CI=1;DLNA.ORG_FLAGS={DLNA_FLAGS_TIME_SEEK}"
+        )
+    return (
+        "http-get:*:video/MP2T:"
+        "DLNA.ORG_PN=HEVC_TS_NA_ISO;DLNA.ORG_OP=00;DLNA.ORG_CI=1"
+    )
+
+
+def _si_id(prefix: str, rel_key: str, extra: object | None = None) -> str:
+    suffix = "" if extra is None else f"@{extra}"
+    return f"{prefix}{rel_key}{suffix}"
+
+
+def _split_si_id(object_id: str, prefix: str, *, expect_extra: bool) -> tuple[str, str] | None:
+    if not object_id.startswith(prefix):
+        return None
+    rest = object_id[len(prefix):]
+    if not expect_extra:
+        return rest.replace("\\", "/").strip("/"), ""
+    rel, sep, extra = rest.rpartition("@")
+    if not sep:
+        return None
+    return rel.replace("\\", "/").strip("/"), extra.strip()
+
+
+def _si_title(title: str) -> str:
+    return f"[SI] {title}"
+
+
+def _si_time_index_title_for_language(title: str, language: str | None = None) -> str:
+    return f"[{_select_time_index_label(language)}]_{_si_title(title)}"
+
+
+def _si_play_leaf(
+    *,
+    base_url: str,
+    rel_key: str,
+    item_id: str,
+    parent_id: str,
+    title: str,
+    offset: int,
+    meta: dict,
+    client_profile: str | None = None,
+) -> dict:
+    quoted_key = quote(rel_key)
+    duration = float(meta.get("duration") or 0.0)
+    remaining = max(0.0, duration - float(offset)) if duration > 0 else 0.0
+    width = int(meta.get("width") or 0)
+    height = int(meta.get("height") or 0)
+    omit_filelike_attrs = not _is_deovr_cds_client(client_profile)
+    return {
+        "id": item_id,
+        "parent_id": parent_id,
+        "title": title,
+        "url": f"{base_url}/si_live/{quoted_key}{_si_live_route_hint_suffix(client_profile)}?t={int(offset)}",
+        "thumb": f"{base_url}/thumb/{quoted_key}",
+        "size": 0,
+        "duration": remaining,
+        "resolution": f"{width}x{height}" if width > 0 and height > 0 else "",
+        "bitrate": int(meta.get("bitrate") or 0),
+        "mime": "video/MP2T",
+        "dlna_pn": "HEVC_TS_NA_ISO",
+        "protocol_info": _si_live_protocol_info(client_profile),
+        "omit_duration": omit_filelike_attrs,
+        "omit_bitrate": omit_filelike_attrs,
+        "subtitles": [],
+    }
+
+
+def _si_time_index_root_item(
+    rel_key: str,
+    parent_id: str,
+    title: str,
+    duration: float,
+    language: str | None = None,
+) -> dict:
+    return {
+        "container": True,
+        "id": _si_id(SI_TIME_INDEX_PREFIX, rel_key),
+        "parent_id": parent_id,
+        "title": _si_time_index_title_for_language(title, language),
+        "child_count": _si_time_index_child_count(duration, "index"),
+    }
+
+
+def _si_container_item(rel_key: str, parent_id: str, title: str, duration: float) -> dict:
+    return {
+        "container": True,
+        "id": _si_id(VIDEO_SI_PREFIX, rel_key),
+        "parent_id": parent_id,
+        "title": _si_title(title),
+        "child_count": _si_directory_child_count(duration),
+    }
+
+
+def _si_chapter_items(
+    path: Path,
+    rel_key: str,
+    parent_id: str,
+    base_url: str,
+    client_profile: str | None = None,
+    language: str | None = None,
+) -> list[dict]:
+    meta = probe_cached(path)
+    duration = float(meta.get("duration") or 0.0)
+    title = vr_naming.source_display_stem(path.stem, int(meta.get("width") or 0), int(meta.get("height") or 0))
+    items = [_si_time_index_root_item(rel_key, parent_id, title, duration, language)]
+    for offset in _si_chapter_offsets(duration):
+        items.append(
+            _si_play_leaf(
+                base_url=base_url,
+                rel_key=rel_key,
+                item_id=_si_id(SI_CHAPTER_PREFIX, rel_key, int(offset)),
+                parent_id=parent_id,
+                title=f"{_fmt_title_time(offset)}_{_si_title(title)}",
+                offset=int(offset),
+                meta=meta,
+                client_profile=client_profile,
+            )
+        )
+    return items
+
+
+def _si_time_minute_items(
+    *,
+    rel_key: str,
+    parent_id: str,
+    title: str,
+    duration: float,
+    start: int,
+    end: int,
+) -> list[dict]:
+    force_hours = _si_time_force_hours(duration)
+    return [
+        {
+            "container": True,
+            "id": _si_id(SI_TIME_MINUTE_PREFIX, rel_key, int(minute)),
+            "parent_id": parent_id,
+            "title": f"{_fmt_index_time(minute, force_hours)}_{_si_title(title)}",
+            "child_count": _si_time_index_child_count(duration, "minute", int(minute)),
+        }
+        for minute in _si_time_minute_offsets(start, end)
+    ]
+
+
+def _si_time_index_items(
+    path: Path,
+    rel_key: str,
+    level: str,
+    base_url: str,
+    *,
+    start: int = 0,
+    end: int = 0,
+    client_profile: str | None = None,
+) -> list[dict]:
+    meta = probe_cached(path)
+    duration = float(meta.get("duration") or 0.0)
+    title = vr_naming.source_display_stem(path.stem, int(meta.get("width") or 0), int(meta.get("height") or 0))
+    force_hours = _si_time_force_hours(duration)
+
+    if level == "index":
+        parent_id = _si_id(SI_TIME_INDEX_PREFIX, rel_key)
+        groups = _si_time_group_ranges(duration)
+        if len(groups) == 1:
+            group_start, group_end = groups[0]
+            return _si_time_minute_items(
+                rel_key=rel_key,
+                parent_id=parent_id,
+                title=title,
+                duration=duration,
+                start=group_start,
+                end=group_end,
+            )
+        return [
+            {
+                "container": True,
+                "id": _si_id(SI_TIME_GROUP_PREFIX, rel_key, f"{group_start}-{group_end}"),
+                "parent_id": parent_id,
+                "title": (
+                    f"{_fmt_index_time(group_start, force_hours)}-{_fmt_index_time(group_end, force_hours)}"
+                    f"_{_si_title(title)}"
+                ),
+                "child_count": _si_time_index_child_count(duration, "group", group_start, group_end),
+            }
+            for group_start, group_end in groups
+        ]
+
+    if level == "group":
+        parent_id = _si_id(SI_TIME_GROUP_PREFIX, rel_key, f"{int(start)}-{int(end)}")
+        return _si_time_minute_items(
+            rel_key=rel_key,
+            parent_id=parent_id,
+            title=title,
+            duration=duration,
+            start=start,
+            end=end,
+        )
+
+    if level != "minute":
+        return []
+
+    parent_id = _si_id(SI_TIME_MINUTE_PREFIX, rel_key, int(start))
+    return [
+        _si_play_leaf(
+            base_url=base_url,
+            rel_key=rel_key,
+            item_id=_si_id(SI_TIME_POINT_PREFIX, rel_key, int(offset)),
+            parent_id=parent_id,
+            title=f"{_fmt_index_time(offset, force_hours)}_{_si_title(title)}",
+            offset=int(offset),
+            meta=meta,
+            client_profile=client_profile,
+        )
+        for offset in _si_time_point_offsets(start, duration)
+    ]
+
+
+def _si_time_index_metadata_item(
+    path: Path,
+    rel_key: str,
+    level: str,
+    *,
+    start: int = 0,
+    end: int = 0,
+    language: str | None = None,
+) -> dict | None:
+    meta = probe_cached(path)
+    duration = float(meta.get("duration") or 0.0)
+    title = vr_naming.source_display_stem(path.stem, int(meta.get("width") or 0), int(meta.get("height") or 0))
+    force_hours = _si_time_force_hours(duration)
+    if level == "index":
+        return _si_time_index_root_item(rel_key, _si_id(VIDEO_SI_PREFIX, rel_key), title, duration, language)
+    if level == "group":
+        return {
+            "container": True,
+            "id": _si_id(SI_TIME_GROUP_PREFIX, rel_key, f"{int(start)}-{int(end)}"),
+            "parent_id": _si_id(SI_TIME_INDEX_PREFIX, rel_key),
+            "title": f"{_fmt_index_time(start, force_hours)}-{_fmt_index_time(end, force_hours)}_{_si_title(title)}",
+            "child_count": _si_time_index_child_count(duration, "group", start, end),
+        }
+    if level == "minute":
+        parent_id = _si_id(SI_TIME_INDEX_PREFIX, rel_key)
+        groups = _si_time_group_ranges(duration)
+        if len(groups) > 1:
+            group_start = (max(0, int(start)) // SI_TIME_INDEX_GROUP_SEC) * SI_TIME_INDEX_GROUP_SEC
+            group_end = min(group_start + SI_TIME_INDEX_GROUP_SEC, _duration_seconds(duration))
+            parent_id = _si_id(SI_TIME_GROUP_PREFIX, rel_key, f"{group_start}-{group_end}")
+        return {
+            "container": True,
+            "id": _si_id(SI_TIME_MINUTE_PREFIX, rel_key, int(start)),
+            "parent_id": parent_id,
+            "title": f"{_fmt_index_time(start, force_hours)}_{_si_title(title)}",
+            "child_count": _si_time_index_child_count(duration, "minute", start),
+        }
+    return None
+
+
+def _si_point_metadata_item(
+    path: Path,
+    rel_key: str,
+    prefix: str,
+    offset: int,
+    base_url: str,
+    client_profile: str | None = None,
+) -> dict | None:
+    if prefix == SI_CHAPTER_PREFIX:
+        candidates = _si_chapter_items(
+            path,
+            rel_key,
+            _si_id(VIDEO_SI_PREFIX, rel_key),
+            base_url,
+            client_profile=client_profile,
+        )
+    else:
+        minute_start = (max(0, int(offset)) // SI_TIME_INDEX_MINUTE_SEC) * SI_TIME_INDEX_MINUTE_SEC
+        candidates = _si_time_index_items(
+            path,
+            rel_key,
+            "minute",
+            base_url,
+            start=minute_start,
+            client_profile=client_profile,
+        )
+    item_id = _si_id(prefix, rel_key, int(offset))
+    for item in candidates:
+        if item.get("id") == item_id:
+            return item
+    return None
+
+
 def _didl_for(items: list[dict]) -> str:
     """Generate DIDL-Lite XML string for a list of items."""
     out = [
@@ -151,14 +578,17 @@ def _didl_for(items: list[dict]) -> str:
         mime = it["mime"]
 
         dlna_ci = int(it.get("dlna_ci", 0))
-        proto = f"http-get:*:{mime}:DLNA.ORG_PN={it['dlna_pn']};DLNA.ORG_OP=01;DLNA.ORG_CI={dlna_ci};DLNA.ORG_FLAGS={DLNA_FLAGS_BASE}"
+        proto = it.get("protocol_info") or (
+            f"http-get:*:{mime}:DLNA.ORG_PN={it['dlna_pn']};"
+            f"DLNA.ORG_OP=01;DLNA.ORG_CI={dlna_ci};DLNA.ORG_FLAGS={DLNA_FLAGS_BASE}"
+        )
 
         attrs: list[str] = []
         if size > 0:
             attrs.append(f'size="{size}"')
-        if it["duration"] > 0:
+        if it["duration"] > 0 and not it.get("omit_duration"):
             attrs.append(f'duration="{duration}"')
-        if bitrate > 0:
+        if bitrate > 0 and not it.get("omit_bitrate"):
             attrs.append(f'bitrate="{bitrate}"')
         if resolution:
             attrs.append(f'resolution="{resolution}"')
@@ -285,21 +715,12 @@ def _get_items_for_dir(
                     si_source = None
                 if si_config is not None and si_config.enabled and si_source is not None:
                     items.append(
-                        {
-                            "id": f"{VIDEO_SI_PREFIX}{rel_key}",
-                            "parent_id": parent_id,
-                            "title": f"[SI] {title}",
-                            "url": f"{base_url}/media_si/{quoted_key}",
-                            "thumb": f"{base_url}/thumb/{quoted_key}",
-                            "size": si_service.estimate_output_size(child),
-                            "duration": meta["duration"],
-                            "resolution": f"{meta['width']}x{meta['height']}" if meta["width"] > 0 else "",
-                            "bitrate": meta["bitrate"],
-                            "mime": "video/mp4",
-                            "dlna_pn": "AVC_MP4_HP_HD_AAC",
-                            "dlna_ci": 1,
-                            "subtitles": sub_list,
-                        }
+                        _si_container_item(
+                            rel_key,
+                            parent_id,
+                            title,
+                            float(meta.get("duration") or 0.0),
+                        )
                     )
             else:
                 skipped += 1
@@ -391,6 +812,8 @@ def handle_soap(
     media_library,
     subtitles_enabled: bool,
     si_service=None,
+    client_profile: str | None = None,
+    language: str | None = None,
 ) -> tuple[bytes, int]:
     """Parse SOAP action and compile matching Browse result XML."""
     action = soap_action.strip('"').split("#")[-1]
@@ -428,6 +851,11 @@ def handle_soap(
         video_file = None
         video_rel = ""
         is_si_video = False
+        si_object_kind = ""
+        si_time_level = ""
+        si_start = 0
+        si_end = 0
+        si_point_prefix = ""
         if object_id.startswith(VIDEO_PREFIX):
             rel = object_id[len(VIDEO_PREFIX):]
             video_rel = rel
@@ -445,6 +873,7 @@ def handle_soap(
             rel = object_id[len(VIDEO_SI_PREFIX):]
             video_rel = rel
             is_si_video = True
+            si_object_kind = "dir"
             video_file = media_library.key_to_path(rel)
             if video_file is not None:
                 try:
@@ -455,6 +884,61 @@ def handle_soap(
                         parent_id = f"{FOLDER_PREFIX}{parent_rel}"
                 except ValueError:
                     parent_id = ROOT_ID
+        else:
+            parsed = _split_si_id(object_id, SI_TIME_INDEX_PREFIX, expect_extra=False)
+            if parsed is not None:
+                video_rel = parsed[0]
+                video_file = media_library.key_to_path(video_rel)
+                is_si_video = True
+                si_object_kind = "time"
+                si_time_level = "index"
+            else:
+                for prefix, level in (
+                    (SI_TIME_GROUP_PREFIX, "group"),
+                    (SI_TIME_MINUTE_PREFIX, "minute"),
+                ):
+                    parsed = _split_si_id(object_id, prefix, expect_extra=True)
+                    if parsed is None:
+                        continue
+                    video_rel, extra = parsed
+                    video_file = media_library.key_to_path(video_rel)
+                    is_si_video = True
+                    si_object_kind = "time"
+                    si_time_level = level
+                    try:
+                        if level == "group":
+                            left, right = extra.split("-", 1)
+                            si_start = max(0, int(left))
+                            si_end = max(si_start, int(right))
+                        else:
+                            si_start = max(0, int(extra))
+                    except ValueError:
+                        video_file = None
+                    break
+                if video_file is None:
+                    for prefix in (SI_CHAPTER_PREFIX, SI_TIME_POINT_PREFIX):
+                        parsed = _split_si_id(object_id, prefix, expect_extra=True)
+                        if parsed is None:
+                            continue
+                        video_rel, extra = parsed
+                        video_file = media_library.key_to_path(video_rel)
+                        is_si_video = True
+                        si_object_kind = "point"
+                        si_point_prefix = prefix
+                        try:
+                            si_start = max(0, int(extra))
+                        except ValueError:
+                            video_file = None
+                        break
+
+        def si_available(path: Path | None) -> bool:
+            if path is None or si_service is None:
+                return False
+            try:
+                si_config = si_service.current_config()
+                return bool(si_config is not None and si_config.enabled and si_service.has_si_source(path) is not None)
+            except Exception:
+                return False
 
         # 3. Handle BrowseMetadata
         if flag == "BrowseMetadata":
@@ -463,43 +947,60 @@ def handle_soap(
                 # Browse single video details
                 meta = probe_cached(video_file)
                 title = vr_naming.source_display_stem(video_file.stem, meta["width"], meta["height"])
-                sub_list = []
-                tracks = subtitles.find_external_subtitles(video_file, subtitles_enabled, media_library)
-                for track in tracks:
-                    try:
-                        sub_rel = media_library.path_to_key(track.path)
-                        sub_list.append(
-                            {
-                                "url": f"{base_url}/subs/{quote(sub_rel)}",
-                                "lang": track.lang,
-                                "type": track.kind,
-                                "mime": track.mime,
-                            }
-                        )
-                    except Exception:
-                        pass
-                item = {
-                    "id": object_id,
-                    "parent_id": parent_id,
-                    "title": f"[SI] {title}" if is_si_video else title,
-                    "url": f"{base_url}/media_si/{quote(video_rel)}" if is_si_video else f"{base_url}/media/{quote(video_rel)}",
-                    "thumb": f"{base_url}/thumb/{quote(video_rel)}",
-                    "size": si_service.estimate_output_size(video_file) if is_si_video and si_service is not None else meta["size"],
-                    "duration": meta["duration"],
-                    "resolution": f"{meta['width']}x{meta['height']}" if meta["width"] > 0 else "",
-                    "bitrate": meta["bitrate"],
-                    "mime": "video/mp4" if is_si_video else _get_mime(video_file),
-                    "dlna_pn": "AVC_MP4_HP_HD_AAC" if is_si_video else _get_dlna_pn(video_file),
-                    "dlna_ci": 1 if is_si_video else 0,
-                    "subtitles": sub_list,
-                }
                 if is_si_video:
-                    try:
-                        si_config = si_service.current_config() if si_service is not None else None
-                        if si_config is None or not si_config.enabled or si_service.has_si_source(video_file) is None:
-                            item = None
-                    except Exception:
-                        item = None
+                    item = None
+                    if si_available(video_file):
+                        if si_object_kind == "dir":
+                            item = _si_container_item(video_rel, parent_id, title, float(meta.get("duration") or 0.0))
+                        elif si_object_kind == "time":
+                            item = _si_time_index_metadata_item(
+                                video_file,
+                                video_rel,
+                                si_time_level,
+                                start=si_start,
+                                end=si_end,
+                                language=language,
+                            )
+                        elif si_object_kind == "point":
+                            item = _si_point_metadata_item(
+                                video_file,
+                                video_rel,
+                                si_point_prefix,
+                                si_start,
+                                base_url,
+                                client_profile=client_profile,
+                            )
+                else:
+                    sub_list = []
+                    tracks = subtitles.find_external_subtitles(video_file, subtitles_enabled, media_library)
+                    for track in tracks:
+                        try:
+                            sub_rel = media_library.path_to_key(track.path)
+                            sub_list.append(
+                                {
+                                    "url": f"{base_url}/subs/{quote(sub_rel)}",
+                                    "lang": track.lang,
+                                    "type": track.kind,
+                                    "mime": track.mime,
+                                }
+                            )
+                        except Exception:
+                            pass
+                    item = {
+                        "id": object_id,
+                        "parent_id": parent_id,
+                        "title": title,
+                        "url": f"{base_url}/media/{quote(video_rel)}",
+                        "thumb": f"{base_url}/thumb/{quote(video_rel)}",
+                        "size": meta["size"],
+                        "duration": meta["duration"],
+                        "resolution": f"{meta['width']}x{meta['height']}" if meta["width"] > 0 else "",
+                        "bitrate": meta["bitrate"],
+                        "mime": _get_mime(video_file),
+                        "dlna_pn": _get_dlna_pn(video_file),
+                        "dlna_ci": 0,
+                        "subtitles": sub_list,
+                    }
                 didl = _didl_for([item] if item is not None else [])
                 metadata_count = 1 if item is not None else 0
             else:
@@ -539,6 +1040,26 @@ def handle_soap(
                 subtitles_enabled,
                 si_service=si_service,
             )
+        elif is_si_video and video_file is not None and video_file.is_file() and si_available(video_file):
+            if si_object_kind == "dir":
+                all_items = _si_chapter_items(
+                    video_file,
+                    video_rel,
+                    object_id,
+                    base_url,
+                    client_profile=client_profile,
+                    language=language,
+                )
+            elif si_object_kind == "time":
+                all_items = _si_time_index_items(
+                    video_file,
+                    video_rel,
+                    si_time_level,
+                    base_url,
+                    start=si_start,
+                    end=si_end,
+                    client_profile=client_profile,
+                )
         elif directory is None:
             log.warning("CDS Browse resolved no directory for object_id=%s", object_id)
         else:

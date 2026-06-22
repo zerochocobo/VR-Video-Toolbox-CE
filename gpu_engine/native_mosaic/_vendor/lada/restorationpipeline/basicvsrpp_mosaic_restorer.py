@@ -47,7 +47,9 @@ class BasicvsrppMosaicRestorer:
         clip_length = max(1, int(clip_length))
         inputs = torch.zeros((1, clip_length, 3, size, size), device=self.device, dtype=self.dtype)
         inputs = _torch_tuning.to_channels_last_5d(inputs)
-        with torch.no_grad():
+        # Capture is only permitted here (single-threaded warmup), never during
+        # concurrent restore/encode. See CudaGraphRunner._capture_allowed.
+        with self._graph_runner.allow_capture(), torch.no_grad():
             _ = self._forward_model(inputs)
         return True
 

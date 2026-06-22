@@ -69,11 +69,23 @@ class SIStreamTests(unittest.TestCase):
     def test_si_mix_config_from_app_config_defaults(self) -> None:
         config = si_stream.SIMixConfig.from_app_config(lambda _key, default=None: default)
 
-        self.assertFalse(config.enabled)
-        self.assertEqual(config.mix_channel, "left")
+        self.assertTrue(config.enabled)
+        self.assertEqual(config.mix_channel, "both")
         self.assertEqual(config.original_volume_percent, 100)
-        self.assertEqual(config.si_volume_percent, 50)
+        self.assertEqual(config.si_volume_percent, 100)
         self.assertEqual(config.si_delay_seconds, 1.0)
+        self.assertTrue(config.duck_original)
+
+    def test_si_mix_config_invalid_values_fall_back_to_dlna_defaults(self) -> None:
+        config = si_stream.SIMixConfig.from_mapping(
+            {
+                "dlna_si_mix_channel": "invalid",
+                "dlna_si_volume_percent": 999,
+            }
+        )
+
+        self.assertEqual(config.mix_channel, "both")
+        self.assertEqual(config.si_volume_percent, 100)
 
     def test_si_mix_config_filter_string_matches_tool_si(self) -> None:
         config = si_stream.SIMixConfig(
@@ -82,11 +94,12 @@ class SIStreamTests(unittest.TestCase):
             original_volume_percent=90,
             si_volume_percent=60,
             si_delay_seconds=0.7,
+            duck_original=True,
         )
 
         self.assertEqual(
             config.filter_string(),
-            si_logic.build_si_mix_filter("right", 90, 60, 0.7),
+            si_logic.build_si_mix_filter("right", 90, 60, 0.7, duck_original=True),
         )
 
     def test_parse_range_header_handles_open_ended_and_malformed(self) -> None:
@@ -100,6 +113,17 @@ class SIStreamTests(unittest.TestCase):
             root = Path(raw)
             video = root / "movie.mp4"
             si_wav = root / "movie.si.wav"
+            video.write_bytes(b"video")
+            si_wav.write_bytes(b"wav")
+            service = si_stream.SIStreamService(config_holder=si_stream.ConfigHolder(si_stream.SIMixConfig(True)))
+
+            self.assertEqual(service.has_si_source(video), si_wav)
+
+    def test_has_si_source_detects_uppercase_sibling_wav(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            video = root / "movie.mp4"
+            si_wav = root / "movie.SI.WAV"
             video.write_bytes(b"video")
             si_wav.write_bytes(b"wav")
             service = si_stream.SIStreamService(config_holder=si_stream.ConfigHolder(si_stream.SIMixConfig(True)))
@@ -143,6 +167,35 @@ class SIStreamTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-i") + 1], str(video))
         self.assertIn("+frag_keyframe+empty_moov+default_base_moof", cmd)
         self.assertIn("pipe:1", cmd)
+
+    def test_iter_si_mpegts_starts_ffmpeg_as_mpegts(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            video = root / "movie.mp4"
+            wav = root / "movie.si.wav"
+            video.write_bytes(b"video")
+            wav.write_bytes(b"wav")
+            fake_proc = _FakePopen()
+            fake_proc.stdout = io.BytesIO(b"abcdef")
+
+            with patch("tool_dlna.si_stream.subprocess.Popen", return_value=fake_proc) as popen:
+                data = b"".join(
+                    si_stream.iter_si_mpegts(
+                        video,
+                        wav,
+                        si_stream.SIMixConfig(enabled=True),
+                        start_time=5.0,
+                        chunk_size=2,
+                    )
+                )
+                cmd = popen.call_args[0][0]
+
+        self.assertEqual(data, b"abcdef")
+        self.assertEqual(cmd[cmd.index("-ss") + 1], "5.000")
+        self.assertEqual(cmd[cmd.index("-f") + 1], "mpegts")
+        self.assertIn("-muxpreload", cmd)
+        self.assertIn("-muxdelay", cmd)
+        self.assertNotIn("+frag_keyframe+empty_moov+default_base_moof", cmd)
 
     def test_open_stream_starts_session_with_seek_from_range(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

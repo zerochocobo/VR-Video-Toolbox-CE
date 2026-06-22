@@ -172,7 +172,11 @@ class NativeMosaicEngine:
             errors.append(f"restoration: {type(exc).__name__}: {exc}")
 
         try:
-            warmup_clip_length = int(os.environ.get("VRVT_CUDA_GRAPH_WARMUP_FRAMES", "180"))
+            # Startup capture is only a cheap validation that graph capture works
+            # on this system; default small so it does not pin a large unused graph
+            # in VRAM. The real per-clip-length capture happens single-threaded at
+            # the start of restore_file (see warm(max_clip_length) there).
+            warmup_clip_length = int(os.environ.get("VRVT_CUDA_GRAPH_WARMUP_FRAMES", "8"))
             if hasattr(self.restoration_model, "warmup_graph"):
                 self.restoration_model.warmup_graph(warmup_clip_length)
                 self.torch.cuda.current_stream(self.device).synchronize()
@@ -243,6 +247,19 @@ class NativeMosaicEngine:
             with profile.section("restore_file.total"):
                 with profile.section("metadata.lada_video"):
                     meta = video_utils.get_video_meta_data(input_path)
+
+                # Pre-capture the restoration CUDA graph for this clip length now,
+                # while we are still single-threaded. Most clips are exactly
+                # max_clip_length, so this captures the dominant shape. Runtime
+                # capture is forbidden (it races with the detection/encode threads),
+                # so any other clip length falls back to eager.
+                try:
+                    warm = getattr(self.restoration_model, "warmup_graph", None)
+                    if callable(warm):
+                        warm(int(max_clip_length))
+                        self.torch.cuda.current_stream(self.device).synchronize()
+                except Exception as exc:
+                    _log(f"[native] graph warmup skipped: {type(exc).__name__}: {exc}")
 
                 gpu_ok = False
                 frame_source_ok = False

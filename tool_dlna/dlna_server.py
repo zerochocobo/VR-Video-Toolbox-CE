@@ -9,12 +9,14 @@ import ipaddress
 import logging
 import os
 import random
+import re
 import socket
 import struct
 import subprocess
 import sys
 import threading
 import time
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -30,9 +32,17 @@ MCAST_GRP = "239.255.255.250"
 MCAST_PORT = 1900
 XML_MEDIA_TYPE = "text/xml; charset=utf-8"
 DLNA_FLAGS_BASE = "01700000000000000000000000000000"
+DLNA_FLAGS_TIME_SEEK = "41700000000000000000000000000000"
 LOGGER_NAME = "vrtoolbox.dlna"
 LOG_MAX_BYTES = 1024 * 1024
 LOG_BACKUP_COUNT = 3
+SI_LIVE_ROUTE_HINT_SUFFIXES = (".ts", ".m2ts", ".mpegts")
+_SOAP_FIELD_RE = re.compile(
+    rb"<(?:\w+:)?(ObjectID|BrowseFlag|Filter|RequestedCount|StartingIndex)>(.*?)</(?:\w+:)?\1>",
+    re.IGNORECASE | re.DOTALL,
+)
+_DEOVR_CDS_FILTER = {"res", "res@size", "res@duration", "dc:date", "upnp:albumarturi"}
+_SUPPORTED_CDS_UI_LANGUAGES = ("zh_CN", "ja_JP", "en_US")
 
 
 def get_logger() -> logging.Logger:
@@ -132,6 +142,97 @@ def classify_moov_probe(range_start: int, range_end: int | None, total: int) -> 
         if 0 < probe_size <= MID_PROBE_MAX_SIZE_BYTES and range_start >= int(total * 0.5):
             return "mid"
     return ""
+
+
+def _soap_history_fields(body: bytes) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for match in _SOAP_FIELD_RE.finditer(body[:64 * 1024]):
+        key = match.group(1).decode("ascii", "ignore")
+        value = match.group(2).decode("utf-8", "ignore").strip()
+        if value:
+            fields[key] = value
+    return fields
+
+
+def _normalise_filter_set(value: str) -> set[str]:
+    return {part.strip().lower() for part in str(value or "").split(",") if part.strip()}
+
+
+def _header_value(headers: Mapping[str, str], name: str) -> str:
+    return str(headers.get(name) or headers.get(name.lower()) or headers.get(name.title()) or "")
+
+
+def _normalise_cds_ui_language(value: str) -> str | None:
+    language = str(value or "").strip().lower().replace("-", "_")
+    if not language:
+        return None
+    if language.startswith("zh"):
+        return "zh_CN"
+    if language.startswith("ja"):
+        return "ja_JP"
+    if language.startswith("en"):
+        return "en_US"
+    return None
+
+
+def _cds_ui_language(headers: Mapping[str, str]) -> str | None:
+    accept_language = _header_value(headers, "accept-language")
+    candidates: list[tuple[float, int, str]] = []
+    for index, raw_part in enumerate(accept_language.split(",")):
+        part = raw_part.strip()
+        if not part:
+            continue
+        language, *params = [piece.strip() for piece in part.split(";")]
+        q = 1.0
+        for param in params:
+            if param.lower().startswith("q="):
+                try:
+                    q = float(param[2:])
+                except ValueError:
+                    q = 0.0
+        normalised = _normalise_cds_ui_language(language)
+        if normalised in _SUPPORTED_CDS_UI_LANGUAGES and q > 0:
+            candidates.append((q, index, normalised))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    return candidates[0][2]
+
+
+def _cds_client_profile(headers: Mapping[str, str], fields: dict[str, str]) -> str | None:
+    ua = str(headers.get("user-agent", "") or "").strip().lower()
+    if "deovr" in ua or "[deo" in ua:
+        return "deovr"
+    if ua:
+        return None
+    # DeoVR's CDS Browse request observed on Quest sends no User-Agent. Keep
+    # this fallback deliberately narrow so other DLNA clients keep the default
+    # Skybox-compatible live metadata.
+    if fields.get("BrowseFlag", "").strip().lower() != "browsedirectchildren":
+        return None
+    if fields.get("RequestedCount", "").strip() != "0":
+        return None
+    if _normalise_filter_set(fields.get("Filter", "")) != _DEOVR_CDS_FILTER:
+        return None
+    return "deovr"
+
+
+def _is_deovr_user_agent(user_agent: str | None) -> bool:
+    ua = str(user_agent or "").strip().lower()
+    return "deovr" in ua or "[deo" in ua
+
+
+def si_live_content_features(user_agent: str | None = None) -> str:
+    if _is_deovr_user_agent(user_agent):
+        return (
+            "DLNA.ORG_PN=HEVC_TS_NA_ISO;"
+            "DLNA.ORG_OP=10;DLNA.ORG_CI=1;"
+            f"DLNA.ORG_FLAGS={DLNA_FLAGS_TIME_SEEK}"
+        )
+    return (
+        "DLNA.ORG_PN=HEVC_TS_NA_ISO;"
+        "DLNA.ORG_OP=00;DLNA.ORG_CI=1"
+    )
 
 
 class SSDPServer:
@@ -417,7 +518,16 @@ def create_app(
     async def control_cds(request: Request):
         soap_action = request.headers.get("SOAPAction", "")
         body = await request.body()
-        logger.info("SOAP ContentDirectory action=%s bytes=%d", soap_action, len(body))
+        fields = _soap_history_fields(body)
+        client_profile = _cds_client_profile(request.headers, fields)
+        ui_language = _cds_ui_language(request.headers)
+        logger.info(
+            "SOAP ContentDirectory action=%s bytes=%d profile=%s language=%s",
+            soap_action,
+            len(body),
+            client_profile or "",
+            ui_language or "",
+        )
         payload, status = content_directory.handle_soap(
             soap_action,
             body,
@@ -425,6 +535,8 @@ def create_app(
             media_library,
             subtitles_enabled,
             si_service=si_service,
+            client_profile=client_profile,
+            language=ui_language,
         )
         return Response(content=payload, status_code=status, media_type=XML_MEDIA_TYPE)
 
@@ -524,6 +636,39 @@ def create_app(
         if status == 206:
             headers["Content-Range"] = f"bytes {safe_start}-{content_end}/{total}"
         return StreamingResponse(chunks, status_code=status, headers=headers, media_type="video/mp4")
+
+    @app.get("/si_live/{name:path}")
+    async def si_live_get(request: Request, name: str, t: float = 0.0):
+        for suffix in SI_LIVE_ROUTE_HINT_SUFFIXES:
+            if name.lower().endswith(suffix):
+                name = name[: -len(suffix)]
+                break
+        path = _safe_video_path(name)
+        config = si_service.current_config()
+        si_wav = si_service.has_si_source(path)
+        if not config.enabled or si_wav is None:
+            raise HTTPException(404, "SI stream not available")
+        start_time = max(0.0, float(t or 0.0))
+        logger.info(
+            "SI live request path=%s t=%.3f client=%s ua=%r",
+            name,
+            start_time,
+            request.client.host if request.client else "",
+            request.headers.get("user-agent", ""),
+        )
+        headers = {
+            "Accept-Ranges": "none",
+            "X-SI-Enabled": "1",
+            "X-SI-Transport": "mpegts-live",
+            "transferMode.dlna.org": "Streaming",
+            "contentFeatures.dlna.org": si_live_content_features(request.headers.get("user-agent", "")),
+        }
+        return StreamingResponse(
+            si_stream.iter_si_mpegts(path, si_wav, config, start_time),
+            status_code=200,
+            headers=headers,
+            media_type="video/MP2T",
+        )
 
     @app.post("/admin/reload_si_config")
     async def reload_si_config(request: Request):
