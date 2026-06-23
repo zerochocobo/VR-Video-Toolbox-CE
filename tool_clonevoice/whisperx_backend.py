@@ -18,6 +18,16 @@ LogCallback = Callable[[str], None]
 
 SAMPLE_RATE = 16000
 
+# ffmpeg afftdn denoise presets applied to the 16 kHz ASR feed only (never the
+# dubbing background bed). Mirrors tool_subtitle's DENOISE_FILTERS so behaviour
+# matches the subtitle tool users already know.
+DENOISE_FILTERS = {
+    "none": "",
+    "mild": "afftdn=nr=6:nf=-35:tn=1:ad=0.35:gs=6",
+    "balanced": "afftdn=nr=10:nf=-40:tn=1:ad=0.5:gs=8",
+    "strong": "afftdn=nr=14:nf=-45:tn=1:ad=0.65:gs=10",
+}
+
 
 @contextlib.contextmanager
 def torch_load_compat():
@@ -263,8 +273,14 @@ def extract_audio_16k(
     out_wav: str,
     log: LogCallback = print,
     stop_event=None,
+    denoise: str = "none",
 ) -> str:
-    """Decode the video's audio to 16kHz mono PCM WAV via ffmpeg."""
+    """Decode the video's audio to 16kHz mono PCM WAV via ffmpeg.
+
+    ``denoise`` selects an :data:`DENOISE_FILTERS` preset applied with ``-af``.
+    This only cleans the audio fed to the ASR, improving recall on hissy / noisy
+    sources; the dubbing background bed is extracted separately and untouched.
+    """
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise FileNotFoundError("ffmpeg not found on PATH.")
@@ -273,8 +289,12 @@ def extract_audio_16k(
         ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
         "-i", str(video_path),
         "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE),
-        "-c:a", "pcm_s16le", str(out_wav),
     ]
+    filter_str = DENOISE_FILTERS.get(denoise or "none", "")
+    if filter_str:
+        cmd += ["-af", filter_str]
+        log(f"[extract] denoise preset: {denoise}")
+    cmd += ["-c:a", "pcm_s16le", str(out_wav)]
     log(f"[extract] {Path(video_path).name} -> 16kHz mono wav")
     proc = subprocess.run(
         cmd, capture_output=True, text=True, errors="replace",

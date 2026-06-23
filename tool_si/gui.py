@@ -17,6 +17,16 @@ def get_text(key: str) -> str:
     return i18n.translate("si", key)
 
 
+_SUPPRESSED_LOG_MESSAGES = {
+    "FlashAttention2 is not installed; using PyTorch SDPA attention",
+    "FlashAttention2 is not installed; using PyTorch SDPA attention.",
+}
+
+
+def _should_show_log_message(message: object) -> bool:
+    return str(message).strip() not in _SUPPRESSED_LOG_MESSAGES
+
+
 class SimultaneousInterpretationApp:
     def __init__(self, root, on_return=None):
         self.root = root
@@ -40,6 +50,7 @@ class SimultaneousInterpretationApp:
         self.mix_process = None
         self.batch_mix_process = None
         self._download_button_packed = False
+        self._model_frame_packed = False
 
         self._setup_ui()
         self._check_dependencies()
@@ -50,43 +61,50 @@ class SimultaneousInterpretationApp:
         main_frame.pack(fill="both", expand=True)
 
         header_frame = ttk.Frame(main_frame)
-        header_frame.pack(fill="x", pady=(0, 10))
+        header_frame.pack(fill="x", pady=(0, 2))
         ttk.Label(header_frame, text=get_text("title"), font=("Arial", 14, "bold")).pack(side="left")
         if self.on_return:
             ttk.Button(header_frame, text=get_text("btn_return"), command=self.on_return).pack(side="right")
+        ttk.Label(
+            main_frame,
+            text=get_text("lbl_dlna_si_note"),
+            font=("Arial", 9),
+            foreground="dim gray",
+            wraplength=760,
+            justify="left",
+        ).pack(fill="x", pady=(0, 10))
 
         style = ttk.Style()
         style.configure("TNotebook.Tab", padding=[12, 8], font=("Arial", 10, "bold"))
 
-        model_frame = ttk.LabelFrame(main_frame, text=get_text("grp_model"), padding=10)
-        model_frame.pack(fill="x", pady=(0, 8))
+        self.model_frame = ttk.LabelFrame(main_frame, text=get_text("grp_model"), padding=10)
         self.model_status_var = tk.StringVar()
-        ttk.Label(model_frame, textvariable=self.model_status_var).pack(side="left", fill="x", expand=True)
+        ttk.Label(self.model_frame, textvariable=self.model_status_var).pack(side="left", fill="x", expand=True)
         self.btn_download_model = ttk.Button(
-            model_frame,
+            self.model_frame,
             text=get_text("btn_download_model"),
             command=self.download_model,
         )
         self.btn_download_model.pack(side="right", padx=(8, 0))
         self._download_button_packed = True
 
-        notebook = ttk.Notebook(main_frame)
-        notebook.pack(fill="x", pady=(0, 8))
+        self.notebook = ttk.Notebook(main_frame)
+        self.notebook.pack(fill="x", pady=(0, 8))
 
-        single_tab = ttk.Frame(notebook, padding=10)
-        notebook.add(single_tab, text=get_text("tab_single"))
+        single_tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(single_tab, text=get_text("tab_single"))
         self._setup_single_frame(single_tab)
 
-        batch_tab = ttk.Frame(notebook, padding=10)
-        notebook.add(batch_tab, text=get_text("tab_batch"))
+        batch_tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(batch_tab, text=get_text("tab_batch"))
         self._setup_batch_frame(batch_tab)
 
-        mix_tab = ttk.Frame(notebook, padding=10)
-        notebook.add(mix_tab, text=get_text("tab_mix_video_audio"))
+        mix_tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(mix_tab, text=get_text("tab_mix_video_audio"))
         self._setup_mix_frame(mix_tab)
 
-        batch_mix_tab = ttk.Frame(notebook, padding=10)
-        notebook.add(batch_mix_tab, text=get_text("tab_batch_mix_video_audio"))
+        batch_mix_tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(batch_mix_tab, text=get_text("tab_batch_mix_video_audio"))
         self._setup_batch_mix_frame(batch_mix_tab)
 
         log_frame = ttk.LabelFrame(main_frame, text=get_text("lbl_log"), padding=10)
@@ -592,6 +610,9 @@ class SimultaneousInterpretationApp:
         )
 
     def log(self, message: str):
+        if not _should_show_log_message(message):
+            return
+
         def _log():
             self.log_text.config(state="normal")
             self.log_text.insert("end", str(message) + "\n")
@@ -620,12 +641,18 @@ class SimultaneousInterpretationApp:
     def _refresh_model_status(self):
         model_dir = logic.get_model_dir(self.models_root)
         if logic.check_model_files(self.models_root):
-            self.model_status_var.set(get_text("model_ready").format(model_dir))
+            self.model_status_var.set("")
+            if self._model_frame_packed:
+                self.model_frame.pack_forget()
+                self._model_frame_packed = False
             if self._download_button_packed:
                 self.btn_download_model.pack_forget()
                 self._download_button_packed = False
         else:
             self.model_status_var.set(get_text("model_missing").format(model_dir))
+            if not self._model_frame_packed:
+                self.model_frame.pack(fill="x", pady=(0, 8), before=self.notebook)
+                self._model_frame_packed = True
             if not self._download_button_packed:
                 self.btn_download_model.pack(side="right", padx=(8, 0))
                 self._download_button_packed = True

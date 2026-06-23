@@ -7,7 +7,7 @@ import time
 import sys
 
 from tool_subtitle import logic
-from utils import app_config, i18n
+from utils import i18n
 
 import locale
 
@@ -186,118 +186,9 @@ class SubtitleToolsApp:
         # Initial model check
         self.root.after(100, self.check_model_status)
 
-        # GPU Option
-        gpu_frame = ttk.Frame(opt_frame)
-        gpu_frame.pack(fill='x', pady=5)
+        # CUDA is the default project path; keep the setting internal and avoid
+        # exposing a user-facing GPU toggle/check row.
         self.use_gpu_var = tk.BooleanVar(value=True)
-        self.chk_gpu = ttk.Checkbutton(gpu_frame, text=get_text('chk_use_gpu'), variable=self.use_gpu_var)
-        self.chk_gpu.pack(side='left', padx=5)
-        
-        def run_check_cuda():
-            self.btn_check_cuda.config(state='disabled')
-            language = app_config.get_language()
-            checking_text = {
-                'en': " (Checking...)",
-                'zh': " (环境检测中...)",
-                'ja': " (確認中...)",
-            }.get(language, " (Checking...)")
-            self.chk_gpu.config(text=get_text('chk_use_gpu') + checking_text)
-            
-            def check_cuda():
-                has_cuda = False
-                missing_dlls = []
-                try:
-                    import ctranslate2
-                    if ctranslate2.get_cuda_device_count() > 0:
-                        has_cuda = True
-                except Exception:
-                    pass
-                    
-                # If basic CUDA is present, verify dlls on Windows
-                if has_cuda and sys.platform.startswith('win'):
-                    import ctypes.util
-                    import ctranslate2
-                    
-                    def log_thread(msg):
-                        self.root.after(0, lambda m=msg: self.log(self.gen_log, m))
-
-                    def check_any_dll(prefix, suffixes):
-                        import ctypes.util
-                        for s in suffixes:
-                            name = f'{prefix}{s}'
-                            log_thread(f"System checking DLL: {name} ...")
-                            try:
-                                ctypes.CDLL(f'{name}.dll')
-                                log_thread(f"  [OK] Loaded via CDLL (local directory).")
-                                return True
-                            except Exception as e:
-                                log_thread(f"  [CDLL Load Error] {e}")
-                            
-                            path = ctypes.util.find_library(name)
-                            if path:
-                                log_thread(f"  [OK] Found via find_library (system PATH): {path}")
-                                return True
-                            else:
-                                log_thread(f"  [find_library] Not found in PATH.")
-                        return False
-
-                    language = app_config.get_language()
-                    if language == 'zh':
-                        req_v12 = "(需CUDA 12+)"
-                        req_v9 = "(需v9+)"
-                    elif language == 'ja':
-                        req_v12 = "(CUDA12+必要)"
-                        req_v9 = "(v9+必要)"
-                    else:
-                        req_v12 = "(requires CUDA 12+)"
-                        req_v9 = "(requires v9+)"
-                    
-                    if not check_any_dll('cublas64_', ['12', '13', '14', '15', '16']):
-                        missing_dlls.append(f"cuBLAS{req_v12}")
-                    
-                    has_cudnn = check_any_dll('cudnn_cnn64_', ['9', '10', '11', '12', '13']) or \
-                                check_any_dll('cudnn_cnn_infer64_', [ '9', '10', '11', '12', '13'])
-                    if not has_cudnn:
-                        missing_dlls.append(f"cuDNN{req_v9}")
-                    
-                    if missing_dlls:
-                        has_cuda = False
-                
-                def update_ui():
-                    self.btn_check_cuda.config(state='normal')
-                    language = app_config.get_language()
-                    if has_cuda:
-                        ok_text = {
-                            'en': " [CUDA detected]",
-                            'zh': " [已检测到可用 CUDA]",
-                            'ja': " [CUDA検出]",
-                        }.get(language, " [CUDA detected]")
-                        self.chk_gpu.config(text=get_text('chk_use_gpu') + ok_text)
-                    else:
-                        if missing_dlls:
-                            if language == 'zh':
-                                err_msg = f" [缺少 {'/'.join(missing_dlls)}，可能回退CPU]"
-                            elif language == 'ja':
-                                err_msg = f" [不足 {'/'.join(missing_dlls)}、CPUへ戻る可能性]"
-                            else:
-                                err_msg = f" [Missing {'/'.join(missing_dlls)}, may fallback to CPU]"
-                            self.chk_gpu.config(text=get_text('chk_use_gpu') + err_msg)
-                            self.show_cuda_download_dialog()
-                        else:
-                            if language == 'zh':
-                                err_msg = " [未检测到 NVIDIA 显卡或 CUDA，已回退CPU]"
-                            elif language == 'ja':
-                                err_msg = " [NVIDIA GPU/CUDAなし、CPUへ]"
-                            else:
-                                err_msg = " [NVIDIA GPU or CUDA not found, fallback to CPU]"
-                            self.chk_gpu.config(text=get_text('chk_use_gpu') + err_msg)
-                        
-                self.root.after(0, update_ui)
-                
-            threading.Thread(target=check_cuda, daemon=True).start()
-
-        self.btn_check_cuda = ttk.Button(gpu_frame, text=get_text('btn_check_cuda'), command=run_check_cuda)
-        self.btn_check_cuda.pack(side='left', padx=5)
 
         # Action Buttons
         btn_frame = ttk.Frame(frame, padding=10)
@@ -315,43 +206,6 @@ class SubtitleToolsApp:
         
         self.gen_log = tk.Text(log_frame, height=12, state='disabled')
         self.gen_log.pack(fill='both', expand=True)
-
-    def show_cuda_download_dialog(self):
-        dialog = tk.Toplevel(self.root)
-        dialog.title(get_text('cuda_dialog_title'))
-        dialog.geometry("550x320")
-        dialog.resizable(False, False)
-        dialog.transient(self.root)
-        dialog.grab_set()
-
-        # Center dialog
-        dialog.update_idletasks()
-        width = dialog.winfo_width()
-        height = dialog.winfo_height()
-        x = (dialog.winfo_screenwidth() // 2) - (width // 2)
-        y = (dialog.winfo_screenheight() // 2) - (height // 2)
-        dialog.geometry(f'+{x}+{y}')
-
-        content_frame = ttk.Frame(dialog, padding=20)
-        content_frame.pack(fill='both', expand=True)
-
-        msg_lbl = ttk.Label(content_frame, text=get_text('cuda_dialog_msg'), wraplength=500, justify='left')
-        msg_lbl.pack(fill='both', expand=True, pady=(0, 20))
-
-        btn_frame = ttk.Frame(content_frame)
-        btn_frame.pack(fill='x', side='bottom')
-
-        def open_github():
-            import webbrowser
-            webbrowser.open("https://github.com/Purfview/whisper-standalone-win/releases/tag/libs")
-
-        def open_root():
-            if sys.platform.startswith('win'):
-                base_dir = os.path.dirname(self.models_root)
-                os.startfile(base_dir)
-
-        ttk.Button(btn_frame, text=get_text('btn_open_github'), command=open_github).pack(side='left', padx=(30, 10), fill='x', expand=True)
-        ttk.Button(btn_frame, text=get_text('btn_open_root'), command=open_root).pack(side='right', padx=(10, 30), fill='x', expand=True)
 
     def browse_gen_dir(self):
         path = filedialog.askdirectory()

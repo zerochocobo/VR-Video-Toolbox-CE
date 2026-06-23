@@ -26,6 +26,7 @@ from typing import Callable, Optional
 
 from tool_clonevoice import diarize as diar
 from tool_clonevoice import refsel
+from tool_clonevoice import segment_engine as seg_engine
 from tool_clonevoice import whisperx_backend as wx
 
 LogCallback = Callable[[str], None]
@@ -162,6 +163,7 @@ def run_transcribe_diarize(
     ref_strategy: str = "hybrid",
     models_root: str,
     keep_intermediate: bool = True,
+    denoise: str = "none",
     log: LogCallback = print,
     stop_event: Optional[Event] = None,
     model_holder: Optional[list] = None,
@@ -185,22 +187,24 @@ def run_transcribe_diarize(
     audio_wav = cdir / AUDIO16K_NAME
 
     _check_stop()
-    wx.extract_audio_16k(str(video), str(audio_wav), log=log, stop_event=stop_event)
+    wx.extract_audio_16k(
+        str(video), str(audio_wav), log=log, stop_event=stop_event, denoise=denoise
+    )
 
-    import whisperx
-
-    audio = whisperx.load_audio(str(audio_wav))
     asr_device, asr_compute = wx.resolve_asr_device()
     torch_device, _ = wx.resolve_device()
-    model_arg = wx.resolve_model_arg(model_key, models_root)
     log(f"[device] transcription={asr_device}/{asr_compute}, align+diarize={torch_device}")
     if asr_device == "cpu" and torch_device == "cuda":
         log("[device] CTranslate2 cuDNN 8 DLLs not found; transcription runs on CPU to avoid a hard crash.")
 
     with wx.torch_load_compat():
         _check_stop()
-        result = wx.transcribe(
-            audio, model_arg, asr_device, asr_compute, language, log=log, model_holder=model_holder
+        # High-recall WhisperSeg-VAD + chunked decode (tool_subtitle engine),
+        # producing offset-corrected per-word timestamps. Replaces the old
+        # single-pass whisperx call that dropped quiet speech.
+        result = seg_engine.transcribe(
+            str(audio_wav), model_key=model_key, models_root=models_root,
+            language=language, log=log, model_holder=model_holder,
         )
         detected_lang = result.get("language") or (language or "")
         raw_segments = result.get("segments", [])
@@ -449,6 +453,7 @@ def run_full(
     models_root: str,
     keep_intermediate: bool = True,
     skip_existing: bool = True,
+    denoise: str = "none",
     num_step: int = 32,
     guidance_scale: float = 2.0,
     loudness_mode: str = "envelope",
@@ -470,7 +475,8 @@ def run_full(
     run_transcribe_diarize(
         video, model_key=model_key, language=language, diarize_backend=diarize_backend,
         num_speakers=num_speakers, target_language=target_language, models_root=models_root,
-        keep_intermediate=keep_intermediate, log=log, stop_event=stop_event, model_holder=model_holder,
+        keep_intermediate=keep_intermediate, denoise=denoise, log=log, stop_event=stop_event,
+        model_holder=model_holder,
     )
     # ASR/diarization models can occupy several GB. Release them before
     # OmniVoice loads, otherwise batch runs may carry both stages in VRAM.

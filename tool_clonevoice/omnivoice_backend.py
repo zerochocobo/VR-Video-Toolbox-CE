@@ -48,9 +48,46 @@ def load_model(models_root: str, device: str, log: LogCallback = print):
 # target languages we build a SAME-LANGUAGE working reference (see below); other
 # languages fall back to the cross-lingual video reference.
 _GENERIC_REF_TEXTS = {
-    "chinese": "你好，很高兴认识你。今天天气真不错，我们慢慢聊，有什么想法都可以告诉我，希望你过得开心。",
-    "english": "Hello, it is really nice to meet you. The weather is lovely today, so let us talk slowly, "
-               "and please feel free to tell me anything that is on your mind.",
+    "chinese": (
+        "你好，很高兴认识你。今天的天气很舒服，我们可以慢慢聊聊最近的计划、"
+        "喜欢的音乐、遇到的事情，也可以轻松地分享一些温暖又有趣的想法。"
+    ),
+    "english": (
+        "Hello, it is really nice to meet you today. The weather feels calm and pleasant, "
+        "so let us speak clearly, share a few simple thoughts, and talk about anything on your mind."
+    ),
+    "korean": (
+        "안녕하세요, 오늘 만나서 정말 반갑습니다. 날씨가 편안해서 우리는 천천히 이야기하고, "
+        "최근의 계획과 좋아하는 음악, 기억에 남는 일들을 자연스럽게 나눌 수 있습니다."
+    ),
+    "thai": (
+        "สวัสดีครับ วันนี้ยินดีมากที่ได้พบกัน อากาศสงบและน่าพอใจ "
+        "เราจึงคุยกันช้าๆ ได้อย่างชัดเจน แบ่งปันความคิดง่ายๆ และพูดถึงเรื่องที่อยู่ในใจได้อย่างเป็นธรรมชาติ"
+    ),
+    "german": (
+        "Hallo, es freut mich sehr, dich heute kennenzulernen. Das Wetter ist ruhig und angenehm, "
+        "deshalb können wir klar sprechen, ein paar einfache Gedanken teilen und über alles reden, was dir gerade wichtig ist."
+    ),
+    "french": (
+        "Bonjour, je suis vraiment ravi de vous rencontrer aujourd'hui. Le temps est calme et agréable, "
+        "alors parlons clairement, partageons quelques idées simples et évoquons ce qui vous tient à coeur."
+    ),
+    "spanish": (
+        "Hola, me alegra mucho conocerte hoy. El clima se siente tranquilo y agradable, "
+        "así que podemos hablar con claridad, compartir algunas ideas sencillas y conversar sobre lo que tengas en mente."
+    ),
+    "portuguese": (
+        "Olá, é muito bom conhecer você hoje. O tempo está calmo e agradável, "
+        "então podemos falar com clareza, compartilhar algumas ideias simples e conversar sobre o que estiver em sua mente."
+    ),
+    "italian": (
+        "Ciao, sono davvero felice di incontrarti oggi. Il tempo è calmo e piacevole, "
+        "quindi possiamo parlare con chiarezza, condividere alcuni pensieri semplici e discutere di ciò che hai in mente."
+    ),
+    "russian": (
+        "Здравствуйте, очень приятно встретиться с вами сегодня. Погода спокойная и приятная, "
+        "поэтому мы можем говорить ясно, делиться простыми мыслями и обсуждать то, что для вас сейчас важно."
+    ),
 }
 
 # Fixed target duration (seconds) for the work_ref generic line, sized to the
@@ -59,9 +96,29 @@ _GENERIC_REF_TEXTS = {
 # makes the working reference wildly slow for one speaker and fast for another.
 # Pinning it keeps every speaker's work_ref at the same sane speaking rate.
 _GENERIC_REF_DURATION = {
-    "chinese": 9.5,
-    "english": 12.0,
+    "chinese": 13.0,
+    "english": 13.5,
 }
+
+
+def _estimate_ref_duration(text: str) -> float:
+    cjk_count = len(re.findall(r"[\u3400-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]", text or ""))
+    word_count = len(re.findall(r"[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)?", text or ""))
+    visible_count = sum(1 for ch in (text or "") if not ch.isspace())
+    if word_count > 0 and cjk_count < 10:
+        duration = 1.2 + word_count / 2.45
+    else:
+        duration = 1.0 + max(cjk_count, visible_count) / 5.0
+    return float(np.clip(duration, 6.0, 14.0))
+
+
+def _resolve_generic_ref(language: Optional[str]) -> tuple[Optional[str], float]:
+    key = (language or "").strip().lower()
+    generic = _GENERIC_REF_TEXTS.get(key)
+    duration = _GENERIC_REF_DURATION.get(key)
+    if duration is None and generic:
+        duration = _estimate_ref_duration(generic)
+    return generic, duration or 9.5
 
 
 def _rms(clip: np.ndarray) -> float:
@@ -169,7 +226,7 @@ def _build_speaker_prompts(model, manifest: dict, clone_dir: Path, language, sr,
     """One reusable voice-clone prompt per speaker.
 
     OmniVoice clones reliably (down to very short lines) only when the reference
-    is in the SAME language as the target. So for Chinese/English targets we first
+    is in the SAME language as the target. So for fixed supported targets we first
     synthesize a clean same-language "working reference" — clone the speaker's
     source-language video reference saying a generic sentence — then clone from
     THAT. For other target languages we fall back to the cross-lingual video
@@ -186,8 +243,7 @@ def _build_speaker_prompts(model, manifest: dict, clone_dir: Path, language, sr,
     # OmniVoice and the root cause of "both speakers sound the same generic voice".
     _fill_missing_ref_texts(manifest, clone_dir, models_root, device, log)
 
-    generic = _GENERIC_REF_TEXTS.get((language or "").strip().lower())
-    work_dur = _GENERIC_REF_DURATION.get((language or "").strip().lower(), 9.5)
+    generic, work_dur = _resolve_generic_ref(language)
     prompts = {}
 
     # VRAM discipline: OmniVoice (fp16) nearly fills the GPU during generation,

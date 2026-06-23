@@ -52,10 +52,9 @@ class ClonevoiceToolsApp:
     def _start_backend_warmup(self):
         """Preload heavy backends in the background so the first run isn't cold.
 
-        Opening this window is light, but the clone pipeline then pays a large
-        one-time `import torch` (~tens of seconds in the packaged build) plus
-        transformers. Warm them on a daemon thread while the user picks files,
-        so clicking Start no longer blocks on the cold import. Best-effort.
+        Keep the launcher-to-window transition responsive: the packaged build
+        can spend a long time cold-importing torch/transformers. Start that
+        best-effort warmup after Tk has had a chance to paint this window.
         """
         def _run():
             try:
@@ -64,7 +63,13 @@ class ClonevoiceToolsApp:
             except Exception:
                 pass
 
-        threading.Thread(target=_run, name="clonevoice-warmup", daemon=True).start()
+        def _start():
+            threading.Thread(target=_run, name="clonevoice-warmup", daemon=True).start()
+
+        try:
+            self.root.after(1500, _start)
+        except tk.TclError:
+            _start()
 
     # --- UI ---
     def _setup_ui(self):
@@ -72,10 +77,18 @@ class ClonevoiceToolsApp:
         main_frame.pack(fill="both", expand=True)
 
         header_frame = ttk.Frame(main_frame)
-        header_frame.pack(fill="x", pady=(0, 10))
+        header_frame.pack(fill="x", pady=(0, 2))
         ttk.Label(header_frame, text=get_text("title"), font=("Arial", 14, "bold")).pack(side="left")
         if self.on_return:
             ttk.Button(header_frame, text=get_text("btn_return"), command=self.on_return).pack(side="right")
+        ttk.Label(
+            main_frame,
+            text=get_text("lbl_dlna_si_note"),
+            font=("Arial", 9),
+            foreground="dim gray",
+            wraplength=760,
+            justify="left",
+        ).pack(fill="x", pady=(0, 10))
 
         style = ttk.Style()
         style.configure("TNotebook.Tab", padding=[12, 8], font=("Arial", 10, "bold"))
@@ -191,7 +204,16 @@ class ClonevoiceToolsApp:
         ttk.Label(row2, text=get_text("lbl_num_speakers"), width=10).pack(side="left")
         self._num_map = {get_text("opt_num_auto"): None, "1": 1, "2": 2, "3": 3, "4": 4, "5": 5}
         self.num_spk_var = tk.StringVar(value=get_text("opt_num_auto"))
-        ttk.Combobox(row2, textvariable=self.num_spk_var, values=list(self._num_map.keys()), state="readonly", width=14).pack(side="left")
+        ttk.Combobox(row2, textvariable=self.num_spk_var, values=list(self._num_map.keys()), state="readonly", width=14).pack(side="left", padx=(0, 16))
+        ttk.Label(row2, text=get_text("lbl_denoise"), width=10).pack(side="left")
+        self._denoise_map = {
+            get_text("opt_denoise_none"): "none",
+            get_text("opt_denoise_mild"): "mild",
+            get_text("opt_denoise_balanced"): "balanced",
+            get_text("opt_denoise_strong"): "strong",
+        }
+        self.denoise_var = tk.StringVar(value=get_text("opt_denoise_none"))
+        ttk.Combobox(row2, textvariable=self.denoise_var, values=list(self._denoise_map.keys()), state="readonly", width=12).pack(side="left")
 
         row3 = ttk.Frame(options_frame)
         row3.pack(fill="x", pady=2)
@@ -199,11 +221,26 @@ class ClonevoiceToolsApp:
         self._tgt_map = {
             get_text("opt_lang_zh"): "Chinese",
             get_text("opt_lang_en"): "English",
-            get_text("opt_lang_ja"): "Japanese",
+            get_text("opt_lang_ko"): "Korean",
+            get_text("opt_lang_th"): "Thai",
+            get_text("opt_lang_de"): "German",
+            get_text("opt_lang_fr"): "French",
+            get_text("opt_lang_es"): "Spanish",
+            get_text("opt_lang_pt"): "Portuguese",
+            get_text("opt_lang_it"): "Italian",
+            get_text("opt_lang_ru"): "Russian",
         }
         self.tgt_lang_var = tk.StringVar(value=get_text("opt_lang_zh"))
-        ttk.Combobox(row3, textvariable=self.tgt_lang_var, values=list(self._tgt_map.keys()), state="readonly", width=16).pack(side="left")
-        ttk.Button(row3, text=get_text("btn_trans_config"), command=self._open_translate_config).pack(side="left", padx=(12, 0))
+        self.tgt_lang_combo = ttk.Combobox(
+            row3,
+            textvariable=self.tgt_lang_var,
+            values=list(self._tgt_map.keys()),
+            state="readonly",
+            width=16,
+        )
+        self.tgt_lang_combo.pack(side="left")
+        self.btn_trans_config = ttk.Button(row3, text=get_text("btn_trans_config"), command=self._open_translate_config)
+        self.btn_trans_config.pack(side="left", padx=(12, 0))
 
         row4 = ttk.Frame(options_frame)
         row4.pack(fill="x", pady=2)
@@ -560,11 +597,14 @@ class ClonevoiceToolsApp:
         threading.Thread(target=task, daemon=True).start()
 
     def _dubbing_available(self) -> bool:
-        # Dubbing replaces the original dialogue and needs the bandit-v2
-        # vocal-separation checkpoint under models/bandit-v2.
-        from tool_clonevoice import separate
-
-        return separate.is_available(self.models_root)
+        # Mirror tool_clonevoice.separate.is_available() without importing it.
+        # Importing separate pulls in torch/torchaudio/Bandit/librosa and can
+        # make the launcher click feel frozen in the packaged build.
+        bandit_dir = os.path.join(self.models_root, "bandit-v2")
+        return (
+            os.path.isfile(os.path.join(bandit_dir, "checkpoint-multi.slim.pt"))
+            or os.path.isfile(os.path.join(bandit_dir, "checkpoint-multi.ckpt"))
+        )
 
     def _browse_mix_dir(self):
         d = filedialog.askdirectory()
@@ -779,6 +819,9 @@ class ClonevoiceToolsApp:
             self.envelope_strength_label.pack_forget()
             self.envelope_alpha_combo.pack_forget()
 
+    def _selected_target_language(self) -> str:
+        return self._tgt_map.get(self.tgt_lang_var.get(), "Chinese")
+
     def _on_single_mix_mode_change(self):
         from tool_si import logic as sl
         from tool_clonevoice import dubbing as dub
@@ -871,9 +914,19 @@ class ClonevoiceToolsApp:
                     videos.append(os.path.join(root, name))
         return sorted(videos, key=lambda p: p.lower())
 
-    def _run(self):
-        from tool_clonevoice import logic
+    def _translation_api_key_configured(self) -> bool:
+        try:
+            import keyring
 
+            api_key = (
+                keyring.get_password("VR_Video_Toolbox", "deepseek_api_key")
+                or keyring.get_password("VR_Mosaic_Removal", "deepseek_api_key")
+            )
+        except Exception:
+            api_key = None
+        return bool((api_key or "").strip())
+
+    def _run(self):
         input_path = self.input_video_var.get().strip()
         batch_mode = self.clone_input_mode_var.get() == "batch"
         if batch_mode:
@@ -890,6 +943,16 @@ class ClonevoiceToolsApp:
         else:
             videos = [input_path]
 
+        if not self._translation_api_key_configured():
+            messagebox.showerror("Error", get_text("err_no_translation_api_key"))
+            return
+        target_language = self._selected_target_language()
+        if not target_language:
+            messagebox.showerror("Error", get_text("err_no_target_lang"))
+            return
+
+        from tool_clonevoice import logic
+
         self.stop_event.clear()
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
@@ -898,7 +961,7 @@ class ClonevoiceToolsApp:
         language = self._lang_map.get(self.src_lang_var.get())
         backend = self._diar_map.get(self.diar_var.get(), "auto")
         num_speakers = self._num_map.get(self.num_spk_var.get())
-        target_language = self._tgt_map.get(self.tgt_lang_var.get(), "Chinese")
+        denoise = self._denoise_map.get(self.denoise_var.get(), "none")
         loudness_mode = self._loudness_mode_map.get(self.loudness_mode_var.get(), "envelope")
         envelope_alpha = self._envelope_alpha_map.get(self.envelope_alpha_var.get(), 0.6)
         keep_intermediate = self.keep_intermediate_var.get()
@@ -937,6 +1000,7 @@ class ClonevoiceToolsApp:
                         diarize_backend=backend,
                         num_speakers=num_speakers,
                         target_language=target_language,
+                        denoise=denoise,
                         loudness_mode=loudness_mode,
                         envelope_alpha=envelope_alpha,
                         models_root=self.models_root,

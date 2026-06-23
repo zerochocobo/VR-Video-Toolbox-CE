@@ -73,3 +73,16 @@ def test_follow_envelope_respects_db_clamp():
     gain = np.divide(out, clip, out=np.ones_like(clip), where=np.abs(clip) > 1e-4)
     assert gain.min() >= 0.5 - 1e-3
     assert gain.max() <= 2.0 + 1e-3
+
+
+def test_builtin_generic_ref_texts_are_long_enough():
+    chinese = ov._GENERIC_REF_TEXTS["chinese"]
+    english = ov._GENERIC_REF_TEXTS["english"]
+    thai = ov._GENERIC_REF_TEXTS["thai"]
+
+    assert len(ov._CJK_RE.findall(chinese)) >= 40
+    assert len(ov._LATIN_WORD_RE.findall(english)) >= 18
+    assert len([ch for ch in thai if not ch.isspace()]) >= 40
+    assert 6.0 <= ov._GENERIC_REF_DURATION["chinese"] <= 14.0
+    assert 6.0 <= ov._GENERIC_REF_DURATION["english"] <= 14.0
+    assert 6.0 <= ov._resolve_generic_ref("Thai")[1] <= 14.0

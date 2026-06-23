@@ -1199,8 +1199,12 @@ class SubtitleGenerator:
         segmented_chunks = []
         min_samples = int(WHISPERSEG_MIN_CHUNK_SECONDS * sampling_rate)
         for start, end in merged:
+            # Pad rather than drop short detected speech (see split_audio_whisperseg).
             if end - start < min_samples:
-                continue
+                deficit = min_samples - (end - start)
+                start = max(0, start - deficit // 2)
+                end = min(len(audio), start + min_samples)
+                start = max(0, end - min_samples)
             segmented_chunks.append({
                 "array": audio[start:end].astype(np.float32, copy=False),
                 "offset_sec": offset + start / sampling_rate,
@@ -1275,8 +1279,12 @@ class SubtitleGenerator:
             min_samples = int(WHISPERSEG_MIN_CHUNK_SECONDS * 16000)
             added = 0
             for start, end in merged:
+                # Pad rather than drop short detected speech (see split_audio_whisperseg).
                 if end - start < min_samples:
-                    continue
+                    deficit = min_samples - (end - start)
+                    start = max(0, start - deficit // 2)
+                    end = min(len(audio), start + min_samples)
+                    start = max(0, end - min_samples)
                 segmented_chunks.append({
                     "array": audio[start:end].astype(np.float32, copy=False),
                     "offset_sec": start / 16000.0,
@@ -1329,8 +1337,16 @@ class SubtitleGenerator:
         min_samples = int(WHISPERSEG_MIN_CHUNK_SECONDS * 16000)
 
         def add_chunk(start: int, end: int):
+            # A region WhisperSeg already classified as speech must never be
+            # dropped just for being short -- that silently loses real, often
+            # isolated/quiet lines (e.g. a 1s reply between long pauses). Pad a
+            # too-short region with surrounding audio up to the minimum window so
+            # it still reaches the ASR; any overlap is removed later by dedup.
             if end - start < min_samples:
-                return
+                deficit = min_samples - (end - start)
+                start = max(0, start - deficit // 2)
+                end = min(len(audio), start + min_samples)
+                start = max(0, end - min_samples)
             chunks.append({
                 "array": audio[start:end].astype(np.float32, copy=False),
                 "offset_sec": start / 16000.0,

@@ -2,9 +2,30 @@
 
 ## English
 
+### 2026-06-23
+
+- Major fix: Ported the proven WhisperSeg transcription front-end from Subtitle Tools into Clone Translation Dubbing, including Kotoba alignment-head repair, word timestamp preservation, configurable denoise, and quieter pyannote startup logs.
+- Major fix: Fixed dropped short speech regions in the shared WhisperSeg splitter by padding short detected speech windows instead of discarding them; the same fix was mirrored to the sibling `VR_Video_Toolbox` checkout.
+- Change: Hid the legacy "try GPU acceleration" row in Subtitle Tools because CUDA is now the default project path while generation and listening-translation tasks still run with GPU enabled.
+
+### 2026-06-22
+
+- Major update: Added native mosaic time-gated restore for the `native_gpu` engine, including segment caching, optional detection-clip reuse, one-click direct routing, and MP4 muxing without the old intermediate video-file pipeline.
+- Change: DLNA SI playback is now enabled by default while preserving the existing channel, volume, delay, and ducking defaults.
+- Optimization: Reduced Clone Translation Dubbing launch latency by avoiding heavy backend imports during window creation and delaying backend warmup until after the UI paints.
+- Fix: Clone Translation Dubbing now blocks tab 1 execution when the translation API key is missing.
+- Change: Improved SI and Clonevoice UI clarity: hide the Qwen3-TTS model group when files are ready, add a DLNA live SI note, and suppress the non-actionable FlashAttention2 SDPA notice.
+- Change: Clonevoice target languages are now a fixed OmniVoice-compatible list with Thai added; arbitrary "Other" target language and custom sample plumbing were removed.
+
 ### 2026-06-21
 
 - Change: Removed the local 2D-to-VR implementation. The launcher button now shows a migration notice and links to the VR Passthrough Server download at https://wapok.com.
+- New: Added DLNA SI live MPEG-TS streaming with `[SI]` time-index browsing, quick chapter leaves, and player-specific metadata for default VR players and DeoVR.
+- New: Added SI audio settings to the homepage DLNA configuration dialog, including automatic `.SI.WAV` linking, channel selection, original/SI volume, SI delay, and original-audio ducking.
+
+### 2026-06-20
+
+- New: Added an NVDS stabilizer ONNX export tool for fixed-resolution exports from `NVDS_Stabilizer.pth`, with metadata output and ONNX Runtime validation.
 
 ### 2026-06-14
 
@@ -47,6 +68,31 @@
 - Major optimization: GPU-accelerated VR split/merge, fisheye/equirectangular conversion, VR-to-flat projection, and OneClick geometry stages.
 
 ## 中文
+
+### 2026-06-23
+
+- 重大修复：将字幕工具中验证过的 WhisperSeg 转录前端移植到克隆翻译配音，包含 Kotoba alignment-head 修复、词级时间戳保留、可配置降噪，以及减少 pyannote 启动时的干扰日志。
+- 重大修复：修复共享 WhisperSeg 分段器漏掉短句的问题。现在对已检测到的短语音窗口做补齐，而不是直接丢弃；同一修复也同步到兄弟项目 `VR_Video_Toolbox`。
+- 变更：隐藏字幕工具中的旧版“尝试用 GPU 加速”选项行。项目默认走 CUDA，同时生成字幕和听译任务仍保持 GPU 启用。
+
+### 2026-06-22
+
+- 重大更新：`native_gpu` 引擎新增原生马赛克 time-gated 恢复，支持片段缓存、检测 clip 复用、OneClick 直连路由，并移除旧的中间视频文件流水线。
+- 变更：DLNA SI 播放默认开启，同时保留原有声道、音量、延时和 ducking 默认参数。
+- 优化：降低克隆翻译配音入口卡顿，窗口创建阶段不再导入重型后端，并把后端预热延后到 UI 绘制之后。
+- 修复：克隆翻译配音 tab1 在未配置翻译 API Key 时会阻止任务启动。
+- 变更：优化 SI 与克隆翻译配音界面：模型文件齐备时隐藏 Qwen3-TTS 模型组，标题下方增加 DLNA 直播 SI 提示，并屏蔽非错误的 FlashAttention2 SDPA 提示。
+- 变更：克隆翻译配音目标语言改为 OmniVoice 兼容的固定列表，新增泰语，并移除任意“其他”语言和自定义样句通道。
+
+### 2026-06-21
+
+- 变更：移除本地 2D 转 VR 实现。主界面按钮现在显示迁移提示，并链接到 https://wapok.com 下载 VR Passthrough Server。
+- 新功能：新增 DLNA SI MPEG-TS 直播流，支持 `[SI]` 时间索引浏览、快速章节入口，以及默认 VR 播放器和 DeoVR 的差异化元数据。
+- 新功能：主界面 DLNA 配置新增 SI 音频参数，包括自动关联 `.SI.WAV`、声道选择、原音/SI 音量、SI 延时和原音 ducking。
+
+### 2026-06-20
+
+- 新功能：新增 NVDS stabilizer ONNX 导出工具，可从 `NVDS_Stabilizer.pth` 导出固定分辨率 ONNX，生成元数据并通过 ONNX Runtime 验证。
 
 ### 2026-06-14
 

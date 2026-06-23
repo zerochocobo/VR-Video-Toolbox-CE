@@ -27,6 +27,22 @@ warnings.filterwarnings(
     message=r"(?s).*torchcodec is not installed correctly.*",
     category=UserWarning,
 )
+# pyannote disables TF32 on import (a reproducibility/accuracy trade-off it makes
+# deliberately) and logs a ReproducibilityWarning each run. We accept that choice,
+# so silence the notice. Matched by message because the custom warning category
+# lives in pyannote and need not be imported here.
+warnings.filterwarnings(
+    "ignore",
+    message=r"(?s).*TensorFloat-32 \(TF32\) has been disabled.*",
+)
+# pyannote's statistics pooling computes std() over very short (often 1-frame)
+# speaker-embedding windows, which torch warns about ("degrees of freedom is
+# <= 0"). The std of a single frame is just 0 here and does not affect turns.
+warnings.filterwarnings(
+    "ignore",
+    message=r"(?s).*std\(\): degrees of freedom is <= 0.*",
+    category=UserWarning,
+)
 
 LogCallback = Callable[[str], None]
 Turn = Tuple[float, float, str]

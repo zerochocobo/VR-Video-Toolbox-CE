@@ -11,6 +11,31 @@ import numpy as np
 from tool_si import logic
 
 
+class FakeStringVar:
+    def __init__(self) -> None:
+        self.value = ""
+
+    def set(self, value: str) -> None:
+        self.value = value
+
+
+class FakePackedWidget:
+    def __init__(self, packed: bool = False) -> None:
+        self.packed = packed
+        self.pack_calls: list[dict] = []
+        self.config_calls: list[dict] = []
+
+    def pack(self, **kwargs) -> None:
+        self.packed = True
+        self.pack_calls.append(kwargs)
+
+    def pack_forget(self) -> None:
+        self.packed = False
+
+    def config(self, **kwargs) -> None:
+        self.config_calls.append(kwargs)
+
+
 class FakeTTSModel:
     def __init__(self, fail_batch: bool = False) -> None:
         self.fail_batch = fail_batch
@@ -34,6 +59,67 @@ class FakeTTSModel:
 
 
 class SimultaneousInterpretationLogicTests(unittest.TestCase):
+    def _make_model_status_app(self, *, frame_packed: bool, button_packed: bool):
+        from tool_si.gui import SimultaneousInterpretationApp
+
+        app = object.__new__(SimultaneousInterpretationApp)
+        app.models_root = "models"
+        app.model_status_var = FakeStringVar()
+        app.model_frame = FakePackedWidget(packed=frame_packed)
+        app.btn_download_model = FakePackedWidget(packed=button_packed)
+        app.notebook = FakePackedWidget()
+        app._model_frame_packed = frame_packed
+        app._download_button_packed = button_packed
+        return app
+
+    def test_model_status_hides_model_group_when_files_are_ready(self) -> None:
+        from tool_si.gui import SimultaneousInterpretationApp
+
+        app = self._make_model_status_app(frame_packed=True, button_packed=True)
+        with patch.object(logic, "get_model_dir", return_value="models/qwen"), patch.object(
+            logic, "check_model_files", return_value=True
+        ):
+            SimultaneousInterpretationApp._refresh_model_status(app)
+
+        self.assertEqual(app.model_status_var.value, "")
+        self.assertFalse(app._model_frame_packed)
+        self.assertFalse(app.model_frame.packed)
+        self.assertFalse(app._download_button_packed)
+        self.assertFalse(app.btn_download_model.packed)
+
+    def test_model_status_shows_model_group_when_files_are_missing(self) -> None:
+        from tool_si.gui import SimultaneousInterpretationApp
+
+        app = self._make_model_status_app(frame_packed=False, button_packed=False)
+        with patch.object(logic, "get_model_dir", return_value="models/qwen"), patch.object(
+            logic, "check_model_files", return_value=False
+        ):
+            SimultaneousInterpretationApp._refresh_model_status(app)
+
+        self.assertIn("models/qwen", app.model_status_var.value)
+        self.assertTrue(app._model_frame_packed)
+        self.assertTrue(app.model_frame.packed)
+        self.assertIs(app.model_frame.pack_calls[-1]["before"], app.notebook)
+        self.assertTrue(app._download_button_packed)
+        self.assertTrue(app.btn_download_model.packed)
+        self.assertEqual(app.btn_download_model.config_calls[-1], {"state": "normal"})
+
+    def test_gui_log_filter_hides_flashattention_sdpa_notice_only(self) -> None:
+        from tool_si.gui import _should_show_log_message
+
+        self.assertFalse(
+            _should_show_log_message("FlashAttention2 is not installed; using PyTorch SDPA attention.")
+        )
+        self.assertFalse(
+            _should_show_log_message("FlashAttention2 is not installed; using PyTorch SDPA attention")
+        )
+        self.assertTrue(
+            _should_show_log_message("FlashAttention load failed, retrying without it: import error")
+        )
+        self.assertTrue(
+            _should_show_log_message("SDPA attention load failed, retrying with eager attention: runtime error")
+        )
+
     def test_default_chinese_speaker_is_serena(self) -> None:
         self.assertEqual(logic.default_speaker_for_language("Chinese"), "Serena")
         self.assertIn("Vivian", logic.speakers_for_language("Chinese"))
