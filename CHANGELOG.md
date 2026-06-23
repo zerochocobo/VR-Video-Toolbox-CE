@@ -10,7 +10,7 @@
 
 ### 2026-06-22
 
-- Major update: Added native mosaic time-gated restore for the `native_gpu` engine, including segment caching, optional detection-clip reuse, one-click direct routing, and MP4 muxing without the old intermediate video-file pipeline.
+- Major update: Added native mosaic  CUDA Graph .
 - Change: DLNA SI playback is now enabled by default while preserving the existing channel, volume, delay, and ducking defaults.
 - Optimization: Reduced Clone Translation Dubbing launch latency by avoiding heavy backend imports during window creation and delaying backend warmup until after the UI paints.
 - Fix: Clone Translation Dubbing now blocks tab 1 execution when the translation API key is missing.
@@ -77,7 +77,7 @@
 
 ### 2026-06-22
 
-- 重大更新：`native_gpu` 引擎新增原生马赛克 time-gated 恢复，支持片段缓存、检测 clip 复用、OneClick 直连路由，并移除旧的中间视频文件流水线。
+- 重大更新：`native_gpu` 支持 CUDA Graph 加速。
 - 变更：DLNA SI 播放默认开启，同时保留原有声道、音量、延时和 ducking 默认参数。
 - 优化：降低克隆翻译配音入口卡顿，窗口创建阶段不再导入重型后端，并把后端预热延后到 UI 绘制之后。
 - 修复：克隆翻译配音 tab1 在未配置翻译 API Key 时会阻止任务启动。
