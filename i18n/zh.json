@@ -45,6 +45,7 @@
       "lbl_dlna_port": "服务端口：",
       "lbl_dlna_port_note": "请确保防火墙打开该端口，另外还有UDP协议1900端口固定用于广播服务器信息",
       "lbl_dlna_dirs": "视频目录列表：",
+      "lbl_dlna_dirs_note": "提示：如果绑定的本地路径是网盘挂载的，目录中视频文件数量过多会导致载入超时（因为要读取每个视频参数信息）",
       "lbl_dlna_auto_sub": "自动关联外部字幕",
       "grp_dlna_si_audio": "同声传译音频",
       "lbl_dlna_si_enabled": "自动关联同声传译.SI.WAV文件",
@@ -293,7 +294,7 @@
       "err_invalid_format": "格式无效",
       "err_time_order": "开始时间必须小于结束时间",
       "opt_fisheye": "去马赛克前先转换成鱼眼视角（可以有效针对部分视频制作商画面中轴的马赛克,例如SAVR/URVRSP...）",
-      "opt_pre_extract": "去马赛克前先提取有马赛克的片段和区域，检测置信阈值",
+      "opt_pre_extract": "(实验功能) 去马赛克前先提取有马赛克的片段和区域，检测置信阈值",
       "opt_source_time_filter": "扫描源视频先剔除无马赛克片段（最大化加速；无马赛克视频整片跳过）",
       "chk_keep_inter": "执行完成后保留中间生成的文件",
       "chk_keep_bitrate": "输出视频码率和原视频保持一致"

@@ -1059,6 +1059,49 @@ def _clone_segment(seg, *, seg_id: int, start_s: float | None = None,
     )
 
 
+def _clamp_eye_segments_for_decode(side_name: str, segments, eye_w: int, eye_h: int,
+                                   log_callback=None):
+    from utils.mosaic_prescan import MosaicSegment
+
+    out = []
+    eye_w = max(2, int(eye_w))
+    eye_h = max(2, int(eye_h))
+    for seg in segments:
+        sx = int(seg.x)
+        sy = int(seg.y)
+        sw = int(seg.w)
+        sh = int(seg.h)
+        x1 = max(0, min(eye_w, sx))
+        y1 = max(0, min(eye_h, sy))
+        x2 = max(0, min(eye_w, sx + sw))
+        y2 = max(0, min(eye_h, sy + sh))
+        if x2 - x1 < 2 or y2 - y1 < 2:
+            if log_callback:
+                log_callback(
+                    f"[source-scan] drop {side_name} fine segment {int(seg.seg_id)} outside single-eye bounds: "
+                    f"rect={sx},{sy},{sw}x{sh}, eye={eye_w}x{eye_h}"
+                )
+            continue
+        if (x1, y1, x2 - x1, y2 - y1) != (sx, sy, sw, sh) and log_callback:
+            log_callback(
+                f"[source-scan] clamp {side_name} fine segment {int(seg.seg_id)} to single-eye rect: "
+                f"{sx},{sy},{sw}x{sh} -> {x1},{y1},{x2 - x1}x{y2 - y1}"
+            )
+        out.append(MosaicSegment(
+            seg_id=len(out),
+            start_s=float(seg.start_s),
+            end_s=float(seg.end_s),
+            start_s_kf=float(seg.start_s_kf),
+            end_s_kf=float(seg.end_s_kf),
+            x=x1,
+            y=y1,
+            w=x2 - x1,
+            h=y2 - y1,
+            conf_max=float(seg.conf_max),
+        ))
+    return out
+
+
 def _segment_time_overlap(a, b) -> tuple[float, float, float]:
     start = max(float(a.start_s), float(b.start_s))
     end = min(float(a.end_s), float(b.end_s))
@@ -1394,7 +1437,7 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
     from gpu_engine import probe as gpu_probe
     from gpu_engine import files as gpu_files
     from gpu_engine import restored_sidecar
-    from utils.mosaic_prescan import save_segments_json, scan_segments_gpu_transform
+    from utils.mosaic_prescan import save_segments_json, scan_segments_gpu_transform, scan_segments_gpu_transform_pair
     from utils.segment_paster import build_paste_segments, paste_segments_gpu_or_fallback
 
     base_clip = os.path.abspath(base_clip)
@@ -1412,22 +1455,33 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
     if process_callback:
         process_callback(scan_token)
     try:
-        left_segments = scan_segments_gpu_transform(
-            base_clip,
-            crop_mode="left",
-            to_fisheye=use_fisheye,
-            log_callback=log_callback,
-            cancel_token=scan_token,
-            min_conf=fine_conf,
-        )
-        right_segments = scan_segments_gpu_transform(
-            base_clip,
-            crop_mode="right",
-            to_fisheye=use_fisheye,
-            log_callback=log_callback,
-            cancel_token=scan_token,
-            min_conf=fine_conf,
-        )
+        if use_fisheye:
+            if log_callback:
+                log_callback("[source-scan] fisheye fine scan uses separate left/right GPU transforms")
+            left_segments = scan_segments_gpu_transform(
+                base_clip,
+                crop_mode="left",
+                to_fisheye=True,
+                log_callback=log_callback,
+                cancel_token=scan_token,
+                min_conf=fine_conf,
+            )
+            right_segments = scan_segments_gpu_transform(
+                base_clip,
+                crop_mode="right",
+                to_fisheye=True,
+                log_callback=log_callback,
+                cancel_token=scan_token,
+                min_conf=fine_conf,
+            )
+        else:
+            left_segments, right_segments = scan_segments_gpu_transform_pair(
+                base_clip,
+                to_fisheye=False,
+                log_callback=log_callback,
+                cancel_token=scan_token,
+                min_conf=fine_conf,
+            )
     except OperationCancelled as exc:
         if log_callback:
             log_callback(f"[source-scan] paired fine scan cancelled: {exc}")
@@ -1441,6 +1495,12 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
             log_callback(f"[source-scan] paired fine scan failed: {type(exc).__name__}: {exc}")
         return PreExtractResult.SCAN_FAILED
 
+    meta = gpu_probe.probe_video(base_clip)
+    fps = meta.source_fps or 30.0
+    eye_w = int(meta.width // 2)
+    eye_h = int(meta.height)
+    left_segments = _clamp_eye_segments_for_decode("left", left_segments, eye_w, eye_h, log_callback=log_callback)
+    right_segments = _clamp_eye_segments_for_decode("right", right_segments, eye_w, eye_h, log_callback=log_callback)
     left_segments, right_segments = _pair_eye_segments_by_time(left_segments, right_segments, log_callback=log_callback)
     if not left_segments and not right_segments:
         if log_callback:
@@ -1451,10 +1511,6 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
     restored_paths = []
     segment_input_paths = []
     paste_segments = []
-    meta = gpu_probe.probe_video(base_clip)
-    fps = meta.source_fps or 30.0
-    eye_w = int(meta.width // 2)
-    eye_h = int(meta.height)
     if _paired_pre_extract_should_bypass_crop(
         left_segments,
         right_segments,

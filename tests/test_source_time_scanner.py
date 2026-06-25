@@ -243,6 +243,14 @@ class SourceTimeScannerTests(unittest.TestCase):
         self.assertEqual([seg.y for seg in paired_left], [2288, 2768])
         self.assertEqual([seg.y for seg in paired_right], [2272, 2496])
 
+    def test_fine_segments_are_clamped_to_single_eye_before_decode(self) -> None:
+        segments = [MosaicSegment(0, 1.0, 2.0, 1.0, 2.0, 1900, 100, 300, 200, 0.91)]
+
+        clamped = logic._clamp_eye_segments_for_decode("left", segments, eye_w=2048, eye_h=2048)
+
+        self.assertEqual(len(clamped), 1)
+        self.assertEqual((clamped[0].x, clamped[0].y, clamped[0].w, clamped[0].h), (1900, 100, 148, 200))
+
     def test_source_scan_uses_paired_pre_extract_for_sbs_when_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             src = Path(raw) / "source.mp4"
@@ -409,6 +417,7 @@ class SourceTimeScannerTests(unittest.TestCase):
                 patch("utils.app_config.get", side_effect=lambda key, default=None: cfg.get(key, default)),
                 patch("gpu_engine.probe.probe_video", return_value=meta),
                 patch("utils.mosaic_prescan.scan_segments_gpu_transform", side_effect=[left, right]) as scan_gpu,
+                patch("utils.mosaic_prescan.scan_segments_gpu_transform_pair") as scan_pair,
                 patch("gpu_engine.files.extract_transformed_rect_clip") as extract_rect,
                 patch("gpu_engine.files.extract_multi_rect_clip", side_effect=fake_extract_multi) as extract_multi,
                 patch("one_click.logic.process_lada") as process_lada,
@@ -427,6 +436,9 @@ class SourceTimeScannerTests(unittest.TestCase):
                 )
 
             self.assertEqual(result, logic.PreExtractResult.OK)
+            scan_pair.assert_not_called()
+            self.assertEqual([call.kwargs["crop_mode"] for call in scan_gpu.call_args_list], ["left", "right"])
+            self.assertEqual([call.kwargs["to_fisheye"] for call in scan_gpu.call_args_list], [True, True])
             self.assertEqual([call.kwargs["min_conf"] for call in scan_gpu.call_args_list], [0.6, 0.6])
             extract_rect.assert_not_called()
             extract_multi.assert_called_once()
@@ -488,7 +500,7 @@ class SourceTimeScannerTests(unittest.TestCase):
             with (
                 patch("utils.app_config.get", side_effect=lambda key, default=None: cfg.get(key, default)),
                 patch("gpu_engine.probe.probe_video", return_value=meta),
-                patch("utils.mosaic_prescan.scan_segments_gpu_transform", side_effect=[left, right]),
+                patch("utils.mosaic_prescan.scan_segments_gpu_transform_pair", return_value=(left, right)),
                 patch("gpu_engine.files.extract_transformed_rect_clip", side_effect=fake_extract_rect) as extract_rect,
                 patch("gpu_engine.files.extract_multi_rect_clip") as extract_multi,
                 patch("one_click.logic.process_lada"),
@@ -531,7 +543,7 @@ class SourceTimeScannerTests(unittest.TestCase):
             with (
                 patch("utils.app_config.get", side_effect=lambda key, default=None: cfg.get(key, default)),
                 patch("gpu_engine.probe.probe_video", return_value=meta),
-                patch("utils.mosaic_prescan.scan_segments_gpu_transform", side_effect=[left, []]),
+                patch("utils.mosaic_prescan.scan_segments_gpu_transform_pair", return_value=(left, [])),
                 patch("gpu_engine.files.extract_transformed_rect_clip", side_effect=fake_extract_rect) as extract_rect,
                 patch("gpu_engine.files.extract_multi_rect_clip") as extract_multi,
                 patch("one_click.logic.process_lada", side_effect=fake_process_lada) as process_lada,
@@ -573,7 +585,7 @@ class SourceTimeScannerTests(unittest.TestCase):
             with (
                 patch("utils.app_config.get", side_effect=lambda key, default=None: cfg.get(key, default)),
                 patch("gpu_engine.probe.probe_video", return_value=meta),
-                patch("utils.mosaic_prescan.scan_segments_gpu_transform", side_effect=[left, right]),
+                patch("utils.mosaic_prescan.scan_segments_gpu_transform_pair", return_value=(left, right)),
                 patch("gpu_engine.files.extract_transformed_rect_clip") as extract_rect,
                 patch("gpu_engine.files.extract_multi_rect_clip") as extract_multi,
                 patch("one_click.logic.process_lada") as process_lada,
@@ -644,7 +656,7 @@ class SourceTimeScannerTests(unittest.TestCase):
             with (
                 patch("utils.app_config.get", side_effect=lambda key, default=None: cfg.get(key, default)),
                 patch("gpu_engine.probe.probe_video", return_value=meta),
-                patch("utils.mosaic_prescan.scan_segments_gpu_transform", side_effect=[left, right]),
+                patch("utils.mosaic_prescan.scan_segments_gpu_transform_pair", return_value=(left, right)),
                 patch("gpu_engine.files.extract_transformed_rect_clip") as extract_rect,
                 patch("gpu_engine.files.extract_multi_rect_clip", side_effect=fake_extract_multi) as extract_multi,
                 patch("one_click.logic.process_lada", side_effect=fake_process_lada) as process_lada,
@@ -697,7 +709,7 @@ class SourceTimeScannerTests(unittest.TestCase):
             with (
                 patch("utils.app_config.get", side_effect=lambda key, default=None: cfg.get(key, default)),
                 patch("gpu_engine.probe.probe_video", return_value=meta),
-                patch("utils.mosaic_prescan.scan_segments_gpu_transform", side_effect=[left, right]),
+                patch("utils.mosaic_prescan.scan_segments_gpu_transform_pair", return_value=(left, right)),
                 patch("gpu_engine.files.extract_multi_rect_clip", side_effect=fake_extract_multi),
                 patch("one_click.logic.process_lada", side_effect=lambda _src, dst, **_kwargs: str(dst)),
                 patch("utils.segment_paster.paste_segments_gpu_or_fallback") as paste_fallback,
@@ -742,7 +754,7 @@ class SourceTimeScannerTests(unittest.TestCase):
             with (
                 patch("utils.app_config.get", side_effect=lambda key, default=None: default),
                 patch("gpu_engine.probe.probe_video", return_value=meta),
-                patch("utils.mosaic_prescan.scan_segments_gpu_transform", side_effect=[left, right]),
+                patch("utils.mosaic_prescan.scan_segments_gpu_transform_pair", return_value=(left, right)),
                 patch("gpu_engine.files.extract_transformed_rect_clip") as extract_rect,
                 patch("gpu_engine.files.extract_multi_rect_clip") as extract_multi,
                 patch("one_click.logic.process_lada") as process_lada,

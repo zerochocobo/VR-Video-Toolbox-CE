@@ -227,7 +227,7 @@ class VRMosaicOneClickApp:
         ttk.Label(end_frame_s_auto, text=get_text('lbl_end_hint'), foreground='gray').pack(side='left', padx=(8, 0))
 
         self.s_auto_fisheye = tk.BooleanVar()
-        self.s_auto_pre_extract = tk.BooleanVar(value=True)
+        self.s_auto_pre_extract = tk.BooleanVar(value=False)
         self.s_auto_fine_conf = tk.StringVar(value=_DEFAULT_FINE_CONF)
         self.s_auto_keep = tk.BooleanVar()
         self.s_auto_keep_bitrate = tk.BooleanVar(value=True)
@@ -343,7 +343,7 @@ class VRMosaicOneClickApp:
         ttk.Label(end_frame_s_eye, text=get_text('lbl_end_hint'), foreground='gray').pack(side='left', padx=(8, 0))
 
         self.s_eye_fisheye = tk.BooleanVar()
-        self.s_eye_pre_extract = tk.BooleanVar(value=True)
+        self.s_eye_pre_extract = tk.BooleanVar(value=False)
         self.s_eye_fine_conf = tk.StringVar(value=_DEFAULT_FINE_CONF)
         self.s_eye_keep = tk.BooleanVar()
         self.s_eye_keep_bitrate = tk.BooleanVar(value=True)
@@ -440,7 +440,7 @@ class VRMosaicOneClickApp:
         ttk.Button(input_frame, text=get_text('btn_browse'), command=lambda: self.browse_dir(self.b_auto_input)).pack(side='left', padx=5)
         
         self.b_auto_fisheye = tk.BooleanVar()
-        self.b_auto_pre_extract = tk.BooleanVar(value=True)
+        self.b_auto_pre_extract = tk.BooleanVar(value=False)
         self.b_auto_fine_conf = tk.StringVar(value=_DEFAULT_FINE_CONF)
         self.b_auto_keep_bitrate = tk.BooleanVar(value=True)
         ttk.Checkbutton(tab, text=get_text('opt_fisheye'), variable=self.b_auto_fisheye).grid(row=1, column=0, columnspan=2, sticky='w', padx=5, pady=5)
@@ -532,7 +532,7 @@ class VRMosaicOneClickApp:
         ttk.Radiobutton(eye_frame, text=get_text('opt_right'), variable=self.b_eye_mode, value=2).pack(side='left', padx=5)
         
         self.b_eye_fisheye = tk.BooleanVar()
-        self.b_eye_pre_extract = tk.BooleanVar(value=True)
+        self.b_eye_pre_extract = tk.BooleanVar(value=False)
         self.b_eye_fine_conf = tk.StringVar(value=_DEFAULT_FINE_CONF)
         self.b_eye_keep_bitrate = tk.BooleanVar(value=True)
         ttk.Checkbutton(tab, text=get_text('opt_fisheye'), variable=self.b_eye_fisheye).grid(row=2, column=0, columnspan=2, sticky='w', padx=5, pady=5)

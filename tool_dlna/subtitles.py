@@ -7,6 +7,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from tool_dlna.media_library import safe_resolve_path
+
 SUBTITLE_MIME_BY_SUFFIX = {
     ".srt": "application/x-subrip",
     ".ass": "application/x-ass",
@@ -68,10 +70,7 @@ def find_external_subtitles(video_path: Path, enabled: bool = True, media_librar
         except Exception:
             pass
         for path in candidates:
-            try:
-                resolved = path.resolve()
-            except Exception:
-                continue
+            resolved = safe_resolve_path(path)
             key = str(resolved).casefold()
             if key in seen or not resolved.is_file():
                 continue

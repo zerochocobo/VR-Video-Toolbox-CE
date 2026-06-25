@@ -46,7 +46,7 @@ _DEFAULTS = {
     # OneClick pre-extract: detect/crop mosaic time ranges and regions before sending them to lada/jasna.
     'pre_extract_detection_model': 'lada_vr_mosaic_detection_model_v2_accurate.pt',#'lada_vr_mosaic_detection_model_v2_fast.pt',
     'pre_extract_sample_stride_s': 0.5,
-    'pre_extract_yolo_batch': 8,
+    'pre_extract_yolo_batch': 1,
     'pre_extract_head_tail_pad_s': 2.0,
     'pre_extract_merge_gap_s': 1.5,
     'pre_extract_min_gap_s': 2.0,

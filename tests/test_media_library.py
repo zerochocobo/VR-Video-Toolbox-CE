@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tool_dlna.media_library import MediaLibrary, build_media_roots, parse_video_dirs
 
@@ -14,6 +16,15 @@ class MediaLibraryTests(unittest.TestCase):
         self.assertEqual(len(roots), 2)
         self.assertTrue(str(roots[0]).endswith("D:\\VR"))
         self.assertTrue(str(roots[1]).endswith("E:\\VR"))
+
+    def test_parse_video_dirs_tolerates_virtual_drive_resolve_failure(self) -> None:
+        raw = "Y:\\"
+        expected = Path(os.path.abspath(os.fspath(Path(raw))))
+
+        with patch.object(type(Path()), "resolve", side_effect=OSError(1005, "unrecognized volume")):
+            roots = parse_video_dirs(raw, Path("videos"))
+
+        self.assertEqual(roots, [expected])
 
     def test_duplicate_names_are_numbered(self) -> None:
         roots = build_media_roots([Path(r"D:\VR"), Path(r"E:\VR"), Path(r"F:\Movies")])
@@ -59,6 +70,13 @@ class MediaLibraryTests(unittest.TestCase):
             library = MediaLibrary(build_media_roots([root]))
 
             self.assertIsNone(library.key_to_path("../outside.mp4"))
+
+    def test_key_to_path_rejects_parent_traversal_when_resolve_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            with patch.object(type(Path()), "resolve", side_effect=OSError(1005, "unrecognized volume")):
+                library = MediaLibrary(build_media_roots([root]))
+                self.assertIsNone(library.key_to_path("../outside.mp4"))
 
     def test_multi_root_key_to_path_rejects_absolute_rest_and_traversal(self) -> None:
         with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:

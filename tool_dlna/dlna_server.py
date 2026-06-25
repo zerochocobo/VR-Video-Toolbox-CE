@@ -27,6 +27,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 from tool_dlna import connection_manager, content_directory, descriptions, si_stream, subtitles
 from tool_dlna.firewall import hidden_subprocess_kwargs
+from tool_dlna.media_library import safe_resolve_path
 
 MCAST_GRP = "239.255.255.250"
 MCAST_PORT = 1900
@@ -480,7 +481,7 @@ def create_app(
         p = media_library.key_to_path(decoded)
         if p is None:
             raise HTTPException(403, "Forbidden")
-        p = p.resolve()
+        p = safe_resolve_path(p)
         if not media_library.contains(p):
             raise HTTPException(403, "Forbidden")
         if not p.is_file():
@@ -691,7 +692,7 @@ def create_app(
         p = media_library.key_to_path(decoded)
         if p is None:
             raise HTTPException(403, "Forbidden")
-        p = p.resolve()
+        p = safe_resolve_path(p)
         if not media_library.contains(p) or not p.is_file() or not subtitles.is_subtitle_path(p):
             raise HTTPException(404, "Not Found")
         headers = {

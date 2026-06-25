@@ -45,6 +45,7 @@
       "lbl_dlna_port": "Server Port:",
       "lbl_dlna_port_note": "Make sure the firewall allows this port. UDP port 1900 is also fixed for broadcasting server information.",
       "lbl_dlna_dirs": "Video Directory List:",
+      "lbl_dlna_dirs_note": "Tip: If the bound local path is a mounted cloud drive, too many video files in the directory may cause loading to time out because each video's parameter information must be read.",
       "lbl_dlna_auto_sub": "Automatically Associate Subtitles",
       "grp_dlna_si_audio": "Simultaneous Interpretation Audio",
       "lbl_dlna_si_enabled": "Automatically associate simultaneous interpretation .SI.WAV files",
@@ -293,7 +294,7 @@
       "err_invalid_format": "Invalid format",
       "err_time_order": "Start time must be less than End time",
       "opt_fisheye": "Convert to fisheye before processing (Good for some vr manufacturer such as SAVR/URVRSP...)",
-      "opt_pre_extract": "Pre-extract mosaic clips and regions; detection confidence threshold",
+      "opt_pre_extract": "(Experimental) Pre-extract mosaic clips and regions; detection confidence threshold",
       "opt_source_time_filter": "Pre-scan source to skip non-mosaic spans (max speed; whole-video skip when empty)",
       "chk_keep_inter": "Keep intermediate files after execution",
       "chk_keep_bitrate": "Keep output bitrate same as original video"

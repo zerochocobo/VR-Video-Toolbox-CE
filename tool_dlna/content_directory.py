@@ -15,6 +15,7 @@ from urllib.parse import quote
 
 from tool_dlna import subtitles, vr_naming
 from tool_dlna.firewall import hidden_subprocess_kwargs
+from tool_dlna.media_library import safe_resolve_path
 
 ROOT_ID = "0"
 FOLDER_PREFIX = "d_"
@@ -221,7 +222,7 @@ def _probe_video(path: Path) -> dict:
 
 def probe_cached(path: Path) -> dict:
     """Retrieve metadata from cache or probe the video file."""
-    key = str(path.resolve())
+    key = str(safe_resolve_path(path))
     try:
         mtime = path.stat().st_mtime
     except OSError:

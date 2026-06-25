@@ -18,6 +18,7 @@ from gpu_engine import probe
 _DETECTOR = None
 _DETECTOR_CONFIG = None
 _DETECTOR_LOCK = threading.Lock()
+_RESIZE_LUT_CACHE = {}
 
 
 @dataclass
@@ -124,6 +125,8 @@ def _empty_scan_cache_path(video_path: str | Path, *, mode: str,
         "sample_stride_s": float(_cfg("pre_extract_sample_stride_s", 0.5) or 0.5),
         "yolo_imgsz": int(_cfg("pre_extract_yolo_imgsz", 2048) or 0),
         "use_mask_boxes": bool(_cfg("pre_extract_use_mask_boxes", True)),
+        "detector_box_only": True,
+        "detector_box_only_version": 2,
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
@@ -621,9 +624,13 @@ def _is_detector_oom(exc: BaseException) -> bool:
     return "out of memory" in text or "cuda oom" in text or "cublas_status_alloc_failed" in text
 
 
-def _run_detector_batch(detector, frames: list, log_callback=None):
+def _run_detector_batch(detector, frames: list, log_callback=None, *, boxes_only: bool = False):
     try:
         preprocessed = detector.preprocess(frames)
+        if boxes_only:
+            box_fn = getattr(detector, "inference_and_postprocess_boxes", None)
+            if callable(box_fn):
+                return list(box_fn(preprocessed, frames))
         return list(detector.inference_and_postprocess(preprocessed, frames))
     except (RuntimeError, MemoryError) as exc:
         if len(frames) <= 1 or not _is_detector_oom(exc):
@@ -641,8 +648,8 @@ def _run_detector_batch(detector, frames: list, log_callback=None):
         except Exception:
             pass
         return (
-            _run_detector_batch(detector, frames[:mid], log_callback=log_callback)
-            + _run_detector_batch(detector, frames[mid:], log_callback=log_callback)
+            _run_detector_batch(detector, frames[:mid], log_callback=log_callback, boxes_only=boxes_only)
+            + _run_detector_batch(detector, frames[mid:], log_callback=log_callback, boxes_only=boxes_only)
         )
 
 
@@ -682,7 +689,7 @@ def _scan_hits(video_path: str | Path, log_callback=None, cancel_token=None,
 
     stride_s = max(0.05, float(_cfg("pre_extract_sample_stride_s", 0.5) or 0.5))
     stride_frames = max(1, int(round(stride_s * fps)))
-    batch_size = max(1, int(_cfg("pre_extract_yolo_batch", 8) or 8))
+    batch_size = max(1, int(_cfg("pre_extract_yolo_batch", 1) or 1))
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -702,7 +709,7 @@ def _scan_hits(video_path: str | Path, log_callback=None, cancel_token=None,
         nonlocal batch_frames, batch_times, batch_indices
         if not batch_frames:
             return
-        results = _run_detector_batch(detector, batch_frames, log_callback=log_callback)
+        results = _run_detector_batch(detector, batch_frames, log_callback=log_callback, boxes_only=True)
         for frame_idx, ts, result in zip(batch_indices, batch_times, results):
             boxes, detections = _extract_boxes_with_debug(result, min_conf=min_conf)
             if detections:
@@ -835,7 +842,7 @@ def _scan_hits_keyframes_lowres(video_path: str | Path, log_callback=None,
     batch_frames = []
     batch_times = []
     batch_indices = []
-    batch_size = max(1, int(_cfg("pre_extract_yolo_batch", 8) or 8))
+    batch_size = max(1, int(_cfg("pre_extract_yolo_batch", 1) or 1))
     sampled = 0
     t0 = time.perf_counter()
     last_log = 0.0
@@ -844,7 +851,7 @@ def _scan_hits_keyframes_lowres(video_path: str | Path, log_callback=None,
         nonlocal batch_frames, batch_times, batch_indices
         if not batch_frames:
             return
-        results = _run_detector_batch(detector, batch_frames, log_callback=log_callback)
+        results = _run_detector_batch(detector, batch_frames, log_callback=log_callback, boxes_only=True)
         for frame_idx, ts, result in zip(batch_indices, batch_times, results):
             boxes, detections = _extract_boxes_with_debug(result, min_conf=min_conf)
             if detections:
@@ -905,8 +912,8 @@ def _scan_hits_keyframes_lowres(video_path: str | Path, log_callback=None,
 def _scan_hits_keyframes_gpu(video_path: str | Path, log_callback=None,
                              cancel_token=None,
                              min_conf: float | None = None) -> tuple[list[dict], probe.VideoMetadata, list[dict]]:
+    import PyNvVideoCodec as nvc
     from gpu_engine.fallback import OperationCancelled
-    from gpu_engine.pynv_io import PyNvSimpleDecoder
     from utils.keyframe_cutter import list_keyframes
 
     src_meta, decision = probe.route(video_path)
@@ -915,33 +922,23 @@ def _scan_hits_keyframes_gpu(video_path: str | Path, log_callback=None,
 
     keyframes = list_keyframes(video_path)
     if not keyframes:
-        if log_callback:
-            log_callback("[source-scan] no keyframe list available; falling back to normal scan")
-        return _scan_hits(video_path, log_callback=log_callback, cancel_token=cancel_token, min_conf=min_conf)
+        raise RuntimeError("no keyframe list available for GPU keyframe scan")
 
     src_w, src_h, out_w, out_h = _keyframe_left_eye_geometry(src_meta, video_path)
     bd = 10 if src_meta.bit_depth > 8 else 8
-    dec = PyNvSimpleDecoder(Path(video_path), bit_depth=bd)
+    demuxer = nvc.CreateDemuxer(str(Path(video_path)))
+    decoder = nvc.CreateDecoder(
+        gpuid=0,
+        codec=demuxer.GetNvCodecId(),
+        usedevicememory=True,
+        outputColorType=nvc.OutputColorType.NATIVE,
+    )
     try:
-        total_frames = max(1, len(dec))
-        samples: list[tuple[float, int]] = []
-        seen_indices: set[int] = set()
-        for ts in keyframes:
-            idx = int(dec.index_at_time(float(ts)))
-            idx = max(0, min(idx, total_frames - 1))
-            if idx in seen_indices:
-                continue
-            seen_indices.add(idx)
-            samples.append((float(ts), idx))
-
-        if not samples:
-            samples = [(float(keyframes[0]), 0)]
-
         if log_callback:
             log_callback(
-                f"[source-scan] GPU keyframe scan: {len(samples)} keyframes, "
+                f"[source-scan] GPU keyframe scan: {len(keyframes)} keyframes, "
                 f"left-eye original-size crop {src_w}x{src_h} -> {out_w}x{out_h}, "
-                f"route={decision.backend}"
+                f"route={decision.backend}, decoder=key-packet"
             )
 
         detector = _get_detector(log_callback, frame_w=out_w, frame_h=out_h)
@@ -950,16 +947,18 @@ def _scan_hits_keyframes_gpu(video_path: str | Path, log_callback=None,
         batch_frames = []
         batch_times = []
         batch_indices = []
-        batch_size = max(1, int(_cfg("pre_extract_yolo_batch", 8) or 8))
+        batch_size = max(1, int(_cfg("pre_extract_yolo_batch", 1) or 1))
         sampled = 0
+        key_packets = 0
         t0 = time.perf_counter()
         last_log = 0.0
+        pending_keys: list[dict] = []
 
         def _flush_batch():
             nonlocal batch_frames, batch_times, batch_indices
             if not batch_frames:
                 return
-            results = _run_detector_batch(detector, batch_frames, log_callback=log_callback)
+            results = _run_detector_batch(detector, batch_frames, log_callback=log_callback, boxes_only=True)
             for frame_idx, ts, result in zip(batch_indices, batch_times, results):
                 boxes, detections = _extract_boxes_with_debug(result, min_conf=min_conf)
                 if detections:
@@ -976,34 +975,92 @@ def _scan_hits_keyframes_gpu(video_path: str | Path, log_callback=None,
             batch_times = []
             batch_indices = []
 
-        for keyframe_pos, (ts, frame_idx) in enumerate(samples, start=1):
-            if cancel_token is not None and getattr(cancel_token, "cancelled", False):
-                raise OperationCancelled("cancelled by user")
-            frame = dec.frame_at(frame_idx)
-            y_plane, uv_plane = frame.y_uv_cupy()
-            y_plane = y_plane[0:out_h, 0:out_w]
-            uv_plane = uv_plane[0:out_h // 2, 0:out_w // 2, :]
-            batch_frames.append(_cupy_to_torch_bgr(y_plane, uv_plane, bit_depth=bd))
-            batch_times.append(float(ts))
-            batch_indices.append(int(frame_idx))
-            sampled += 1
-            if len(batch_frames) >= batch_size:
-                _flush_batch()
+        def _pop_pending_key(decoded_pts: int | None) -> dict | None:
+            if not pending_keys:
+                return None
+            if decoded_pts is not None:
+                for pos, item in enumerate(pending_keys):
+                    if item.get("pts") == decoded_pts:
+                        if pos > 0:
+                            del pending_keys[:pos]
+                        return pending_keys.pop(0)
+            return pending_keys.pop(0)
+
+        def _handle_decoded_frames(decoded_frames) -> None:
+            nonlocal sampled, last_log
+            for decoded in decoded_frames or []:
+                if cancel_token is not None and getattr(cancel_token, "cancelled", False):
+                    raise OperationCancelled("cancelled by user")
+                try:
+                    decoded_pts = int(decoded.getPTS())
+                except Exception:
+                    decoded_pts = None
+                key_info = _pop_pending_key(decoded_pts)
+                if key_info is None:
+                    continue
+                frame = _decoded_frame_to_gpu_frame(decoded, src_w, src_h, bd)
+                y_plane, uv_plane = frame.y_uv_cupy()
+                y_plane = y_plane[0:out_h, 0:out_w]
+                uv_plane = uv_plane[0:out_h // 2, 0:out_w // 2, :]
+                batch_frames.append(_cupy_to_torch_bgr(y_plane, uv_plane, bit_depth=bd))
+                batch_times.append(float(key_info["ts"]))
+                batch_indices.append(int(key_info["frame_idx"]))
+                sampled += 1
+                if len(batch_frames) >= batch_size:
+                    _flush_batch()
+                now = time.perf_counter()
+                if log_callback and now - last_log >= 5.0:
+                    last_log = now
+                    pct = 100.0 * min(key_packets, len(keyframes)) / max(1, len(keyframes))
+                    elapsed = max(0.001, now - t0)
+                    log_callback(
+                        f"[source-scan] scanned {sampled} GPU keyframes ({pct:.1f}%) "
+                        f"at {sampled / elapsed:.1f} samples/s"
+                    )
+
+        while True:
             now = time.perf_counter()
             if log_callback and now - last_log >= 5.0:
                 last_log = now
-                pct = 100.0 * keyframe_pos / max(1, len(samples))
+                pct = 100.0 * min(key_packets, len(keyframes)) / max(1, len(keyframes))
                 elapsed = max(0.001, now - t0)
                 log_callback(
                     f"[source-scan] scanned {sampled} GPU keyframes ({pct:.1f}%) "
                     f"at {sampled / elapsed:.1f} samples/s"
                 )
+            if cancel_token is not None and getattr(cancel_token, "cancelled", False):
+                raise OperationCancelled("cancelled by user")
+            pkt = demuxer.Demux()
+            if not getattr(pkt, "bsl", 0):
+                _handle_decoded_frames(decoder.Decode(pkt))
+                break
+            if not bool(getattr(pkt, "key", False)):
+                continue
+            key_idx = key_packets
+            key_packets += 1
+            if key_idx < len(keyframes):
+                ts = float(keyframes[key_idx])
+            else:
+                fps = src_meta.source_fps or 30.0
+                ts = float(key_idx) / max(1.0, fps)
+            pending_keys.append({
+                "pts": int(getattr(pkt, "pts", -1)),
+                "ts": ts,
+                "frame_idx": int(round(ts * (src_meta.source_fps or 30.0))),
+            })
+            _handle_decoded_frames(decoder.Decode(pkt))
         _flush_batch()
+        if log_callback and key_packets != len(keyframes):
+            log_callback(
+                f"[source-scan] GPU key packet count differs from ffprobe keyframes: "
+                f"demux={key_packets}, ffprobe={len(keyframes)}"
+            )
+        if log_callback and pending_keys:
+            log_callback(f"[source-scan] GPU keyframe decoder left {len(pending_keys)} pending keyframes")
         if log_callback:
             log_callback(f"[source-scan] detector hits: {len(hits)} GPU keyframes")
         return hits, _keyframe_scan_meta(video_path, src_meta, out_w, out_h), debug_records
     finally:
-        dec.stop()
         try:
             import torch
 
@@ -1079,6 +1136,58 @@ def _scan_hits_keyframes(video_path: str | Path, log_callback=None,
         )
 
 
+def _scene_signature_from_luma(y_plane, bit_depth: int):
+    """Downscaled luma histogram of one (cropped/fisheye) frame for shot-cut detection."""
+    import cupy as cp
+
+    from utils import scene_detect
+
+    h = int(y_plane.shape[0])
+    w = int(y_plane.shape[1])
+    sh = max(1, h // 64)
+    sw = max(1, w // 64)
+    arr = cp.asnumpy(y_plane[::sh, ::sw])
+    if int(bit_depth or 8) > 8:
+        # P016/P010 store the high-bit-depth sample in the top of a 16-bit
+        # container (full 0..65535 range, matching nv12_to_bgr's 255/65535
+        # scaling), so the 8-bit downconversion is >> 8 -- not >> (depth-8),
+        # which would overflow uint8 and produce a garbage histogram.
+        arr = (arr >> 8).astype("uint8")
+    else:
+        arr = arr.astype("uint8")
+    return scene_detect.compute_histogram(arr)
+
+
+def _decoded_frame_to_gpu_frame(decoded, width: int, height: int, bit_depth: int):
+    from gpu_engine.pynv_io import GpuNv12Frame, GpuP016Frame
+
+    if int(bit_depth or 8) > 8:
+        return GpuP016Frame.from_decoded_frame(decoded, int(width), int(height))
+    return GpuNv12Frame.from_decoded_frame(decoded, int(width), int(height))
+
+
+def _trim_gpu_memory() -> None:
+    """Return cached CuPy-pool and PyTorch-allocator blocks to the driver.
+
+    The per-frame CuPy->Torch dlpack handoff in the GPU scan can strand freed
+    blocks in one allocator while the other keeps allocating fresh ones; on long
+    8K scans this grows VRAM without bound and thrashes. Periodically trimming
+    both pools caps the high-water mark.
+    """
+    try:
+        import cupy as cp
+
+        cp.get_default_memory_pool().free_all_blocks()
+    except Exception:
+        pass
+    try:
+        import torch
+
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def _cupy_to_torch_bgr(y_plane, uv_plane, bit_depth: int = 8):
     import cupy as cp
     import torch
@@ -1090,6 +1199,345 @@ def _cupy_to_torch_bgr(y_plane, uv_plane, bit_depth: int = 8):
         return torch.utils.dlpack.from_dlpack(bgr)
     except TypeError:
         return torch.utils.dlpack.from_dlpack(bgr.toDlpack())
+
+
+def _resize_lut(in_w: int, in_h: int, out_w: int, out_h: int):
+    import cupy as cp
+
+    key = (int(in_w), int(in_h), int(out_w), int(out_h))
+    cached = _RESIZE_LUT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if int(in_w) == int(out_w) and int(in_h) == int(out_h):
+        lut = None
+    else:
+        xs = cp.arange(int(out_w), dtype=cp.float32)
+        ys = cp.arange(int(out_h), dtype=cp.float32)
+        xx, yy = cp.meshgrid(xs, ys)
+        src_x = (xx + 0.5) * (float(in_w) / float(out_w)) - 0.5
+        src_y = (yy + 0.5) * (float(in_h) / float(out_h)) - 0.5
+        lut = cp.stack([src_x, src_y], axis=-1).astype(cp.float32)
+    _RESIZE_LUT_CACHE[key] = lut
+    return lut
+
+
+def _detector_work_size(frame_w: int, frame_h: int) -> tuple[int, int]:
+    imgsz = _resolve_detector_imgsz(frame_w, frame_h)
+    if int(frame_w) <= 0 or int(frame_h) <= 0:
+        return max(2, int(frame_w)), max(2, int(frame_h))
+    scale = min(float(imgsz) / float(frame_w), float(imgsz) / float(frame_h))
+    if scale >= 1.0:
+        return max(2, int(frame_w)), max(2, int(frame_h))
+    out_w = max(2, int(round(float(frame_w) * scale)))
+    out_h = max(2, int(round(float(frame_h) * scale)))
+    out_w = max(2, out_w - (out_w % 2))
+    out_h = max(2, out_h - (out_h % 2))
+    return out_w, out_h
+
+
+def _resize_nv12_planes(y_plane, uv_plane, out_w: int, out_h: int):
+    from gpu_engine import nv12_kernels
+
+    in_h, in_w = y_plane.shape
+    out_w = max(2, int(out_w))
+    out_h = max(2, int(out_h))
+    if (in_w, in_h) == (out_w, out_h):
+        return y_plane, uv_plane
+    y_lut = _resize_lut(in_w, in_h, out_w, out_h)
+    uv_lut = _resize_lut(in_w // 2, in_h // 2, out_w // 2, out_h // 2)
+    if y_lut is None or uv_lut is None:
+        return y_plane, uv_plane
+    return (
+        nv12_kernels.remap_y(y_plane, y_lut, out_w, out_h),
+        nv12_kernels.remap_uv(uv_plane, uv_lut, out_w // 2, out_h // 2),
+    )
+
+
+def _scale_box_xyxy(box: tuple[float, float, float, float], scale_x: float, scale_y: float) -> tuple[float, float, float, float]:
+    x1, y1, x2, y2 = box
+    return (
+        float(x1) * float(scale_x),
+        float(y1) * float(scale_y),
+        float(x2) * float(scale_x),
+        float(y2) * float(scale_y),
+    )
+
+
+def _scale_debug_record(record: dict, scale_x: float, scale_y: float) -> dict:
+    out = dict(record)
+    for key in ("raw_box_xyxy", "mask_box_xyxy", "used_box_xyxy"):
+        box = out.get(key)
+        if box:
+            out[key] = _box_to_list(_scale_box_xyxy(tuple(box[:4]), scale_x, scale_y))
+    return out
+
+
+def _scale_boxes_and_debug(boxes, debug, scale_x: float, scale_y: float):
+    if scale_x == 1.0 and scale_y == 1.0:
+        return boxes, debug
+    scaled_boxes = [
+        (
+            float(x1) * float(scale_x),
+            float(y1) * float(scale_y),
+            float(x2) * float(scale_x),
+            float(y2) * float(scale_y),
+            float(conf),
+        )
+        for x1, y1, x2, y2, conf in boxes
+    ]
+    scaled_debug = [_scale_debug_record(record, scale_x, scale_y) for record in debug]
+    return scaled_boxes, scaled_debug
+
+
+def _split_sbs_boxes_to_eye(
+    boxes: list[tuple[float, float, float, float, float]],
+    frame_w: int,
+    frame_h: int,
+    crop_modes: tuple[str, ...] = ("left", "right"),
+) -> dict[str, list[tuple[float, float, float, float, float]]]:
+    """Split full-SBS detector boxes into per-eye local coordinates."""
+    eye_w = max(1, int(frame_w) // 2)
+    eye_h = max(1, int(frame_h))
+    full_w = eye_w * 2
+    out: dict[str, list[tuple[float, float, float, float, float]]] = {
+        mode: [] for mode in crop_modes if mode in {"left", "right"}
+    }
+    for box in boxes:
+        x1, y1, x2, y2, conf = [float(v) for v in box[:5]]
+        y1 = max(0.0, min(float(eye_h), y1))
+        y2 = max(0.0, min(float(eye_h), y2))
+        if y2 - y1 <= 1.0:
+            continue
+        if "left" in out:
+            lx1 = max(0.0, min(float(eye_w), x1))
+            lx2 = max(0.0, min(float(eye_w), x2))
+            if lx2 - lx1 > 1.0:
+                out["left"].append((lx1, y1, lx2, y2, conf))
+        if "right" in out:
+            rx1 = max(float(eye_w), min(float(full_w), x1)) - float(eye_w)
+            rx2 = max(float(eye_w), min(float(full_w), x2)) - float(eye_w)
+            if rx2 - rx1 > 1.0:
+                out["right"].append((rx1, y1, rx2, y2, conf))
+    return out
+
+
+def _split_sbs_detections_to_eye(
+    detections: list[dict],
+    frame_w: int,
+    frame_h: int,
+    crop_modes: tuple[str, ...],
+) -> dict[str, list[dict]]:
+    out: dict[str, list[dict]] = {mode: [] for mode in crop_modes if mode in {"left", "right"}}
+    for record in detections:
+        if not bool(record.get("accepted")):
+            continue
+        used_box = record.get("used_box_xyxy")
+        if not used_box:
+            continue
+        conf = float(record.get("conf", 0.0))
+        split = _split_sbs_boxes_to_eye(
+            [(
+                float(used_box[0]),
+                float(used_box[1]),
+                float(used_box[2]),
+                float(used_box[3]),
+                conf,
+            )],
+            frame_w,
+            frame_h,
+            crop_modes,
+        )
+        for mode, boxes in split.items():
+            for box in boxes:
+                item = dict(record)
+                item["eye"] = mode
+                item["sbs_used_box_xyxy"] = record.get("used_box_xyxy")
+                item["used_box_xyxy"] = _box_to_list(box[:4])
+                out.setdefault(mode, []).append(item)
+    return out
+
+
+def _scan_hits_gpu_transform_pair(video_path: str | Path, *, crop_modes: tuple[str, ...],
+                                  to_fisheye: bool = False,
+                                  log_callback=None, cancel_token=None,
+                                  min_conf: float | None = None) -> tuple[dict[str, list[dict]], probe.VideoMetadata, dict[str, list[dict]], dict[str, list[float]]]:
+    import torch
+    from gpu_engine.fallback import OperationCancelled
+    from gpu_engine.pynv_io import PyNvThreadedSerialDecoder
+
+    if to_fisheye:
+        raise ValueError("paired GPU transform scan is non-fisheye only; scan fisheye eyes separately")
+    crop_modes = tuple(mode for mode in crop_modes if mode in {"left", "right"})
+    if not crop_modes:
+        raise ValueError("no SBS eye crop modes requested")
+
+    src_meta = probe.probe_video(video_path)
+    bd = 10 if src_meta.bit_depth > 8 else 8
+    fps = src_meta.source_fps or 30.0
+    dec_buffer = max(2, int(_cfg("pre_extract_decoder_buffer", 8) or 8))
+    dec = PyNvThreadedSerialDecoder(Path(video_path), bit_depth=bd, buffer_size=dec_buffer)
+    try:
+        info = dec.info
+        eye_w = max(2, int(info.width) // 2)
+        eye_h = max(2, int(info.height))
+        scan_w = eye_w * 2
+        detector_w, detector_h = _detector_work_size(scan_w, eye_h)
+        detector_scale_x = float(scan_w) / float(detector_w)
+        detector_scale_y = float(eye_h) / float(detector_h)
+
+        total_frames = len(dec)
+        stride_s = max(0.05, float(_cfg("pre_extract_sample_stride_s", 0.5) or 0.5))
+        stride_frames = max(1, int(round(stride_s * fps)))
+        batch_size = max(1, int(_cfg("pre_extract_yolo_batch", 1) or 1))
+        detector = _get_detector(log_callback, frame_w=scan_w, frame_h=eye_h)
+
+        hits_by_mode: dict[str, list[dict]] = {mode: [] for mode in crop_modes}
+        debug_by_mode: dict[str, list[dict]] = {mode: [] for mode in crop_modes}
+        cuts_by_mode: dict[str, list[float]] = {mode: [] for mode in crop_modes}
+        scene_det_by_mode = {}
+        scene_det_error: str | None = None
+        if bool(_cfg("pre_extract_scene_detect_enabled", True)):
+            from utils import scene_detect
+
+            for crop_mode in crop_modes:
+                scene_det_by_mode[crop_mode] = scene_detect.SceneCutDetector(
+                    min_scene_len_s=float(_cfg("pre_extract_scene_min_len_s", 1.5) or 1.5),
+                    floor=float(_cfg("pre_extract_scene_floor", 0.30) or 0.30),
+                    k=float(_cfg("pre_extract_scene_k", 3.0) or 3.0),
+                )
+
+        out_meta = probe.VideoMetadata(
+            path=str(video_path),
+            codec_name=src_meta.codec_name,
+            profile=src_meta.profile,
+            pix_fmt=src_meta.pix_fmt,
+            width=int(eye_w),
+            height=int(eye_h),
+            bit_depth=src_meta.bit_depth,
+            duration=src_meta.duration,
+            nb_frames=src_meta.nb_frames,
+            source_fps=fps,
+            is_cfr=src_meta.is_cfr,
+            bitrate_bps=src_meta.bitrate_bps,
+            color=src_meta.color,
+            audio_codec="",
+        )
+
+        batch_frames = []
+        batch_meta = []
+        sampled = 0
+        t0 = time.perf_counter()
+        last_log = 0.0
+        trim_samples = int(_cfg("pre_extract_vram_trim_samples", 32) or 0)
+        last_trim = 0
+
+        def _flush_batch():
+            nonlocal batch_frames, batch_meta
+            if not batch_frames:
+                return
+            results = _run_detector_batch(detector, batch_frames, log_callback=log_callback, boxes_only=True)
+            for meta_item, result in zip(batch_meta, results):
+                frame_idx = meta_item["frame_idx"]
+                ts = meta_item["ts"]
+                boxes, detections = _extract_boxes_with_debug(result, min_conf=min_conf)
+                boxes, detections = _scale_boxes_and_debug(
+                    boxes,
+                    detections,
+                    meta_item["scale_x"],
+                    meta_item["scale_y"],
+                )
+                boxes_by_mode = _split_sbs_boxes_to_eye(boxes, scan_w, eye_h, crop_modes)
+                debug_split = _split_sbs_detections_to_eye(detections, scan_w, eye_h, crop_modes) if detections else {}
+                for crop_mode in crop_modes:
+                    eye_boxes = boxes_by_mode.get(crop_mode, [])
+                    eye_debug = debug_split.get(crop_mode, [])
+                    if eye_debug:
+                        debug_by_mode[crop_mode].append({
+                            "frame_idx": int(frame_idx),
+                            "t": round(float(ts), 6),
+                            "frame_size": [int(eye_w), int(eye_h)],
+                            "sbs_frame_size": [int(scan_w), int(eye_h)],
+                            "detector_frame_size": [int(meta_item["detector_w"]), int(meta_item["detector_h"])],
+                            "detections": eye_debug,
+                            "accepted_boxes_xyxy": [_box_to_list(b[:4]) for b in eye_boxes],
+                        })
+                    if eye_boxes:
+                        hits_by_mode[crop_mode].append({"t": ts, "boxes": eye_boxes})
+            batch_frames = []
+            batch_meta = []
+
+        if log_callback:
+            modes_text = ",".join(crop_modes)
+            log_callback(
+                f"[pre-extract] GPU SBS pair scan: eyes={modes_text}, input={scan_w}x{eye_h}, "
+                f"detector_input={detector_w}x{detector_h}, "
+                f"frames={total_frames}, stride={stride_s:.2f}s, conf_filter={min_conf if min_conf is not None else 'model'}"
+            )
+
+        for frame_idx in range(0, total_frames, stride_frames):
+            if cancel_token is not None and getattr(cancel_token, "cancelled", False):
+                raise OperationCancelled("cancelled by user")
+            frame = dec.frame_at(frame_idx)
+            y_plane, uv_plane = frame.y_uv_cupy()
+            scan_y = y_plane[:eye_h, :scan_w]
+            scan_uv = uv_plane[:eye_h // 2, :scan_w // 2, :]
+            for crop_mode in crop_modes:
+                if crop_mode in scene_det_by_mode:
+                    try:
+                        x = 0 if crop_mode == "left" else eye_w
+                        cropped_y = scan_y[:, x:x + eye_w]
+                        sig = _scene_signature_from_luma(cropped_y, bd)
+                        if scene_det_by_mode[crop_mode].update(float(frame_idx) / fps, sig):
+                            tcut = float(frame_idx) / fps
+                            cuts_by_mode[crop_mode].append(tcut)
+                            if log_callback:
+                                log_callback(f"[pre-extract] scene cut detected at {tcut:.1f}s ({crop_mode})")
+                    except Exception as exc:
+                        if scene_det_error is None:
+                            scene_det_error = f"{type(exc).__name__}: {exc}"
+                            if log_callback:
+                                log_callback(f"[pre-extract] scene detect disabled after error: {scene_det_error}")
+                            scene_det_by_mode = {}
+            detector_y, detector_uv = _resize_nv12_planes(scan_y, scan_uv, detector_w, detector_h)
+            batch_frames.append(_cupy_to_torch_bgr(detector_y, detector_uv, bit_depth=bd))
+            batch_meta.append({
+                "frame_idx": frame_idx,
+                "ts": float(frame_idx) / fps,
+                "scale_x": detector_scale_x,
+                "scale_y": detector_scale_y,
+                "detector_w": detector_w,
+                "detector_h": detector_h,
+            })
+            sampled += 1
+            if len(batch_frames) >= batch_size:
+                _flush_batch()
+                if trim_samples and sampled - last_trim >= trim_samples:
+                    last_trim = sampled
+                    _trim_gpu_memory()
+            now = time.perf_counter()
+            if log_callback and now - last_log >= 5.0:
+                last_log = now
+                pct = 100.0 * min(frame_idx + 1, total_frames) / max(1, total_frames)
+                elapsed = max(0.001, now - t0)
+                log_callback(
+                    f"[pre-extract] scanned {sampled} GPU samples ({pct:.1f}%) at {sampled / elapsed:.1f} samples/s"
+                )
+        _flush_batch()
+        if log_callback:
+            total_hits = sum(len(v) for v in hits_by_mode.values())
+            log_callback(f"[pre-extract] detector hits: {total_hits} SBS-split sampled frames")
+            if any(cuts_by_mode.values()):
+                log_callback(
+                    "[pre-extract] scene cuts detected: "
+                    + ", ".join(f"{mode}={len(cuts_by_mode[mode])}" for mode in crop_modes)
+                )
+        return hits_by_mode, out_meta, debug_by_mode, cuts_by_mode
+    finally:
+        dec.stop()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 
 def _scan_hits_gpu_transform(video_path: str | Path, *, crop_mode: str,
@@ -1104,7 +1552,11 @@ def _scan_hits_gpu_transform(video_path: str | Path, *, crop_mode: str,
     src_meta = probe.probe_video(video_path)
     bd = 10 if src_meta.bit_depth > 8 else 8
     fps = src_meta.source_fps or 30.0
-    dec = PyNvThreadedSerialDecoder(Path(video_path), bit_depth=bd)
+    # Detection only samples sparsely (~stride_s), so a deep decode buffer is
+    # pure VRAM cost. At 8K each buffered surface is ~100MB; the default 32 is
+    # what makes the fine scan open at ~15GB. 8 keeps the pipeline fed cheaply.
+    dec_buffer = max(2, int(_cfg("pre_extract_decoder_buffer", 8) or 8))
+    dec = PyNvThreadedSerialDecoder(Path(video_path), bit_depth=bd, buffer_size=dec_buffer)
     try:
         info = dec.info
         if crop_mode == "left":
@@ -1119,17 +1571,37 @@ def _scan_hits_gpu_transform(video_path: str | Path, *, crop_mode: str,
         total_frames = len(dec)
         stride_s = max(0.05, float(_cfg("pre_extract_sample_stride_s", 0.5) or 0.5))
         stride_frames = max(1, int(round(stride_s * fps)))
-        batch_size = max(1, int(_cfg("pre_extract_yolo_batch", 8) or 8))
+        batch_size = max(1, int(_cfg("pre_extract_yolo_batch", 1) or 1))
         detector = _get_detector(log_callback, frame_w=out_w, frame_h=out_h)
+        detector_w, detector_h = _detector_work_size(out_w, out_h)
+        detector_scale_x = float(out_w) / float(detector_w)
+        detector_scale_y = float(out_h) / float(detector_h)
 
         hits: list[dict] = []
         debug_records: list[dict] = []
         batch_frames = []
         batch_times = []
         batch_indices = []
+        batch_scales = []
+        batch_detector_sizes = []
         sampled = 0
         t0 = time.perf_counter()
         last_log = 0.0
+        trim_samples = int(_cfg("pre_extract_vram_trim_samples", 32) or 0)
+        last_trim = 0
+
+        # Per-eye shot-cut detection on the same sampled frames (luma histogram).
+        scene_cuts: list[float] = []
+        scene_det = None
+        scene_det_error: str | None = None
+        if bool(_cfg("pre_extract_scene_detect_enabled", True)):
+            from utils import scene_detect
+
+            scene_det = scene_detect.SceneCutDetector(
+                min_scene_len_s=float(_cfg("pre_extract_scene_min_len_s", 1.5) or 1.5),
+                floor=float(_cfg("pre_extract_scene_floor", 0.30) or 0.30),
+                k=float(_cfg("pre_extract_scene_k", 3.0) or 3.0),
+            )
 
         out_meta = probe.VideoMetadata(
             path=str(video_path),
@@ -1149,17 +1621,30 @@ def _scan_hits_gpu_transform(video_path: str | Path, *, crop_mode: str,
         )
 
         def _flush_batch():
-            nonlocal batch_frames, batch_times, batch_indices
+            nonlocal batch_frames, batch_times, batch_indices, batch_scales, batch_detector_sizes
             if not batch_frames:
                 return
-            results = _run_detector_batch(detector, batch_frames, log_callback=log_callback)
-            for frame_idx, ts, result in zip(batch_indices, batch_times, results):
+            results = _run_detector_batch(detector, batch_frames, log_callback=log_callback, boxes_only=True)
+            for frame_idx, ts, result, scale_item, detector_size in zip(
+                batch_indices,
+                batch_times,
+                results,
+                batch_scales,
+                batch_detector_sizes,
+            ):
                 boxes, detections = _extract_boxes_with_debug(result, min_conf=min_conf)
+                boxes, detections = _scale_boxes_and_debug(
+                    boxes,
+                    detections,
+                    scale_item[0],
+                    scale_item[1],
+                )
                 if detections:
                     debug_records.append({
                         "frame_idx": int(frame_idx),
                         "t": round(float(ts), 6),
                         "frame_size": [int(out_w), int(out_h)],
+                        "detector_frame_size": [int(detector_size[0]), int(detector_size[1])],
                         "detections": detections,
                         "accepted_boxes_xyxy": [_box_to_list(b[:4]) for b in boxes],
                     })
@@ -1168,11 +1653,14 @@ def _scan_hits_gpu_transform(video_path: str | Path, *, crop_mode: str,
             batch_frames = []
             batch_times = []
             batch_indices = []
+            batch_scales = []
+            batch_detector_sizes = []
 
         if log_callback:
             suffix = " + fisheye" if to_fisheye else ""
             log_callback(
                 f"[pre-extract] GPU scan transform: crop={crop_mode}{suffix}, "
+                f"detector_input={detector_w}x{detector_h}, "
                 f"frames={total_frames}, stride={stride_s:.2f}s, conf_filter={min_conf if min_conf is not None else 'model'}"
             )
 
@@ -1186,12 +1674,32 @@ def _scan_hits_gpu_transform(video_path: str | Path, *, crop_mode: str,
             if to_fisheye:
                 y_plane = nv12_kernels.remap_y(y_plane, lut_y, out_w, out_h)
                 uv_plane = nv12_kernels.remap_uv(uv_plane, lut_c, out_w // 2, out_h // 2)
-            batch_frames.append(_cupy_to_torch_bgr(y_plane, uv_plane, bit_depth=bd))
+            if scene_det is not None:
+                try:
+                    sig = _scene_signature_from_luma(y_plane, bd)
+                    if scene_det.update(float(frame_idx) / fps, sig):
+                        tcut = float(frame_idx) / fps
+                        scene_cuts.append(tcut)
+                        if log_callback:
+                            log_callback(f"[pre-extract] scene cut detected at {tcut:.1f}s")
+                except Exception as exc:
+                    if scene_det_error is None:
+                        scene_det_error = f"{type(exc).__name__}: {exc}"
+                        if log_callback:
+                            log_callback(f"[pre-extract] scene detect disabled after error: {scene_det_error}")
+                        scene_det = None
+            detector_y, detector_uv = _resize_nv12_planes(y_plane, uv_plane, detector_w, detector_h)
+            batch_frames.append(_cupy_to_torch_bgr(detector_y, detector_uv, bit_depth=bd))
             batch_times.append(float(frame_idx) / fps)
             batch_indices.append(frame_idx)
+            batch_scales.append((detector_scale_x, detector_scale_y))
+            batch_detector_sizes.append((detector_w, detector_h))
             sampled += 1
             if len(batch_frames) >= batch_size:
                 _flush_batch()
+                if trim_samples and sampled - last_trim >= trim_samples:
+                    last_trim = sampled
+                    _trim_gpu_memory()
             now = time.perf_counter()
             if log_callback and now - last_log >= 5.0:
                 last_log = now
@@ -1201,7 +1709,9 @@ def _scan_hits_gpu_transform(video_path: str | Path, *, crop_mode: str,
         _flush_batch()
         if log_callback:
             log_callback(f"[pre-extract] detector hits: {len(hits)} transformed sampled frames")
-        return hits, out_meta, debug_records
+            if scene_det is not None:
+                log_callback(f"[pre-extract] scene cuts detected: {len(scene_cuts)}")
+        return hits, out_meta, debug_records, scene_cuts
     finally:
         dec.stop()
         try:
@@ -1220,12 +1730,107 @@ def _merge_hit_groups(groups: list[dict], min_gap_s: float) -> list[dict]:
             prev["end"] = max(prev["end"], group["end"])
             prev["last_hit"] = max(prev["last_hit"], group["last_hit"])
             prev["boxes"].extend(group["boxes"])
+            prev["samples"].extend(group["samples"])
         else:
             merged.append(group)
     return merged
 
 
-def _aggregate_hits(hits: list[dict], meta: probe.VideoMetadata) -> list[MosaicSegment]:
+def _union4(boxes) -> tuple[float, float, float, float] | None:
+    """Axis-aligned union (x1, y1, x2, y2) of a box list, or None if empty."""
+    if not boxes:
+        return None
+    return (
+        min(b[0] for b in boxes),
+        min(b[1] for b in boxes),
+        max(b[2] for b in boxes),
+        max(b[3] for b in boxes),
+    )
+
+
+def _segment_area_ratio(union: tuple[float, float, float, float] | None,
+                        frame_w: int, frame_h: int) -> float:
+    """Area ratio of the *expanded* crop rect that this union would produce.
+
+    Uses ``_expanded_rect`` so the cap is compared against the same rect the
+    bypass-crop check sees downstream.
+    """
+    if union is None:
+        return 0.0
+    x1, y1, x2, y2 = union
+    _x, _y, w, h, _conf = _expanded_rect([(x1, y1, x2, y2, 1.0)], frame_w, frame_h)
+    fa = max(1, int(frame_w) * int(frame_h))
+    return float(max(0, w) * max(0, h)) / float(fa)
+
+
+def _split_samples_by_area(samples: list[tuple[float, list]], frame_w: int, frame_h: int,
+                           *, max_area_ratio: float, cut_gap_s: float,
+                           min_dur_s: float,
+                           scene_cuts: list[float] | None = None) -> list[list[tuple[float, list]]]:
+    """Split a time-ordered sample run into sub-windows.
+
+    Two complementary triggers:
+
+    * **Scene cut** (whole-frame, from the histogram detector): a hard boundary
+      at the cut time regardless of mosaic state -- handles videos made of
+      distinct shots. Empty on single-shot footage.
+    * **Crop area** (mosaic drift within a shot): a new sub-window starts only
+      at a mosaic-free gap (>= ``cut_gap_s``), so cuts never land inside
+      continuous mosaic (which would break the temporal restoration). A cut
+      happens when the running crop rect would grow past ``max_area_ratio`` and
+      the segment so far is at least ``min_dur_s`` long. With no gap to cut at,
+      the window is forced to keep growing (rare; bounded in practice).
+    """
+    if len(samples) <= 1:
+        return [samples]
+    cuts = sorted(float(c) for c in (scene_cuts or []))
+    sc_idx = 0
+    area_enabled = max_area_ratio > 0.0
+
+    out: list[list[tuple[float, list]]] = []
+    seg_start = 0
+    last_gap = None  # index i such that a cuttable gap precedes samples[i]
+    union: tuple[float, float, float, float] | None = None
+
+    for i, (t, boxes) in enumerate(samples):
+        # Forced scene-cut boundary between samples[i-1] and samples[i].
+        if cuts and i > seg_start:
+            prev_t = samples[i - 1][0]
+            while sc_idx < len(cuts) and cuts[sc_idx] <= prev_t:
+                sc_idx += 1
+            if sc_idx < len(cuts) and prev_t < cuts[sc_idx] <= t:
+                out.append(samples[seg_start:i])
+                seg_start = i
+                union = _union4(boxes)
+                last_gap = None
+                continue
+
+        if i > seg_start and last_gap != i and (t - samples[i - 1][0]) > cut_gap_s:
+            last_gap = i
+        tentative = union
+        bu = _union4(boxes)
+        if bu is not None:
+            tentative = bu if tentative is None else (
+                min(tentative[0], bu[0]), min(tentative[1], bu[1]),
+                max(tentative[2], bu[2]), max(tentative[3], bu[3]),
+            )
+        if area_enabled and union is not None \
+                and _segment_area_ratio(tentative, frame_w, frame_h) > max_area_ratio \
+                and last_gap is not None and last_gap > seg_start \
+                and (samples[last_gap - 1][0] - samples[seg_start][0]) >= min_dur_s:
+            out.append(samples[seg_start:last_gap])
+            seg_start = last_gap
+            union = _union4([b for _, bs in samples[seg_start:i + 1] for b in bs])
+            last_gap = None
+        else:
+            union = tentative
+
+    out.append(samples[seg_start:])
+    return [s for s in out if s]
+
+
+def _aggregate_hits(hits: list[dict], meta: probe.VideoMetadata,
+                    scene_cuts: list[float] | None = None) -> list[MosaicSegment]:
     if not hits:
         return []
     duration = meta.duration or (meta.nb_frames / meta.source_fps if meta.nb_frames and meta.source_fps else 0.0)
@@ -1233,6 +1838,10 @@ def _aggregate_hits(hits: list[dict], meta: probe.VideoMetadata) -> list[MosaicS
     min_gap_s = float(_cfg("pre_extract_min_gap_s", 2.0) or 2.0)
     pad_s = float(_cfg("pre_extract_head_tail_pad_s", 2.0) or 2.0)
     min_segment_s = float(_cfg("pre_extract_min_segment_s", 1.5) or 1.5)
+
+    max_area_ratio = float(_cfg("pre_extract_segment_max_area_ratio", 0.33) or 0.0)
+    cut_gap_s = float(_cfg("pre_extract_segment_cut_gap_s", 0.75) or 0.75)
+    seg_min_dur_s = float(_cfg("pre_extract_segment_min_dur_s", 10.0) or 0.0)
 
     hits = sorted(hits, key=lambda h: float(h["t"]))
     groups: list[dict] = []
@@ -1242,11 +1851,13 @@ def _aggregate_hits(hits: list[dict], meta: probe.VideoMetadata) -> list[MosaicS
         if current is None or t - current["last_hit"] > merge_gap_s:
             if current is not None:
                 groups.append(current)
-            current = {"start": t, "end": t, "last_hit": t, "boxes": list(hit["boxes"])}
+            current = {"start": t, "end": t, "last_hit": t,
+                       "boxes": list(hit["boxes"]), "samples": [(t, list(hit["boxes"]))]}
         else:
             current["end"] = t
             current["last_hit"] = t
             current["boxes"].extend(hit["boxes"])
+            current["samples"].append((t, list(hit["boxes"])))
     if current is not None:
         groups.append(current)
 
@@ -1262,20 +1873,39 @@ def _aggregate_hits(hits: list[dict], meta: probe.VideoMetadata) -> list[MosaicS
     for group in groups:
         if group["end"] - group["start"] < min_segment_s:
             continue
-        boxes = _filter_spatial_outliers(group["boxes"], meta.width, meta.height)
-        for cluster_boxes in _spatial_cluster(boxes, meta.width, meta.height):
-            x, y, w, h, conf = _expanded_rect(cluster_boxes, meta.width, meta.height)
-            if w <= 0 or h <= 0:
+        windows = _split_samples_by_area(
+            group["samples"], meta.width, meta.height,
+            max_area_ratio=max_area_ratio, cut_gap_s=cut_gap_s, min_dur_s=seg_min_dur_s,
+            scene_cuts=scene_cuts,
+        )
+        for w_idx, window in enumerate(windows):
+            # Outer ends use the padded group bounds; interior cuts sit at the
+            # midpoint of the mosaic-free gap so adjacent windows never overlap.
+            if w_idx == 0:
+                seg_start = float(group["start"])
+            else:
+                seg_start = 0.5 * (windows[w_idx - 1][-1][0] + window[0][0])
+            if w_idx == len(windows) - 1:
+                seg_end = float(group["end"])
+            else:
+                seg_end = 0.5 * (window[-1][0] + windows[w_idx + 1][0][0])
+            if seg_end - seg_start < min_segment_s:
                 continue
-            segments.append(MosaicSegment(
-                seg_id=len(segments),
-                start_s=float(group["start"]),
-                end_s=float(group["end"]),
-                start_s_kf=float(group["start"]),
-                end_s_kf=float(group["end"]),
-                x=x, y=y, w=w, h=h,
-                conf_max=conf,
-            ))
+            window_boxes = [b for _, bs in window for b in bs]
+            boxes = _filter_spatial_outliers(window_boxes, meta.width, meta.height)
+            for cluster_boxes in _spatial_cluster(boxes, meta.width, meta.height):
+                x, y, w, h, conf = _expanded_rect(cluster_boxes, meta.width, meta.height)
+                if w <= 0 or h <= 0:
+                    continue
+                segments.append(MosaicSegment(
+                    seg_id=len(segments),
+                    start_s=seg_start,
+                    end_s=seg_end,
+                    start_s_kf=seg_start,
+                    end_s_kf=seg_end,
+                    x=x, y=y, w=w, h=h,
+                    conf_max=conf,
+                ))
     return _merge_overlapping_segments(segments)
 
 
@@ -1292,7 +1922,8 @@ def save_detection_debug_jsonl(records: list[dict], path: str | Path, source: st
             "source": str(source) if source else "",
             "note": (
                 "raw_box_xyxy is direct YOLO output; mask_box_xyxy is the box recomputed from "
-                "the segmentation mask; accepted_boxes_xyxy are the boxes used by pre-extract."
+                "the segmentation mask when mask postprocess is enabled; accepted_boxes_xyxy are "
+                "the boxes used by pre-extract."
             ),
         }
         f.write(json.dumps(header, ensure_ascii=False) + "\n")
@@ -1340,7 +1971,7 @@ def scan_segments_gpu_transform(video_path: str | Path, *, crop_mode: str,
     )
     if _load_empty_scan_cache(cache_path, log_callback=log_callback):
         return []
-    hits, meta, debug_records = _scan_hits_gpu_transform(
+    hits, meta, debug_records, scene_cuts = _scan_hits_gpu_transform(
         video_path,
         crop_mode=crop_mode,
         to_fisheye=to_fisheye,
@@ -1355,7 +1986,7 @@ def scan_segments_gpu_transform(video_path: str | Path, *, crop_mode: str,
         save_detection_debug_jsonl(debug_records, debug_path, source=video_path)
         if log_callback:
             log_callback(f"[pre-extract] saved detection debug: {debug_path}")
-    segments = _aggregate_hits(hits, meta)
+    segments = _aggregate_hits(hits, meta, scene_cuts=scene_cuts)
     if log_callback:
         covered = sum(s.duration_s for s in segments)
         dur = meta.duration or 0.0
@@ -1364,6 +1995,92 @@ def scan_segments_gpu_transform(video_path: str | Path, *, crop_mode: str,
     if not segments:
         _write_empty_scan_cache(cache_path, log_callback=log_callback)
     return segments
+
+
+def scan_segments_gpu_transform_pair(video_path: str | Path, *,
+                                     to_fisheye: bool = False,
+                                     log_callback=None, cancel_token=None,
+                                     min_conf: float | None = None) -> tuple[list[MosaicSegment], list[MosaicSegment]]:
+    if to_fisheye:
+        if log_callback:
+            log_callback("[pre-extract] fisheye fine scan uses separate per-eye GPU transforms")
+        return (
+            scan_segments_gpu_transform(
+                video_path,
+                crop_mode="left",
+                to_fisheye=True,
+                log_callback=log_callback,
+                cancel_token=cancel_token,
+                min_conf=min_conf,
+            ),
+            scan_segments_gpu_transform(
+                video_path,
+                crop_mode="right",
+                to_fisheye=True,
+                log_callback=log_callback,
+                cancel_token=cancel_token,
+                min_conf=min_conf,
+            ),
+        )
+
+    modes = ("left", "right")
+    cache_paths = {
+        mode: _empty_scan_cache_path(
+            video_path,
+            mode="gpu_transform_pair_sbs",
+            min_conf=min_conf,
+            crop_mode=mode,
+            to_fisheye=to_fisheye,
+        )
+        for mode in modes
+    }
+    segments_by_mode: dict[str, list[MosaicSegment] | None] = {}
+    scan_modes = []
+    for mode in modes:
+        if _load_empty_scan_cache(cache_paths[mode], log_callback=log_callback):
+            segments_by_mode[mode] = []
+        else:
+            segments_by_mode[mode] = None
+            scan_modes.append(mode)
+
+    if scan_modes:
+        hits_by_mode, meta, debug_by_mode, cuts_by_mode = _scan_hits_gpu_transform_pair(
+            video_path,
+            crop_modes=tuple(scan_modes),
+            to_fisheye=to_fisheye,
+            log_callback=log_callback,
+            cancel_token=cancel_token,
+            min_conf=min_conf,
+        )
+        for mode in scan_modes:
+            if bool(_cfg("pre_extract_save_detection_debug", True)):
+                p = Path(video_path)
+                suffix = f"{mode}{'_fisheye' if to_fisheye else ''}"
+                debug_path = p.with_name(f"{p.stem}.{suffix}.detections.jsonl")
+                save_detection_debug_jsonl(debug_by_mode.get(mode, []), debug_path, source=video_path)
+                if log_callback:
+                    log_callback(f"[pre-extract] saved detection debug: {debug_path}")
+            segments = _aggregate_hits(
+                hits_by_mode.get(mode, []),
+                meta,
+                scene_cuts=cuts_by_mode.get(mode, []),
+            )
+            if log_callback:
+                covered = sum(s.duration_s for s in segments)
+                dur = meta.duration or 0.0
+                pct = (100.0 * covered / dur) if dur > 0 else 0.0
+                log_callback(
+                    f"[pre-extract] aggregated {len(segments)} transformed {mode} segments, "
+                    f"{covered:.1f}s ({pct:.1f}% of video)"
+                )
+            if not segments:
+                _write_empty_scan_cache(cache_paths[mode], log_callback=log_callback)
+            segments_by_mode[mode] = segments
+
+    return (
+        list(segments_by_mode.get("left") or []),
+        list(segments_by_mode.get("right") or []),
+    )
 
 
 def _format_hms(seconds: float) -> str:

@@ -18,6 +18,7 @@ from typing import Any
 
 from tool_dlna import content_directory
 from tool_dlna.firewall import hidden_subprocess_kwargs
+from tool_dlna.media_library import safe_resolve_path
 from tool_si import logic as si_logic
 
 
@@ -350,7 +351,7 @@ class SIStreamService:
         return None
 
     def estimate_output_size(self, video: Path) -> int:
-        video = Path(video).resolve()
+        video = safe_resolve_path(Path(video))
         try:
             mtime = video.stat().st_mtime
         except OSError:
@@ -388,7 +389,7 @@ class SIStreamService:
         return ratio * duration
 
     def _session_key(self, video: Path, client_id: str | None = None) -> str:
-        base = str(Path(video).resolve())
+        base = str(safe_resolve_path(Path(video)))
         # The DLNA handler passes client IP as client_id, so clients sharing one IP also share a session.
         normalized_client = str(client_id or "").strip()
         return f"{base}\0{normalized_client}" if normalized_client else base
@@ -470,7 +471,7 @@ class SIStreamService:
         client_id: str | None = None,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
     ) -> tuple[Iterator[bytes], int, int, int]:
-        video = Path(video).resolve()
+        video = safe_resolve_path(Path(video))
         config = self.current_config()
         if not config.enabled:
             raise FileNotFoundError("SI streaming is disabled")

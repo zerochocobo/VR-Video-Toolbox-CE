@@ -52,6 +52,51 @@ class MosaicPrescanAggregationTests(unittest.TestCase):
     def test_large_boxes_are_not_rejected_by_area(self) -> None:
         self.assertIsNone(mosaic_prescan._box_limit_reason((0.0, 0.0, 4096.0, 4096.0), 4096, 4096))
 
+    def test_sbs_boxes_are_split_to_single_eye_coordinates(self) -> None:
+        split = mosaic_prescan._split_sbs_boxes_to_eye(
+            [
+                (1900.0, 100.0, 2200.0, 300.0, 0.90),
+                (2300.0, 50.0, 2600.0, 200.0, 0.80),
+                (100.0, 10.0, 300.0, 100.0, 0.70),
+            ],
+            frame_w=4096,
+            frame_h=2048,
+        )
+
+        self.assertEqual(
+            split["left"],
+            [
+                (1900.0, 100.0, 2048.0, 300.0, 0.90),
+                (100.0, 10.0, 300.0, 100.0, 0.70),
+            ],
+        )
+        self.assertEqual(
+            split["right"],
+            [
+                (0.0, 100.0, 152.0, 300.0, 0.90),
+                (252.0, 50.0, 552.0, 200.0, 0.80),
+            ],
+        )
+
+    def test_detector_work_size_keeps_configured_yolo_resolution_without_8k_bgr(self) -> None:
+        with patch.object(mosaic_prescan, "_cfg", side_effect=lambda key, default=None: 2048 if key == "pre_extract_yolo_imgsz" else default):
+            self.assertEqual(mosaic_prescan._detector_work_size(8192, 4096), (2048, 1024))
+            self.assertEqual(mosaic_prescan._detector_work_size(4096, 4096), (2048, 2048))
+
+    def test_detector_resized_boxes_scale_back_to_source_space(self) -> None:
+        boxes = [(475.0, 25.0, 550.0, 75.0, 0.90)]
+        debug = [{
+            "raw_box_xyxy": [475.0, 25.0, 550.0, 75.0],
+            "mask_box_xyxy": [475.0, 25.0, 550.0, 75.0],
+            "used_box_xyxy": [475.0, 25.0, 550.0, 75.0],
+            "accepted": True,
+        }]
+
+        scaled_boxes, scaled_debug = mosaic_prescan._scale_boxes_and_debug(boxes, debug, 4.0, 4.0)
+
+        self.assertEqual(scaled_boxes, [(1900.0, 100.0, 2200.0, 300.0, 0.90)])
+        self.assertEqual(scaled_debug[0]["used_box_xyxy"], [1900.0, 100.0, 2200.0, 300.0])
+
     def test_detector_batch_oom_fallback_splits_and_preserves_order(self) -> None:
         class Detector:
             def preprocess(self, frames):
@@ -67,6 +112,31 @@ class MosaicPrescanAggregationTests(unittest.TestCase):
 
         self.assertEqual(results, ["result-1", "result-2", "result-3", "result-4", "result-5"])
         self.assertTrue(any("detector batch OOM" in item for item in messages))
+
+    def test_detector_batch_box_only_uses_lightweight_postprocess(self) -> None:
+        class Detector:
+            def __init__(self):
+                self.full_called = False
+                self.box_called = False
+
+            def preprocess(self, frames):
+                return [f"pre-{frame}" for frame in frames]
+
+            def inference_and_postprocess_boxes(self, preprocessed, frames):
+                self.box_called = True
+                assert preprocessed == ["pre-a", "pre-b"]
+                return [f"box-{frame}" for frame in frames]
+
+            def inference_and_postprocess(self, _preprocessed, _frames):
+                self.full_called = True
+                return []
+
+        detector = Detector()
+        results = mosaic_prescan._run_detector_batch(detector, ["a", "b"], boxes_only=True)
+
+        self.assertEqual(results, ["box-a", "box-b"])
+        self.assertTrue(detector.box_called)
+        self.assertFalse(detector.full_called)
 
     def test_low_conf_far_boxes_do_not_expand_segment_rect_to_full_frame(self) -> None:
         hits = []
@@ -95,6 +165,30 @@ class MosaicPrescanAggregationTests(unittest.TestCase):
         self.assertGreaterEqual(segment.y, 3200)
         self.assertLess(segment.h, 1000)
         self.assertLess(segment.w, 1600)
+
+    def test_scene_cut_forces_segment_boundary(self) -> None:
+        # One continuous mosaic in a fixed spot; a scene cut mid-way must split
+        # the timeline in two even though the crop area never grows.
+        hits = [{"t": idx * 0.5, "boxes": [(500.0, 500.0, 900.0, 900.0, 0.9)]} for idx in range(40)]
+        meta = VideoMetadata(path="synthetic.mp4", width=4096, height=4096, duration=20.0, source_fps=30.0)
+
+        with patch.object(mosaic_prescan, "_cfg", side_effect=lambda _key, default: default):
+            no_cut = mosaic_prescan._aggregate_hits(hits, meta)
+            with_cut = mosaic_prescan._aggregate_hits(hits, meta, scene_cuts=[10.0])
+
+        self.assertEqual(len(no_cut), 1)
+        self.assertEqual(len(with_cut), 2)
+        self.assertLessEqual(with_cut[0].end_s, 10.5)
+        self.assertGreaterEqual(with_cut[1].start_s, 9.5)
+
+    def test_scene_cut_outside_any_group_is_ignored(self) -> None:
+        hits = [{"t": idx * 0.5, "boxes": [(500.0, 500.0, 900.0, 900.0, 0.9)]} for idx in range(20)]
+        meta = VideoMetadata(path="synthetic.mp4", width=4096, height=4096, duration=60.0, source_fps=30.0)
+
+        with patch.object(mosaic_prescan, "_cfg", side_effect=lambda _key, default: default):
+            segs = mosaic_prescan._aggregate_hits(hits, meta, scene_cuts=[40.0])
+
+        self.assertEqual(len(segs), 1)
 
     def test_same_time_far_regions_produce_multiple_segments(self) -> None:
         hits = []
@@ -259,32 +353,52 @@ class MosaicPrescanAggregationTests(unittest.TestCase):
         scan_gpu.assert_called_once()
         scan_cpu.assert_not_called()
 
-    def test_keyframe_gpu_scan_uses_simple_decoder_time_indices(self) -> None:
+    def test_keyframe_gpu_scan_decodes_key_packets_only(self) -> None:
         import numpy as np
 
         class FakeFrame:
             def y_uv_cupy(self):
                 return np.zeros((4, 8), dtype=np.uint8), np.zeros((2, 4, 2), dtype=np.uint8)
 
+        class FakeDecodedFrame:
+            def __init__(self, pts):
+                self._pts = int(pts)
+
+            def getPTS(self):
+                return self._pts
+
+        class FakePacket:
+            def __init__(self, *, bsl=1, key=False, pts=-1):
+                self.bsl = int(bsl)
+                self.key = bool(key)
+                self.pts = int(pts)
+
+        class FakeDemuxer:
+            def __init__(self):
+                self._packets = [
+                    FakePacket(key=True, pts=100),
+                    FakePacket(key=False, pts=150),
+                    FakePacket(key=True, pts=200),
+                    FakePacket(bsl=0, key=False, pts=-1),
+                ]
+
+            def GetNvCodecId(self):
+                return "hevc"
+
+            def Demux(self):
+                pkt = self._packets.pop(0)
+                seen["demuxed"].append((pkt.key, pkt.pts))
+                return pkt
+
         class FakeDecoder:
-            info = types.SimpleNamespace(width=8, height=4)
-
-            def __init__(self, _path, bit_depth=8):
-                self.bit_depth = bit_depth
-                self.indices = []
-
-            def __len__(self):
-                return 100
-
-            def index_at_time(self, seconds):
-                return int(round(float(seconds) * 30.0)) + 1
-
-            def frame_at(self, index):
-                seen["indices"].append(index)
-                return FakeFrame()
-
-            def stop(self):
-                seen["stopped"] = True
+            def Decode(self, pkt):
+                if pkt.bsl and not pkt.key:
+                    seen["decoded_non_key"] = True
+                    return []
+                if pkt.bsl:
+                    seen["decoded_key_pts"].append(pkt.pts)
+                    return [FakeDecodedFrame(100)] if pkt.pts == 200 else []
+                return [FakeDecodedFrame(200)]
 
         class Detector:
             def preprocess(self, frames):
@@ -299,7 +413,7 @@ class MosaicPrescanAggregationTests(unittest.TestCase):
 
                 return [Result() for _ in frames]
 
-        seen = {"indices": []}
+        seen = {"demuxed": [], "decoded_key_pts": []}
         meta = VideoMetadata(
             path="source.mp4",
             codec_name="hevc",
@@ -309,19 +423,30 @@ class MosaicPrescanAggregationTests(unittest.TestCase):
             duration=2.0,
             source_fps=30.0,
         )
+        fake_nvc = types.SimpleNamespace(
+            CreateDemuxer=lambda _path: FakeDemuxer(),
+            CreateDecoder=lambda **_kwargs: FakeDecoder(),
+            OutputColorType=types.SimpleNamespace(NATIVE=0),
+        )
 
         with (
+            patch.dict("sys.modules", {"PyNvVideoCodec": fake_nvc}),
+            # Pin batch >= 2 so both decoded frames land in one detector batch;
+            # the keyframe scan defaults batch to 1, which would otherwise flush
+            # per-frame and depend on ambient config.
+            patch("utils.mosaic_prescan._cfg", side_effect=lambda key, default=None: 8 if key == "pre_extract_yolo_batch" else default),
             patch("utils.mosaic_prescan.probe.route", return_value=(meta, mosaic_prescan.probe.BackendDecision("gpu_nv12", "ok"))),
             patch("utils.keyframe_cutter.list_keyframes", return_value=[0.0, 1.0]),
-            patch("gpu_engine.pynv_io.PyNvSimpleDecoder", FakeDecoder),
+            patch("utils.mosaic_prescan._decoded_frame_to_gpu_frame", return_value=FakeFrame()),
             patch("utils.mosaic_prescan._cupy_to_torch_bgr", side_effect=lambda *_args, **_kwargs: "frame"),
             patch("utils.mosaic_prescan._get_detector", return_value=Detector()) as get_detector,
         ):
             hits, out_meta, _debug = mosaic_prescan._scan_hits_keyframes_gpu("source.mp4")
 
         self.assertEqual(hits, [])
-        self.assertEqual(seen["indices"], [1, 31])
-        self.assertTrue(seen["stopped"])
+        self.assertEqual(seen["decoded_key_pts"], [100, 200])
+        self.assertNotIn("decoded_non_key", seen)
+        self.assertEqual(seen["batch_frames"], ["frame", "frame"])
         self.assertEqual((out_meta.width, out_meta.height), (4, 4))
         self.assertEqual(get_detector.call_args.kwargs["frame_w"], 4)
         self.assertEqual(get_detector.call_args.kwargs["frame_h"], 4)
@@ -348,7 +473,7 @@ class MosaicPrescanAggregationTests(unittest.TestCase):
             with (
                 patch("utils.mosaic_prescan._cfg", side_effect=cfg),
                 patch("utils.mosaic_prescan._model_path", return_value=str(model)),
-                patch("utils.mosaic_prescan._scan_hits_gpu_transform", return_value=([], meta, [])) as scan_gpu,
+                patch("utils.mosaic_prescan._scan_hits_gpu_transform", return_value=([], meta, [], [])) as scan_gpu,
             ):
                 first = mosaic_prescan.scan_segments_gpu_transform(
                     video,
@@ -387,7 +512,7 @@ class MosaicPrescanAggregationTests(unittest.TestCase):
             with (
                 patch("utils.mosaic_prescan._cfg", side_effect=cfg),
                 patch("utils.mosaic_prescan._model_path", return_value=str(model)),
-                patch("utils.mosaic_prescan._scan_hits_gpu_transform", return_value=([], meta, [])) as scan_gpu,
+                patch("utils.mosaic_prescan._scan_hits_gpu_transform", return_value=([], meta, [], [])) as scan_gpu,
             ):
                 mosaic_prescan.scan_segments_gpu_transform(video, crop_mode="left", min_conf=0.5)
                 mosaic_prescan.scan_segments_gpu_transform(video, crop_mode="left", min_conf=0.6)

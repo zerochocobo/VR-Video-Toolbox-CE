@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,6 +11,15 @@ class MediaRoot:
     path: Path
 
 
+def safe_resolve_path(path: Path) -> Path:
+    """Resolve paths without rejecting virtual drives that cannot report volume info."""
+    expanded = Path(path).expanduser()
+    try:
+        return expanded.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return Path(os.path.abspath(os.fspath(expanded)))
+
+
 def parse_video_dirs(raw: object, default: Path) -> list[Path]:
     text = str(raw or "").strip()
     parts = [part.strip() for part in text.split("|") if part.strip()]
@@ -18,13 +28,13 @@ def parse_video_dirs(raw: object, default: Path) -> list[Path]:
     roots: list[Path] = []
     seen: set[str] = set()
     for part in parts:
-        path = Path(part).expanduser().resolve()
+        path = safe_resolve_path(Path(part))
         key = str(path).casefold()
         if key in seen:
             continue
         seen.add(key)
         roots.append(path)
-    return roots or [default.resolve()]
+    return roots or [safe_resolve_path(default)]
 
 
 def build_media_roots(paths: list[Path]) -> list[MediaRoot]:
@@ -35,7 +45,7 @@ def build_media_roots(paths: list[Path]) -> list[MediaRoot]:
         index = used.get(base.casefold(), 0) + 1
         used[base.casefold()] = index
         label = base if index == 1 else f"{base}{index}"
-        roots.append(MediaRoot(label=label, path=path.resolve()))
+        roots.append(MediaRoot(label=label, path=safe_resolve_path(path)))
     return roots
 
 
@@ -54,7 +64,7 @@ class MediaLibrary:
         return self.roots[0]
 
     def path_to_key(self, path: Path) -> str:
-        resolved = path.resolve()
+        resolved = safe_resolve_path(path)
         matches: list[tuple[int, MediaRoot, Path]] = []
         for root in self.roots:
             try:
@@ -75,7 +85,7 @@ class MediaLibrary:
         if Path(rel).is_absolute():
             return None
         if not self.multi_root:
-            path = (self.first_root.path / rel).resolve()
+            path = safe_resolve_path(self.first_root.path / rel)
             return path if self._contains_root(self.first_root, path) else None
         label, _, rest = rel.partition("/")
         if not label:
@@ -85,7 +95,7 @@ class MediaLibrary:
         root = self.root_by_label(label)
         if root is None:
             return None
-        path = (root.path / rest).resolve()
+        path = safe_resolve_path(root.path / rest)
         return path if self._contains_root(root, path) else None
 
     def root_by_label(self, label: str) -> MediaRoot | None:
@@ -96,7 +106,7 @@ class MediaLibrary:
         return None
 
     def contains(self, path: Path) -> bool:
-        resolved = path.resolve()
+        resolved = safe_resolve_path(path)
         for root in self.roots:
             if self._contains_root(root, resolved):
                 return True
@@ -104,6 +114,6 @@ class MediaLibrary:
 
     @staticmethod
     def _contains_root(root: MediaRoot, path: Path) -> bool:
-        resolved = path.resolve()
-        root_path = root.path.resolve()
+        resolved = safe_resolve_path(path)
+        root_path = safe_resolve_path(root.path)
         return resolved == root_path or root_path in resolved.parents

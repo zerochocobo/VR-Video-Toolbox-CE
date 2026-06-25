@@ -73,6 +73,19 @@ class Yolo11SegmentationModel:
             preds = self.inference(input)
             return self.postprocess(preds, input, orig_imgs)
 
+    def inference_and_postprocess_boxes(self, imgs: torch.Tensor, orig_imgs: list[ImageTensor]) -> list[UltralyticsResults]:
+        """Run detection and return boxes only.
+
+        Fine pre-scan only needs rect/conf information for later aggregation.
+        Avoiding mask prototype upsampling and per-mask tensor creation keeps the
+        scan path on the lightweight detector output instead of materializing
+        full-resolution segmentation masks for every sampled frame.
+        """
+        with torch.inference_mode():
+            input = imgs.to(device=self.device).to(dtype=self.dtype).div_(255.0)
+            preds = self.inference(input)
+            return self.postprocess_boxes(preds, input, orig_imgs)
+
     def postprocess(self, preds, img, orig_imgs: list[ImageTensor]) -> list[Results]:
         protos = preds[0][-1]
         preds = nms.non_max_suppression(
@@ -97,3 +110,21 @@ class Yolo11SegmentationModel:
             keep = masks.sum((-2, -1)) > 0  # only keep predictions with masks
             preds, masks = preds[keep], masks[keep]
         return Results(orig_img, path='', names=self.model.names, boxes=preds[:, :6].cpu(), masks=masks)
+
+    def postprocess_boxes(self, preds, img, orig_imgs: list[ImageTensor]) -> list[Results]:
+        preds = nms.non_max_suppression(
+            preds[0],
+            self.args.conf,
+            self.args.iou,
+            self.args.classes,
+            self.args.agnostic_nms,
+            max_det=self.args.max_det,
+            nc=len(self.model.names),
+            end2end=getattr(self.model, "end2end", False),
+        )
+        return [self.construct_box_result(pred, img, orig_img) for pred, orig_img in zip(preds, orig_imgs)]
+
+    def construct_box_result(self, preds: torch.tensor, img: torch.tensor, orig_img: ImageTensor):
+        if len(preds):
+            preds[:, :4] = ops.scale_boxes(img.shape[2:], preds[:, :4], orig_img.shape)
+        return Results(orig_img, path='', names=self.model.names, boxes=preds[:, :6].cpu(), masks=None)

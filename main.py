@@ -36,7 +36,7 @@ import subprocess
 from tkinter import filedialog
 from tkinter import messagebox
 
-ver_name = "v1.1 (build 2026-06-23)"
+ver_name = "v1.2 (build 2026-06-25)"
 DLNA_SERVER_EXE_NAME = "vr_dlna_server.exe"
 TWO_DVR_DOWNLOAD_URL = "https://wapok.com"
 
@@ -721,8 +721,8 @@ class VRVideoToolboxLauncher:
 
         dialog = tk.Toplevel(self.root)
         dialog.title(get_text('dlna_config_title'))
-        dialog.geometry("700x680")
-        dialog.minsize(620, 620)
+        dialog.geometry("700x560")
+        dialog.minsize(620, 500)
         dialog.resizable(True, True)
         dialog.transient(self.root)
         dialog.grab_set()
@@ -731,30 +731,30 @@ class VRVideoToolboxLauncher:
         saved = {'ok': False}
 
         # Name
-        ttk.Label(dialog, text=get_text('lbl_dlna_name')).grid(row=0, column=0, sticky='w', padx=(18, 8), pady=(18, 6))
+        ttk.Label(dialog, text=get_text('lbl_dlna_name')).grid(row=0, column=0, sticky='w', padx=(18, 8), pady=(12, 3))
         name_var = tk.StringVar(value=current_name)
         name_entry = ttk.Entry(dialog, textvariable=name_var, width=32)
-        name_entry.grid(row=0, column=1, sticky='ew', padx=(8, 18), pady=(18, 6))
+        name_entry.grid(row=0, column=1, sticky='ew', padx=(8, 18), pady=(12, 3))
 
         # Port
-        ttk.Label(dialog, text=get_text('lbl_dlna_port')).grid(row=1, column=0, sticky='w', padx=(18, 8), pady=6)
+        ttk.Label(dialog, text=get_text('lbl_dlna_port')).grid(row=1, column=0, sticky='w', padx=(18, 8), pady=3)
         port_var = tk.IntVar(value=current_port)
         port_entry = ttk.Entry(dialog, textvariable=port_var, width=32)
-        port_entry.grid(row=1, column=1, sticky='ew', padx=(8, 18), pady=6)
+        port_entry.grid(row=1, column=1, sticky='ew', padx=(8, 18), pady=3)
         ttk.Label(
             dialog,
             text=get_text('lbl_dlna_port_note'),
             foreground='gray',
             wraplength=560,
-        ).grid(row=2, column=0, columnspan=2, sticky='w', padx=18, pady=(0, 6))
+        ).grid(row=2, column=0, columnspan=2, sticky='w', padx=18, pady=(0, 3))
 
         # Subs
         auto_sub_var = tk.BooleanVar(value=current_auto_sub)
-        ttk.Checkbutton(dialog, text=get_text('lbl_dlna_auto_sub'), variable=auto_sub_var).grid(row=3, column=0, columnspan=2, sticky='w', padx=18, pady=6)
+        ttk.Checkbutton(dialog, text=get_text('lbl_dlna_auto_sub'), variable=auto_sub_var).grid(row=3, column=0, columnspan=2, sticky='w', padx=18, pady=3)
 
         # Simultaneous interpretation audio
-        si_frame = ttk.LabelFrame(dialog, text=get_text('grp_dlna_si_audio'), padding=(10, 8))
-        si_frame.grid(row=4, column=0, columnspan=2, sticky='ew', padx=18, pady=(4, 8))
+        si_frame = ttk.LabelFrame(dialog, text=get_text('grp_dlna_si_audio'), padding=(8, 6))
+        si_frame.grid(row=4, column=0, columnspan=2, sticky='ew', padx=18, pady=(2, 4))
         si_frame.columnconfigure(1, weight=1)
         si_frame.columnconfigure(3, weight=1)
 
@@ -764,7 +764,7 @@ class VRVideoToolboxLauncher:
             text=get_text('lbl_dlna_si_enabled'),
             variable=si_enabled_var,
         )
-        si_enabled_check.grid(row=0, column=0, columnspan=4, sticky='w', pady=(0, 6))
+        si_enabled_check.grid(row=0, column=0, columnspan=4, sticky='w', pady=(0, 3))
 
         si_options_frame = ttk.Frame(si_frame)
         si_options_frame.grid(row=1, column=0, columnspan=4, sticky='ew')
@@ -800,43 +800,43 @@ class VRVideoToolboxLauncher:
         si_delay_var = tk.StringVar(value=f"{current_si_delay:g}s")
         si_duck_var = tk.BooleanVar(value=bool(_saved_si_value('dlna_si_duck_original', True)))
 
-        ttk.Label(si_options_frame, text=get_text('lbl_dlna_si_channel')).grid(row=0, column=0, sticky='w', padx=(0, 6), pady=2)
+        ttk.Label(si_options_frame, text=get_text('lbl_dlna_si_channel')).grid(row=0, column=0, sticky='w', padx=(0, 6), pady=1)
         ttk.Combobox(
             si_options_frame,
             textvariable=si_channel_var,
             values=list(channel_map),
             width=18,
             state='readonly',
-        ).grid(row=0, column=1, sticky='w', pady=2)
-        ttk.Label(si_options_frame, text=get_text('lbl_dlna_si_original_volume')).grid(row=0, column=2, sticky='w', padx=(14, 6), pady=2)
+        ).grid(row=0, column=1, sticky='w', pady=1)
+        ttk.Label(si_options_frame, text=get_text('lbl_dlna_si_original_volume')).grid(row=0, column=2, sticky='w', padx=(14, 6), pady=1)
         ttk.Combobox(
             si_options_frame,
             textvariable=si_origvol_var,
             values=[f"{v}%" for v in si_logic.ORIGINAL_VOLUME_CHOICES],
             width=10,
             state='readonly',
-        ).grid(row=0, column=3, sticky='w', pady=2)
-        ttk.Label(si_options_frame, text=get_text('lbl_dlna_si_volume')).grid(row=1, column=0, sticky='w', padx=(0, 6), pady=2)
+        ).grid(row=0, column=3, sticky='w', pady=1)
+        ttk.Label(si_options_frame, text=get_text('lbl_dlna_si_volume')).grid(row=1, column=0, sticky='w', padx=(0, 6), pady=1)
         ttk.Combobox(
             si_options_frame,
             textvariable=si_volume_var,
             values=[f"{v}%" for v in si_logic.SI_VOLUME_CHOICES],
             width=10,
             state='readonly',
-        ).grid(row=1, column=1, sticky='w', pady=2)
-        ttk.Label(si_options_frame, text=get_text('lbl_dlna_si_delay')).grid(row=1, column=2, sticky='w', padx=(14, 6), pady=2)
+        ).grid(row=1, column=1, sticky='w', pady=1)
+        ttk.Label(si_options_frame, text=get_text('lbl_dlna_si_delay')).grid(row=1, column=2, sticky='w', padx=(14, 6), pady=1)
         ttk.Combobox(
             si_options_frame,
             textvariable=si_delay_var,
             values=[f"{v:g}s" for v in si_logic.SI_DELAY_SECONDS_CHOICES],
             width=10,
             state='readonly',
-        ).grid(row=1, column=3, sticky='w', pady=2)
+        ).grid(row=1, column=3, sticky='w', pady=1)
         ttk.Checkbutton(
             si_options_frame,
             text=get_text('lbl_dlna_si_duck_original'),
             variable=si_duck_var,
-        ).grid(row=2, column=0, columnspan=4, sticky='w', pady=(4, 0))
+        ).grid(row=2, column=0, columnspan=4, sticky='w', pady=(2, 0))
 
         def refresh_si_options():
             if si_enabled_var.get():
@@ -848,12 +848,12 @@ class VRVideoToolboxLauncher:
         refresh_si_options()
 
         # Path List
-        ttk.Label(dialog, text=get_text('lbl_dlna_dirs')).grid(row=5, column=0, columnspan=2, sticky='w', padx=18, pady=(12, 4))
+        ttk.Label(dialog, text=get_text('lbl_dlna_dirs')).grid(row=5, column=0, columnspan=2, sticky='w', padx=18, pady=(6, 2))
 
         list_frame = ttk.Frame(dialog)
-        list_frame.grid(row=6, column=0, columnspan=2, sticky='nsew', padx=18, pady=4)
+        list_frame.grid(row=6, column=0, columnspan=2, sticky='nsew', padx=18, pady=2)
         
-        listbox = tk.Listbox(list_frame, height=10, font=('Arial', 10))
+        listbox = tk.Listbox(list_frame, height=5, font=('Arial', 10))
         listbox.pack(side='left', fill='both', expand=True)
         
         scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
@@ -865,7 +865,7 @@ class VRVideoToolboxLauncher:
 
         # Add/Del
         btn_dirs_frame = ttk.Frame(dialog)
-        btn_dirs_frame.grid(row=7, column=0, columnspan=2, sticky='e', padx=18, pady=(8, 6))
+        btn_dirs_frame.grid(row=7, column=0, columnspan=2, sticky='e', padx=18, pady=(4, 3))
         
         def add_directory():
             chosen = filedialog.askdirectory(parent=dialog)
@@ -883,9 +883,17 @@ class VRVideoToolboxLauncher:
         ttk.Button(btn_dirs_frame, text=get_text('btn_add_dir'), command=add_directory, width=10).pack(side='left', padx=5)
         ttk.Button(btn_dirs_frame, text=get_text('btn_del_dir'), command=delete_directory, width=10).pack(side='left', padx=5)
 
+        ttk.Label(
+            dialog,
+            text=get_text('lbl_dlna_dirs_note'),
+            foreground='gray',
+            wraplength=640,
+            justify='left',
+        ).grid(row=8, column=0, columnspan=2, sticky='ew', padx=18, pady=(0, 3))
+
         # Bottom Buttons
         bottom_btn_frame = ttk.Frame(dialog)
-        bottom_btn_frame.grid(row=8, column=0, columnspan=2, sticky='e', padx=18, pady=(10, 18))
+        bottom_btn_frame.grid(row=9, column=0, columnspan=2, sticky='e', padx=18, pady=(6, 12))
 
         def save_config():
             name = name_var.get().strip()
