@@ -64,6 +64,8 @@
       "btn_close": "关闭",
       "msg_dlna_dirs_required_title": "需要配置视频目录",
       "msg_dlna_dirs_required": "启动DLNA服务器前，请至少添加一个视频目录。",
+      "msg_dlna_unc_rejected_title": "不支持的DLNA目录",
+      "msg_dlna_unc_rejected": "此DLNA服务器不支持以\\\\开头的UNC/网络共享路径。请选择本地磁盘路径或已挂载为盘符的路径。",
       "confirm_running_title": "仍有任务在运行",
       "confirm_running_message": "当前窗口仍有任务正在运行。离开此窗口会先停止这些任务，未完成输出可能不可用。\n\n确定要停止任务并离开吗？",
       "lbl_language": "界面语言："
@@ -294,10 +296,20 @@
       "err_invalid_format": "格式无效",
       "err_time_order": "开始时间必须小于结束时间",
       "opt_fisheye": "去马赛克前先转换成鱼眼视角（可以有效针对部分视频制作商画面中轴的马赛克,例如SAVR/URVRSP...）",
-      "opt_pre_extract": "(实验功能) 去马赛克前先提取有马赛克的片段和区域，检测置信阈值",
+      "opt_pre_extract": "去马赛克前先提取有马赛克的片段和区域，检测置信阈值",
+      "opt_pre_extract_hint_title": "功能说明",
+      "opt_pre_extract_hint": "（本功能不要用在最高画质，视频马赛克位置稳定建议打开）",
       "opt_source_time_filter": "扫描源视频先剔除无马赛克片段（最大化加速；无马赛克视频整片跳过）",
       "chk_keep_inter": "执行完成后保留中间生成的文件",
-      "chk_keep_bitrate": "输出视频码率和原视频保持一致"
+      "chk_keep_bitrate": "输出视频码率和原视频保持一致",
+      "lbl_encode_profile": "编码档位:",
+      "opt_encode_highest_quality": "最高画质",
+      "opt_encode_balanced_high_quality": "均衡高画质",
+      "opt_encode_fast_quality": "快速高画质",
+      "opt_encode_ultra_fast_normal": "极速普通画质",
+      "opt_encode_custom": "自定义当前设置",
+      "hint_encode_profile": "默认均衡高画质；NativeGPU/Lada 应用完整 preset/AQ/两遍参数，Jasna 仅应用 CQ",
+      "log_encode_profile_set": "编码档位已设为 {profile}（preset={preset}, multipass={multipass}, aq={aq}, temporal_aq={temporal_aq}）"
     },
     "area_vr2flat": {
       "title": "VR选区去马工具( VR->平面->VR)",
@@ -783,6 +795,15 @@
       "opt_preset_p6": "高画质 P6",
       "opt_preset_p5": "均衡 P5",
       "opt_preset_p4": "普通快速 P4",
+      "lbl_encode_profile": "编码档位:",
+      "opt_encode_maximum_quality": "均衡高画质",
+      "opt_encode_highest_quality": "最高画质",
+      "opt_encode_balanced_high_quality": "均衡高画质",
+      "opt_encode_fast_quality": "快速高画质",
+      "opt_encode_ultra_fast_normal": "极速普通画质",
+      "opt_encode_custom": "自定义当前设置",
+      "hint_encode_profile": "默认均衡高画质；NativeGPU/Lada 应用完整 preset/AQ/两遍参数，Jasna 仅应用 CQ",
+      "log_encode_profile_set": "编码档位已设为 {profile}（preset={preset}, multipass={multipass}, aq={aq}, temporal_aq={temporal_aq}）",
       "warn_dep": "[!] 缺少必要工具: {}",
       "warn_path": ">> 请查阅程序同目录下的「说明.txt」，里面有详细的安装步骤说明。"
     }

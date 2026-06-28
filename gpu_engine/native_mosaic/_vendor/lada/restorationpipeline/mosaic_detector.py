@@ -20,6 +20,7 @@ from lada.utils.threading_utils import EOF_MARKER, STOP_MARKER, PipelineQueue, S
 from lada.utils.ultralytics_utils import convert_yolo_box, convert_yolo_mask_tensor, UltralyticsResults
 from gpu_engine import vram_offload
 from gpu_engine.native_mosaic import _gpu_ops
+from gpu_engine.native_mosaic.progress import NativeStageProgress
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=LOG_LEVEL)
@@ -184,7 +185,7 @@ class Clip:
         return vram_offload.restore_tensor(self.frames[item]), vram_offload.restore_tensor(self.masks[item]), self.boxes[item]
 
 class MosaicDetector:
-    def __init__(self, model: Yolo11SegmentationModel, video_metadata: VideoMetadata, frame_detection_queue: PipelineQueue, mosaic_clip_queue: PipelineQueue, error_handler: Callable[[ErrorMarker], None], max_clip_length=30, clip_size=256, device: torch.device | None = None, pad_mode='reflect', batch_size=4, frame_source_factory=None):
+    def __init__(self, model: Yolo11SegmentationModel, video_metadata: VideoMetadata, frame_detection_queue: PipelineQueue, mosaic_clip_queue: PipelineQueue, error_handler: Callable[[ErrorMarker], None], max_clip_length=30, clip_size=256, device: torch.device | None = None, pad_mode='reflect', batch_size=4, frame_source_factory=None, progress_log_callback=None):
         self.model = model
         self.video_meta_data = video_metadata
         self.frame_source_factory = frame_source_factory
@@ -206,6 +207,8 @@ class MosaicDetector:
         self.inference_thread: PipelineThread | None = None
         self.stop_requested = False
         self.batch_size = batch_size
+        self.progress_log_callback = progress_log_callback
+        self._detect_progress: NativeStageProgress | None = None
 
     def start(self, start_ns):
         assert self.frame_feeder_queue.empty()
@@ -213,6 +216,13 @@ class MosaicDetector:
 
         self.start_ns = start_ns
         self.start_frame = video_utils.offset_ns_to_frame_num(self.start_ns, self.video_meta_data.video_fps_exact)
+        total_frames = max(0, int(getattr(self.video_meta_data, "frames_count", 0) or 0) - int(self.start_frame))
+        self._detect_progress = NativeStageProgress(
+            "FrameRestorer detect",
+            self.progress_log_callback,
+            total=total_frames,
+            unit="frames",
+        )
         self.stop_requested = False
 
         self.frame_detector_thread = PipelineThread(name="frame detector worker", target=self._frame_detector_worker, error_handler=self.error_handler)
@@ -416,6 +426,11 @@ class MosaicDetector:
                     queue_marker = self._create_clips_for_completed_scenes(scenes, frame_num, eof=False)
                     if queue_marker is STOP_MARKER:
                         break
+                    if self._detect_progress is not None:
+                        self._detect_progress.update(
+                            frame_num - self.start_frame + 1,
+                            extra=f"active_scenes={num_scenes_containing_frame}",
+                        )
                     frame_num += 1
                 # Release MPS driver cached memory to prevent unbounded growth
                 if self.device is not None and self.device.type == 'mps' and hasattr(torch.mps, 'empty_cache'):

@@ -52,6 +52,53 @@ class I18nTests(unittest.TestCase):
 
         self.assertEqual(text, "VR视频工具箱(CUDA专版){version}")
 
+    def test_one_click_encode_profile_translations_are_in_one_click_namespace(self) -> None:
+        expected = {
+            "zh": "快速高画质",
+            "en": "Fast high quality",
+            "ja": "高速高画質",
+        }
+        for language, text in expected.items():
+            app_config._cache = {"language": language}
+            i18n.clear_cache()
+            self.assertEqual(i18n.translate("one_click", "opt_encode_fast_quality"), text)
+            self.assertNotEqual(i18n.translate("one_click", "lbl_encode_profile"), "lbl_encode_profile")
+
+    def test_one_click_encode_profile_options_do_not_mark_recommended(self) -> None:
+        keys = (
+            "opt_encode_highest_quality",
+            "opt_encode_balanced_high_quality",
+            "opt_encode_fast_quality",
+            "opt_encode_ultra_fast_normal",
+        )
+        forbidden = ("推荐", "recommended", "Recommended", "推奨")
+        for language in ("zh", "en", "ja"):
+            app_config._cache = {"language": language}
+            i18n.clear_cache()
+            for key in keys:
+                text = i18n.translate("one_click", key)
+                self.assertFalse(any(marker in text for marker in forbidden), (language, key, text))
+
+    def test_one_click_pre_extract_hint_translations(self) -> None:
+        expected = {
+            "zh": ("功能说明", "（本功能不要用在最高画质，视频马赛克位置稳定建议打开）"),
+            "en": ("Note", "(Do not use with maximum quality; recommended when mosaic positions are stable)"),
+            "ja": ("説明", "（最高画質では使用しないでください。モザイク位置が安定している動画では有効化を推奨します）"),
+        }
+        for language, (title, text) in expected.items():
+            app_config._cache = {"language": language}
+            i18n.clear_cache()
+            self.assertEqual(i18n.translate("one_click", "opt_pre_extract_hint_title"), title)
+            self.assertEqual(i18n.translate("one_click", "opt_pre_extract_hint"), text)
+
+    def test_one_click_pre_extract_label_does_not_mark_experimental(self) -> None:
+        forbidden = ("实验功能", "Experimental", "実験機能")
+        for language in ("zh", "en", "ja"):
+            app_config._cache = {"language": language}
+            i18n.clear_cache()
+            text = i18n.translate("one_click", "opt_pre_extract")
+            self.assertFalse(any(marker in text for marker in forbidden), (language, text))
+
     def test_dlna_port_note_translations(self) -> None:
         expected = {
             "en": "Make sure the firewall allows this port. UDP port 1900 is also fixed for broadcasting server information.",

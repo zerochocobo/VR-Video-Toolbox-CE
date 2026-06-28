@@ -2,6 +2,55 @@
 
 ## English
 
+### 2026-06-28
+
+- New: GPU/native progress logs now show VRAM usage where practical, including GPU pipeline progress, pre-scan/fine-scan progress, NativeGPU FrameRestorer detect/restore/compose stages, and native VideoWriter fallback.
+- Optimization: Throttled GPU and NativeGPU progress logging to avoid rapid bursts on short/high-FPS clips, while keeping periodic FPS, ETA, and VRAM visibility.
+- Major fix: Removed the paired pre-extract full-eye `BYPASS_CROP` fallback. Large or spatially jumping mosaic regions are now split into crop windows instead of forcing an expensive full-eye restore.
+- Major fix: Improved fine-scan window slicing by making position jumps split independently of the area cap, and by measuring area caps per spatial cluster so simultaneous small mosaics do not create oversized combined crops.
+- Major fix: Tightened final delivered encode peak bitrate for keep-bitrate workflows. Full-frame paste and final merge/re-encode paths now use the final maxrate policy, including fisheye paste, so output bitrate converges closer to source.
+- Change: Cleaned OneClick pre-extract UI: the option is hidden and forced off under highest-quality encoding, the old experimental prefix was removed, and the warning text moved to a localized `?` popup.
+- Change: Cleaned `vr_toolbox_config.json` so hidden GPU implementation knobs are no longer persisted. Only the UI-level `gpu_encode_profile` is saved; preset, AQ, multipass, final bitrate, and internal native options now come from code defaults.
+- Change: Reduced the Tools safe keyframe cut time-point list height so the log area remains visible.
+
+### 2026-06-27
+
+- New: Added the experimental NativeGPU internal ROI restore + final bake path for built-in GPU mode, with a dedicated OneClick processing mode separate from full-eye processing and region-file pre-extract.
+- New: Added an ROI window planner for internal restore, including safe-gap cuts, forced overlap windows with context, per-window cache/process-frame budgets, and fallback reasons for unsafe windows.
+- Major optimization: Added trusted ROI restore so internal ROI can reuse the outer fine-scan rectangles instead of running LADA detector/clip a second time inside each ROI.
+- Major optimization: Added source-backed internal ROI bake paths for non-fisheye SBS and fisheye workflows, including split-eye fisheye base reuse to avoid remapping full fisheye eyes on every active frame.
+- Fix: Internal ROI mode no longer falls back to full-eye restore only because ROI union spread exceeds the generic planner guard; that relaxation is limited to the dedicated internal ROI mode.
+- Fix: Raised internal ROI default window length to about 8s and increased the per-window patch-cache budget, reducing repeated context/overlap work without making the cache global for long videos.
+- Fix: Made fisheye internal ROI failures explicit instead of silently hiding them behind old fallback paths, and moved fisheye detection debug files into the scan temp directory.
+- Change: Localized the patched LADA detector/restorer chain into project-owned NativeGPU modules with AGPL attribution, making future internal ROI optimization less constrained by vendored code layout.
+
+### 2026-06-26
+
+- Major fix: Replaced slow source-scan keyframe listing with PyAV packet-based keyframe extraction, reducing the provided 8K sample from about 99s to about 3-4s while keeping ffprobe as fallback.
+- Major optimization: Source-scan now skips Stage 2 copy-cut when one interval covers the whole or near-whole source, using the original source as the Stage 3 input without creating a redundant full-length copy.
+- Major fix: Reduced final paste VRAM pressure by releasing cached NativeGPU models before GPU paste and by pre-wrapping raw HEVC restored segments before paste instead of first attempting an unstable raw PyNv seek path.
+- Major update: Unified VBR bitrate policy. Intermediate outputs target about 1.2x source bitrate with 2x peak headroom; final outputs still target source bitrate, and PyNv/ffmpeg fallback paths now share the same maxrate policy.
+- Major update: Final ffmpeg re-encode fallbacks now preserve 10bit/main10 and color metadata, use final-only B-frames and 2s GOP for better compression, and auto-fall back to `bf=0` on older NVENC hardware that rejects HEVC B-frames.
+- Change: OneClick encode profile default is now balanced high quality, and profile options no longer show a "recommended" marker.
+- Fix: CuPy/CUDA JIT cache directories now default to the project `runtime_cache` before importing CuPy, including packaged runtime hooks, avoiding hangs or slow first-use behavior from unwritable user cache folders.
+- Research: Added and then cleaned paste performance diagnostics. The retained production path stays lean; experimental switches remain for NVENC CUDA Graph and stream synchronization, while `fullres` multipass remains the default.
+- Research: Fine-scan PyNv review confirmed current 8K fine-scan time is dominated by sequential decode/prep across the video segment, not the number of detector samples alone.
+
+### 2026-06-25
+
+- Major optimization: Reworked OneClick GPU source keyframe scan away from repeated PyNv random seeking and toward a demuxer/key-packet based path, avoiding the progressive slowdown/crash pattern seen on long HEVC sources.
+- Major optimization: Fine scan now uses box-only detector postprocessing and a single full-SBS paired detection pass for non-fisheye SBS, splitting boxes back to left/right eye coordinates instead of decoding and detecting each eye separately.
+- Major optimization: Accurate-model fine scan keeps `accurate.pt` and `imgsz=2048` but avoids the full 8K BGR intermediate by resizing NV12/P016 planes on GPU before BGR conversion, then scaling boxes back to source coordinates.
+- New: Added semantic OneClick encode profiles for highest quality, balanced high quality, fast high quality, and ultra-fast normal, shared by PyNv, ffmpeg NVENC fallback, LADA CLI, native VideoWriter fallback, paste, concat, and keyframe-cut paths.
+- Major fix: Ensured NVENC multipass/AQ profile settings run under VBR rate control where required, added clear Jasna logging that Jasna only receives CQ, and fixed profile i18n namespace issues.
+- Optimization: Reduced one full-frame GPU copy in the 8K paste path by pasting directly into encoder-packed Y/UV views; paste research confirmed full-frame 8K NVENC is the dominant cost, not alpha blending.
+- Fix: Reworked final raw-HEVC muxing to use a tracked `Popen` wrapper, stream ffmpeg logs, honor cancellation, and let the UI stop button kill the mux child process instead of looking like Python is frozen.
+- Change: OneClick pre-extract is now off by default, and DLNA configuration UI gained a virtual-drive/network-directory timeout note plus a shorter, less tall directory list.
+
+### 2026-06-24
+
+- Major fix: DLNA media roots on CloudDrive2 or other virtual drives now use safe path resolution, avoiding `[WinError 1005]` failures while preserving parent-traversal protection for media, subtitles, route checks, probe cache keys, and SI stream paths.
+
 ### 2026-06-23
 
 - Major fix: Ported the proven WhisperSeg transcription front-end from Subtitle Tools into Clone Translation Dubbing, including Kotoba alignment-head repair, word timestamp preservation, configurable denoise, and quieter pyannote startup logs.
@@ -68,6 +117,55 @@
 - Major optimization: GPU-accelerated VR split/merge, fisheye/equirectangular conversion, VR-to-flat projection, and OneClick geometry stages.
 
 ## 中文
+
+### 2026-06-28
+
+- 新功能：GPU/native 进度日志尽量显示显存占用，覆盖 GPU pipeline、pre-scan/fine-scan、NativeGPU FrameRestorer detect/restore/compose，以及 native VideoWriter fallback。
+- 优化：降低 GPU 和 NativeGPU 进度日志频率，避免短视频或高 FPS 片段一秒内刷出大量日志，同时保留周期性的 FPS、ETA 和显存信息。
+- 重大修复：移除 paired pre-extract 的整眼 `BYPASS_CROP` fallback。遇到大范围或跳变马赛克时改为继续切 crop 窗口，而不是直接进入昂贵的整眼恢复。
+- 重大修复：改进 fine-scan 窗口切割。马赛克位置跳变现在独立触发切段；面积限制改为按空间 cluster 计算，避免同帧多个小马赛克被合并成一个虚大的 crop。
+- 重大修复：收紧 keep-bitrate 流程的最终成品峰值码率策略。全帧 paste、最终 merge/re-encode、fisheye paste 都使用 final maxrate，让最终 MP4 更接近源码率。
+- 变更：清理 OneClick pre-extract UI：最高画质下隐藏并强制关闭该选项，移除旧的“实验功能”前缀，说明文字改为本地化 `?` 弹窗。
+- 变更：清理 `vr_toolbox_config.json`。隐藏的 GPU 实现参数不再持久化，只保存 UI 层的 `gpu_encode_profile`；preset、AQ、multipass、最终码率和 native 内部选项改由代码默认值提供。
+- 变更：缩小工具页“安全帧切割”的时间点列表高度，避免挤占日志区域。
+
+### 2026-06-27
+
+- 新功能：新增实验性的 NativeGPU internal ROI restore + final bake 路径，仅用于内置 GPU 模式，并在 OneClick 中作为独立处理模式，不再混用整眼处理或区域文件预提取选项。
+- 新功能：新增 ROI window planner，支持安全空档切割、带上下文的强制 overlap 窗口、每窗口 cache/帧数预算，以及明确的 fallback 原因。
+- 重大优化：新增 trusted ROI restore，internal ROI 可复用外层 fine-scan 得到的 rect，避免在 ROI 内再次跑一遍 LADA detector/clip。
+- 重大优化：新增非鱼眼 SBS 和鱼眼流程的 source-backed internal ROI bake；鱼眼路径可复用 split-eye fisheye base，避免每个活动帧重复整眼 fisheye remap。
+- 修复：internal ROI 模式不再仅因 ROI union spread 超过通用 planner 阈值就 fallback 到整眼恢复；该放宽只作用于专用 internal ROI 模式。
+- 修复：internal ROI 默认窗口长度提高到约 8 秒，并提高单窗口 patch cache 预算，减少重复上下文/overlap 工作，同时不为长视频建立全局无限缓存。
+- 修复：fisheye internal ROI 失败现在会明确暴露具体原因，不再静默退回旧路径；fisheye detection debug 文件也改为写入 scan temp 目录。
+- 变更：将 patched LADA detector/restorer 链路本地化到项目 NativeGPU 模块，并保留 AGPL 来源说明，方便后续继续改造 internal ROI。
+
+### 2026-06-26
+
+- 重大修复：source-scan 关键帧列表改为优先使用 PyAV packet keyframe 提取。用户提供的 8K 样本从约 99 秒降到约 3-4 秒，同时保留 ffprobe 兜底。
+- 重大优化：source-scan 只有一个整片/近整片 interval 时跳过 Stage 2 copy-cut，直接把原始视频作为 Stage 3 输入，避免生成几乎完整的临时拷贝。
+- 重大修复：降低 final paste 显存压力。GPU paste 前释放 cached NativeGPU 模型，并在 paste 前主动把 raw HEVC restored segments 包装成 MP4，避免先尝试不稳定 raw PyNv seek 再重试。
+- 重大更新：统一 VBR 码率策略。中间产物目标约为源码率 1.2 倍、峰值 2 倍；最终成品仍以源码率为目标，PyNv 和 ffmpeg fallback 使用一致的 maxrate 策略。
+- 重大更新：最终 ffmpeg 重编码 fallback 现在保留 10bit/main10 和色彩元数据，使用 final-only B 帧与 2 秒 GOP 提升压缩效率，并对不支持 HEVC B 帧的老 NVENC 自动回落到 `bf=0`。
+- 变更：OneClick 编码档位默认改为“均衡高画质”，选项文案不再显示“推荐”。
+- 修复：CuPy/CUDA JIT 缓存默认指向项目 `runtime_cache`，并覆盖打包 runtime hook，避免用户目录缓存不可写导致首次 JIT 卡住或异常变慢。
+- 研究：新增并清理 paste 性能诊断。生产路径保持简洁，仅保留 NVENC CUDA Graph 和 stream sync 实验开关；`fullres` multipass 仍为默认。
+- 研究：复查 fine-scan PyNv 路径，确认当前 8K fine-scan 主要受整段顺序 decode/prep 限制，而不是单纯由 detector sample 数决定。
+
+### 2026-06-25
+
+- 重大优化：OneClick GPU source keyframe scan 从反复 PyNv 随机 seek 改向 demuxer/key-packet 路径，规避长 HEVC 源上逐渐变慢甚至崩溃的问题。
+- 重大优化：fine scan 新增 box-only detector 后处理，并让非鱼眼 SBS paired scan 一次检测全 SBS，再把 box 拆回左右眼坐标，避免左右眼重复解码和重复检测。
+- 重大优化：accurate 模型 fine scan 仍保留 `accurate.pt` 与 `imgsz=2048`，但改为先在 GPU 上缩放 NV12/P016 平面，再转 BGR，并把 box 坐标缩放回原始空间，减少 8K BGR 中间图开销。
+- 新功能：新增语义化 OneClick 编码档位：最高画质、均衡高画质、快速高画质、极速普通画质；同一套 profile 被 PyNv、ffmpeg NVENC fallback、LADA CLI、native VideoWriter fallback、paste、concat 和 keyframe-cut 共用。
+- 重大修复：确保 NVENC multipass/AQ 档位在需要时使用 VBR rate control；补充 Jasna 日志说明 Jasna 只接收 CQ；修复编码档位 i18n namespace 问题。
+- 优化：8K paste 路径减少一次全帧 GPU copy，直接在 encoder-packed Y/UV view 上贴回；性能研究确认主瓶颈是 8K 全帧 NVENC，而不是 alpha blending。
+- 修复：raw HEVC 最终 mux 改为 tracked `Popen` 执行，ffmpeg 日志流式写入，支持取消，并允许 UI 停止按钮杀掉 mux 子进程，避免看起来像 Python 卡死。
+- 变更：OneClick pre-extract 默认关闭；DLNA 配置界面新增虚拟盘/网盘目录载入超时提示，并缩短目录列表高度。
+
+### 2026-06-24
+
+- 重大修复：DLNA 媒体目录现在对 CloudDrive2 等虚拟盘使用安全路径解析，避免 `[WinError 1005]`；同时仍保留媒体、字幕、路由检查、probe cache 和 SI stream 路径的父目录穿越保护。
 
 ### 2026-06-23
 

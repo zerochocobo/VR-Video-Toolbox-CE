@@ -267,7 +267,7 @@ class SourceTimeScannerTests(unittest.TestCase):
 
             with (
                 patch("gpu_engine.probe.probe_video", return_value=meta),
-                patch("utils.source_time_scanner.scan_source_time_segments", return_value=[TimeInterval(0.0, 60.0, 0.91)]),
+                patch("utils.source_time_scanner.scan_source_time_segments", return_value=[TimeInterval(10.0, 50.0, 0.91)]),
                 patch("one_click.logic.get_video_bitrate", return_value=1000000),
                 patch("utils.keyframe_cutter.cut_source_by_intervals", return_value=timeline),
                 patch("one_click.logic._process_sbs_paired_pre_extract_clip", return_value=logic.PreExtractResult.OK) as paired,
@@ -295,61 +295,6 @@ class SourceTimeScannerTests(unittest.TestCase):
             self.assertEqual(gpu_merge.call_args.args[:3], (str(src), str(final), timeline))
             concat_timeline.assert_not_called()
 
-    def test_source_scan_bypass_crop_falls_back_only_for_current_timeline_entry(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            src = Path(raw) / "source.mp4"
-            final = Path(raw) / "source_sbs.restored.mp4"
-            tmp_dir = Path(raw) / "source_sbs.restored_scan_tmp"
-            mosaic0 = tmp_dir / "mosaic_seg000.mp4"
-            mosaic1 = tmp_dir / "mosaic_seg001.mp4"
-            restored0 = tmp_dir / "mosaic_seg000.restored.mp4"
-            restored1 = tmp_dir / "mosaic_seg001.restored.mp4"
-            src.write_bytes(b"fake video")
-            tmp_dir.mkdir()
-            mosaic0.write_bytes(b"mosaic0")
-            mosaic1.write_bytes(b"mosaic1")
-            meta = VideoMetadata(path=str(src), width=4096, height=4096, duration=80.0, source_fps=30.0)
-            timeline = [
-                TimelineEntry(0.0, 30.0, mosaic0, "mosaic", 0.91),
-                TimelineEntry(40.0, 70.0, mosaic1, "mosaic", 0.90),
-            ]
-            cfg = {"source_scan_final_merge_mode": "gpu"}
-
-            with (
-                patch("utils.app_config.get", side_effect=lambda key, default=None: cfg.get(key, default)),
-                patch("gpu_engine.probe.probe_video", return_value=meta),
-                patch("utils.source_time_scanner.scan_source_time_segments", return_value=[
-                    TimeInterval(0.0, 30.0, 0.91),
-                    TimeInterval(40.0, 70.0, 0.90),
-                ]),
-                patch("one_click.logic.get_video_bitrate", return_value=1000000),
-                patch("utils.keyframe_cutter.cut_source_by_intervals", return_value=timeline),
-                patch(
-                    "one_click.logic._process_sbs_paired_pre_extract_clip",
-                    side_effect=[logic.PreExtractResult.BYPASS_CROP, logic.PreExtractResult.OK],
-                ) as paired,
-                patch("one_click.logic._process_sbs_clip_to_output") as full_eye,
-                patch("gpu_engine.files.replace_timeline_segments_gpu") as gpu_merge,
-            ):
-                result = logic._run_source_scan_branch(
-                    str(src),
-                    str(final),
-                    use_fisheye=False,
-                    pre_extract_inner=True,
-                    keep_intermediate=False,
-                    keep_original_bitrate=False,
-                    fine_conf=0.5,
-                )
-
-            self.assertEqual(result, logic.PreExtractResult.OK)
-            self.assertEqual(paired.call_count, 2)
-            self.assertEqual(paired.call_args_list[0].args[:2], (str(mosaic0), str(restored0)))
-            self.assertEqual(paired.call_args_list[1].args[:2], (str(mosaic1), str(restored1)))
-            full_eye.assert_called_once()
-            self.assertEqual(full_eye.call_args.args[:2], (str(mosaic0), str(restored0)))
-            self.assertFalse(full_eye.call_args.kwargs["pre_extract_inner"])
-            gpu_merge.assert_called_once()
-
     def test_pre_extract_cancel_does_not_fallback_to_full_restore(self) -> None:
         with (
             patch("one_click.logic._run_pre_extract_branch", return_value=logic.PreExtractResult.CANCELLED),
@@ -375,7 +320,7 @@ class SourceTimeScannerTests(unittest.TestCase):
 
             with (
                 patch("gpu_engine.probe.probe_video", return_value=meta),
-                patch("utils.source_time_scanner.scan_source_time_segments", return_value=[TimeInterval(0.0, 60.0, 0.91)]),
+                patch("utils.source_time_scanner.scan_source_time_segments", return_value=[TimeInterval(10.0, 50.0, 0.91)]),
                 patch("one_click.logic.get_video_bitrate", return_value=1000000),
                 patch("utils.keyframe_cutter.cut_source_by_intervals", return_value=timeline),
                 patch("one_click.logic._process_sbs_paired_pre_extract_clip", return_value=logic.PreExtractResult.CANCELLED),
@@ -443,11 +388,11 @@ class SourceTimeScannerTests(unittest.TestCase):
             extract_rect.assert_not_called()
             extract_multi.assert_called_once()
             # Intermediate stage is decoupled from keep_original_bitrate and
-            # always reserves a 2x headroom for downstream re-encodes.
-            # The area-scaled target (62500 bps) is dominated by the baseline
+            # reserves 1.2x target headroom for downstream re-encodes.
+            # The area-scaled target is dominated by the baseline
             # quality floor (0.015 * 512*512 * 30 fps), which intermediate stage
             # always applies regardless of keep_original_bitrate.
-            area_scaled_target = int(2_000_000 * (512 * 512) / (4096 * 4096) * 2.0)
+            area_scaled_target = int(2_000_000 * (512 * 512) / (4096 * 4096) * 1.2)
             baseline_target = int(0.015 * 512 * 512 * 30)
             expected_rect_bitrate = max(area_scaled_target, baseline_target)
             self.assertFalse(extract_multi.call_args.kwargs["keep_audio"])
@@ -567,7 +512,7 @@ class SourceTimeScannerTests(unittest.TestCase):
             self.assertEqual(len(paste_segments), 1)
             self.assertEqual(paste_segments[0].x, 100)
 
-    def test_paired_pre_extract_bypasses_crop_for_large_single_eye_area(self) -> None:
+    def test_paired_pre_extract_keeps_crop_path_for_large_single_eye_area(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             base = root / "mosaic_seg000.mp4"
@@ -577,18 +522,26 @@ class SourceTimeScannerTests(unittest.TestCase):
             left = [MosaicSegment(0, 1.0, 4.0, 1.0, 4.0, 0, 0, 2048, 2048, 0.91)]
             right = [MosaicSegment(0, 1.0, 4.0, 1.0, 4.0, 140, 220, 512, 512, 0.90)]
             cfg = {
-                "pre_extract_bypass_crop_area_ratio": 1.0 / 3.0,
+                "pre_extract_extract_group_max": 8,
+                "pre_extract_keep_segments": False,
                 "pre_extract_pair_keep_unmatched_conf": 0.60,
             }
-            messages: list[str] = []
+
+            def fake_extract_multi(_src, tasks, **_kwargs):
+                for task in tasks:
+                    Path(task["dst"]).write_bytes(b"segment")
+
+            def fake_process_lada(_src, dst, **_kwargs):
+                Path(dst).write_bytes(b"restored")
+                return str(dst)
 
             with (
                 patch("utils.app_config.get", side_effect=lambda key, default=None: cfg.get(key, default)),
                 patch("gpu_engine.probe.probe_video", return_value=meta),
                 patch("utils.mosaic_prescan.scan_segments_gpu_transform_pair", return_value=(left, right)),
                 patch("gpu_engine.files.extract_transformed_rect_clip") as extract_rect,
-                patch("gpu_engine.files.extract_multi_rect_clip") as extract_multi,
-                patch("one_click.logic.process_lada") as process_lada,
+                patch("gpu_engine.files.extract_multi_rect_clip", side_effect=fake_extract_multi) as extract_multi,
+                patch("one_click.logic.process_lada", side_effect=fake_process_lada) as process_lada,
                 patch("utils.segment_paster.paste_segments_gpu_or_fallback") as paste_fallback,
             ):
                 result = logic._process_sbs_paired_pre_extract_clip(
@@ -598,16 +551,14 @@ class SourceTimeScannerTests(unittest.TestCase):
                     keep_intermediate=False,
                     original_bitrate=2000000,
                     keep_original_bitrate=True,
-                    log_callback=messages.append,
                     fine_conf=0.6,
                 )
 
-            self.assertEqual(result, logic.PreExtractResult.BYPASS_CROP)
+            self.assertEqual(result, logic.PreExtractResult.OK)
             extract_rect.assert_not_called()
-            extract_multi.assert_not_called()
-            process_lada.assert_not_called()
-            paste_fallback.assert_not_called()
-            self.assertTrue(any("paired fine crop bypassed" in msg for msg in messages))
+            extract_multi.assert_called_once()
+            self.assertEqual(process_lada.call_count, 2)
+            paste_fallback.assert_called_once()
 
     def test_paired_pre_extract_pipelines_next_group_extract_during_restore(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -822,7 +773,7 @@ class SourceTimeScannerTests(unittest.TestCase):
 
             with (
                 patch("gpu_engine.probe.probe_video", return_value=meta),
-                patch("utils.source_time_scanner.scan_source_time_segments", return_value=[TimeInterval(0.0, 60.0, 0.91)]),
+                patch("utils.source_time_scanner.scan_source_time_segments", return_value=[TimeInterval(10.0, 50.0, 0.91)]),
                 patch("one_click.logic.get_video_bitrate", return_value=1000000),
                 patch("one_click.logic._process_sbs_clip_to_output") as process_source,
                 patch("utils.keyframe_cutter.cut_source_by_intervals", return_value=timeline) as cut_source,
@@ -856,6 +807,49 @@ class SourceTimeScannerTests(unittest.TestCase):
             self.assertEqual(timeline[0].path, mosaic.with_name("mosaic_seg000.restored.mp4"))
             self.assertIsNone(timeline[0].inpoint_s)
             self.assertIsNone(timeline[0].outpoint_s)
+
+    def test_source_scan_whole_source_interval_skips_stage2_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            src = Path(raw) / "source.mp4"
+            final = Path(raw) / "source_sbs.restored.mp4"
+            tmp_dir = Path(raw) / "source_sbs.restored_scan_tmp"
+            restored = tmp_dir / "mosaic_seg000.restored.mp4"
+            src.write_bytes(b"fake video")
+            meta = VideoMetadata(path=str(src), width=4096, height=4096, duration=60.0, source_fps=30.0)
+
+            with (
+                patch("gpu_engine.probe.probe_video", return_value=meta),
+                patch("utils.source_time_scanner.scan_source_time_segments", return_value=[TimeInterval(0.5, 59.5, 0.91)]),
+                patch("one_click.logic.get_video_bitrate", return_value=1000000),
+                patch("one_click.logic._process_sbs_clip_to_output") as process_source,
+                patch("utils.keyframe_cutter.cut_source_by_intervals") as cut_source,
+                patch("utils.sbs_concat.concat_timeline") as concat_timeline,
+                patch("utils.sbs_concat.concat_timeline_hevc_fast") as fast_merge,
+                patch("gpu_engine.files.replace_timeline_segments_gpu") as gpu_merge,
+            ):
+                result = logic._run_source_scan_branch(
+                    str(src),
+                    str(final),
+                    use_fisheye=False,
+                    pre_extract_inner=False,
+                    keep_intermediate=False,
+                    keep_original_bitrate=False,
+                )
+
+            self.assertEqual(result, logic.PreExtractResult.OK)
+            cut_source.assert_not_called()
+            process_source.assert_called_once()
+            self.assertEqual(process_source.call_args.args[:2], (str(src), str(restored)))
+            self.assertEqual(process_source.call_args.kwargs["work_dir"], str(tmp_dir))
+            self.assertEqual(process_source.call_args.kwargs["work_stem"], "mosaic_seg000")
+            concat_timeline.assert_not_called()
+            fast_merge.assert_called_once()
+            timeline = fast_merge.call_args.args[0]
+            self.assertEqual(len(timeline), 1)
+            self.assertEqual(timeline[0].path, restored)
+            self.assertEqual((timeline[0].start_s, timeline[0].end_s), (0.0, 60.0))
+            gpu_merge.assert_not_called()
+            self.assertTrue(src.exists())
 
     def test_source_scan_gpu_timeline_merge_uses_original_bitrate_when_requested(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

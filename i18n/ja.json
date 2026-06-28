@@ -64,6 +64,8 @@
       "btn_close": "閉じる",
       "msg_dlna_dirs_required_title": "動画フォルダが未設定です",
       "msg_dlna_dirs_required": "DLNAサーバーを起動する前に、動画フォルダを少なくとも1つ追加してください。",
+      "msg_dlna_unc_rejected_title": "未対応のDLNAフォルダ",
+      "msg_dlna_unc_rejected": "このDLNAサーバーでは、\\\\で始まるUNC/ネットワーク共有パスはサポートしていません。ローカルドライブ、またはドライブ文字としてマウント済みのパスを選択してください。",
       "confirm_running_title": "タスクが実行中です",
       "confirm_running_message": "このウィンドウにはまだ実行中のタスクがあります。移動すると先にこれらのタスクを停止します。未完了の出力は使用できない可能性があります。\n\nタスクを停止して移動しますか？",
       "lbl_language": "言語:"
@@ -294,10 +296,20 @@
       "err_invalid_format": "時刻の形式が正しくありません。",
       "err_time_order": "終了時刻は開始時刻より後にしてください。",
       "opt_fisheye": "魚眼として処理",
-      "opt_pre_extract": "(実験機能) モザイク除去前にモザイク区間・領域だけを抽出、検出信頼度しきい値",
+      "opt_pre_extract": "モザイク除去前にモザイク区間・領域だけを抽出、検出信頼度しきい値",
+      "opt_pre_extract_hint_title": "説明",
+      "opt_pre_extract_hint": "（最高画質では使用しないでください。モザイク位置が安定している動画では有効化を推奨します）",
       "opt_source_time_filter": "ソースを事前スキャンしモザイク無し区間をスキップ（高速化、無モザイク動画は丸ごとスキップ）",
       "chk_keep_inter": "中間ファイルを保存",
-      "chk_keep_bitrate": "元のビットレートを維持"
+      "chk_keep_bitrate": "元のビットレートを維持",
+      "lbl_encode_profile": "エンコード設定:",
+      "opt_encode_highest_quality": "最高画質",
+      "opt_encode_balanced_high_quality": "バランス高画質",
+      "opt_encode_fast_quality": "高速高画質",
+      "opt_encode_ultra_fast_normal": "超高速標準画質",
+      "opt_encode_custom": "現在のカスタム設定",
+      "hint_encode_profile": "既定はバランス高画質です。NativeGPU/Lada は preset/AQ/2パスを適用し、Jasna は CQ のみ適用します",
+      "log_encode_profile_set": "エンコード設定を {profile} にしました (preset={preset}, multipass={multipass}, aq={aq}, temporal_aq={temporal_aq})"
     },
     "area_vr2flat": {
       "title": "VR選択範囲モザイク除去ツール (VR→平面→VR)",
@@ -783,6 +795,15 @@
       "opt_preset_p6": "高画質 P6",
       "opt_preset_p5": "バランス P5",
       "opt_preset_p4": "標準高速 P4",
+      "lbl_encode_profile": "エンコード設定:",
+      "opt_encode_maximum_quality": "バランス高画質",
+      "opt_encode_highest_quality": "最高画質",
+      "opt_encode_balanced_high_quality": "バランス高画質",
+      "opt_encode_fast_quality": "高速高画質",
+      "opt_encode_ultra_fast_normal": "超高速標準画質",
+      "opt_encode_custom": "現在のカスタム設定",
+      "hint_encode_profile": "既定はバランス高画質です。NativeGPU/Lada は preset/AQ/2パスを適用し、Jasna は CQ のみ適用します",
+      "log_encode_profile_set": "エンコード設定を {profile} にしました (preset={preset}, multipass={multipass}, aq={aq}, temporal_aq={temporal_aq})",
       "warn_dep": "必要なツールが見つかりません: {}",
       "warn_path": "実行ファイルの場所またはPATHを確認してください。"
     }

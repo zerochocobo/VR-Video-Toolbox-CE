@@ -8,12 +8,15 @@ information is preserved end to end.
 from __future__ import annotations
 
 import os
+import queue
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
+from .fallback import OperationCancelled
 from .probe import ColorMetadata
 
 # Color name -> HEVC VUI numeric code (ITU-T H.265 Table E.3/E.4/E.5).
@@ -67,6 +70,111 @@ def _cfg(key: str, default):
         return default if value is None else value
     except Exception:
         return default
+
+
+class _TrackedProcess:
+    def __init__(self, proc: subprocess.Popen):
+        self._proc = proc
+        self.cancelled = False
+
+    def kill(self):
+        self.cancelled = True
+        return self._proc.kill()
+
+    def terminate(self):
+        self.cancelled = True
+        return self._proc.terminate()
+
+    def poll(self):
+        return self._proc.poll()
+
+    def __getattr__(self, name: str):
+        return getattr(self._proc, name)
+
+
+def _run_ffmpeg(cmd: list[str], *, label: str, log_callback=None,
+                process_callback=None, cancel_token=None) -> str:
+    """Run ffmpeg with streamed logs and cancellation support."""
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        **_hidden_kwargs(),
+    )
+    tracked = _TrackedProcess(proc)
+    if process_callback:
+        process_callback(tracked)
+
+    lines: list[str] = []
+    out_q: queue.Queue[str | None] = queue.Queue()
+
+    def _reader() -> None:
+        try:
+            if proc.stdout:
+                for line in proc.stdout:
+                    out_q.put(line)
+        finally:
+            out_q.put(None)
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
+    reader_done = False
+    try:
+        while True:
+            try:
+                item = out_q.get(timeout=0.2)
+            except queue.Empty:
+                item = None
+            if item is None:
+                if proc.poll() is not None:
+                    reader_done = True
+                    break
+                if cancel_token is not None and getattr(cancel_token, "cancelled", False):
+                    tracked.cancelled = True
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                continue
+            text = item.rstrip()
+            if text:
+                lines.append(text)
+                if log_callback:
+                    log_callback(text)
+            if cancel_token is not None and getattr(cancel_token, "cancelled", False):
+                tracked.cancelled = True
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+
+        while not out_q.empty():
+            item = out_q.get_nowait()
+            if item:
+                text = item.rstrip()
+                if text:
+                    lines.append(text)
+                    if log_callback:
+                        log_callback(text)
+    finally:
+        try:
+            if proc.stdout:
+                proc.stdout.close()
+        except Exception:
+            pass
+        ret = proc.wait()
+        if not reader_done:
+            reader.join(timeout=1.0)
+
+    output = "\n".join(lines)
+    if tracked.cancelled or (cancel_token is not None and getattr(cancel_token, "cancelled", False)):
+        raise OperationCancelled(f"{label} cancelled by user")
+    if ret != 0:
+        raise RuntimeError(f"ffmpeg {label} failed (code {ret}): {output}")
+    return output
 
 
 def should_use_faststart(candidate_size_bytes: int | None = None, mode: object | None = None) -> bool:
@@ -124,6 +232,8 @@ def _restore_audio_from_source(
     audio_duration: float | None = None,
     faststart: object | None = None,
     log_callback=None,
+    process_callback=None,
+    cancel_token=None,
 ) -> None:
     ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
     video_mp4 = Path(video_mp4)
@@ -158,23 +268,22 @@ def _restore_audio_from_source(
     if log_callback:
         log_callback("[mux] output has no audio; retrying source-audio remux without -shortest")
         log_callback(f"[mux] {' '.join(cmd)}")
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        **_hidden_kwargs(),
-    )
-    if proc.returncode != 0:
+    try:
+        _run_ffmpeg(
+            cmd,
+            label="audio restore",
+            log_callback=log_callback,
+            process_callback=process_callback,
+            cancel_token=cancel_token,
+        )
+    except Exception:
         try:
             if video_mp4.exists():
                 video_mp4.unlink()
             temp_video.replace(video_mp4)
         except OSError:
             pass
-        raise RuntimeError(f"ffmpeg audio restore failed (code {proc.returncode}): {proc.stdout}")
+        raise
     try:
         temp_video.unlink()
     except OSError:
@@ -189,6 +298,8 @@ def _ensure_output_audio(
     audio_duration: float | None = None,
     faststart: object | None = None,
     log_callback=None,
+    process_callback=None,
+    cancel_token=None,
 ) -> None:
     if _has_audio_stream(out_path):
         return
@@ -201,6 +312,8 @@ def _ensure_output_audio(
         audio_duration=audio_duration,
         faststart=faststart,
         log_callback=log_callback,
+        process_callback=process_callback,
+        cancel_token=cancel_token,
     )
     if not _has_audio_stream(out_path):
         raise RuntimeError(f"ffmpeg mux produced no audio stream after source-audio restore: {out_path}")
@@ -218,6 +331,8 @@ def mux_hevc_with_audio(
     shortest: bool = True,
     faststart: object | None = None,
     log_callback=None,
+    process_callback=None,
+    cancel_token=None,
 ) -> None:
     """Package a raw HEVC bitstream into mp4, optionally copying source audio.
 
@@ -282,12 +397,13 @@ def mux_hevc_with_audio(
             f"audio={audio_source} audio_exists={Path(audio_source).exists() if audio_source is not None else False}"
         )
         log_callback(f"[mux] {' '.join(cmd)}")
-    proc = subprocess.run(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace", **_hidden_kwargs(),
+    _run_ffmpeg(
+        cmd,
+        label="mux",
+        log_callback=log_callback,
+        process_callback=process_callback,
+        cancel_token=cancel_token,
     )
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg mux failed (code {proc.returncode}): {proc.stdout}")
     if has_audio:
         _ensure_output_audio(
             final_out,
@@ -296,4 +412,6 @@ def mux_hevc_with_audio(
             audio_duration=audio_duration,
             faststart=faststart,
             log_callback=log_callback,
+            process_callback=process_callback,
+            cancel_token=cancel_token,
         )

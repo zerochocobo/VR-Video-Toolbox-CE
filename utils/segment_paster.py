@@ -11,7 +11,7 @@ from pathlib import Path
 
 from gpu_engine import mux, probe
 from gpu_engine.fallback import OperationCancelled
-from utils import app_config
+from utils import app_config, encode_config
 from utils.mosaic_prescan import MosaicSegment
 
 
@@ -232,6 +232,7 @@ def _try_paste_segments_gpu_passthrough(base_path: str | Path, restored_path: st
                                         paste_segments: list[PasteSeg],
                                         keep_audio: bool,
                                         bitrate_bps: int | None,
+                                        max_bitrate_bps: int | None = None,
                                         log_callback=None,
                                         process_callback=None) -> bool:
     if not bool(app_config.get("paste_passthrough_enabled", True)):
@@ -355,9 +356,11 @@ def _try_paste_segments_gpu_passthrough(base_path: str | Path, restored_path: st
                     active,
                     keep_audio=False,
                     bitrate_bps=bitrate_bps,
+                    max_bitrate_bps=max_bitrate_bps,
                     start_frame=actual_start,
                     end_frame=expected_end,
                     log_callback=log_callback,
+                    process_callback=process_callback,
                     cancel_token=token,
                 )
                 source_cursor = expected_end
@@ -382,10 +385,31 @@ def paste_segments_gpu_or_fallback(base_path: str | Path, restored_path: str | P
                                    restored_paths: list[str | Path],
                                    keep_audio: bool = True,
                                    bitrate_bps: int | None = None,
+                                   max_bitrate_bps: int | None = None,
                                    log_callback=None, process_callback=None) -> None:
-    paste_segments = build_paste_segments(base_path, segments, restored_paths)
+    original_paste_segments = build_paste_segments(base_path, segments, restored_paths)
+    paste_segments = original_paste_segments
+    temp_inputs: list[Path] = []
     try:
         from gpu_engine import files as gpu_files
+
+        raw_count = sum(1 for seg in paste_segments if seg.path.suffix.lower() == ".hevc")
+        if raw_count:
+            if log_callback:
+                log_callback(
+                    f"[pre-extract] wrapping {raw_count} raw HEVC restored segments before GPU paste "
+                    "to avoid PyNv raw seek fallback"
+                )
+            token = gpu_files.CancelToken()
+            if process_callback:
+                process_callback(token)
+            paste_segments, temp_inputs = _materialize_raw_hevc_segments(
+                restored_path,
+                paste_segments,
+                log_callback=log_callback,
+                process_callback=process_callback,
+                cancel_token=token,
+            )
 
         try:
             if _try_paste_segments_gpu_passthrough(
@@ -394,6 +418,7 @@ def paste_segments_gpu_or_fallback(base_path: str | Path, restored_path: str | P
                 paste_segments,
                 keep_audio,
                 bitrate_bps,
+                max_bitrate_bps=max_bitrate_bps,
                 log_callback=log_callback,
                 process_callback=process_callback,
             ):
@@ -416,71 +441,40 @@ def paste_segments_gpu_or_fallback(base_path: str | Path, restored_path: str | P
             paste_segments,
             keep_audio=keep_audio,
             bitrate_bps=bitrate_bps,
+            max_bitrate_bps=max_bitrate_bps,
             log_callback=log_callback,
+            process_callback=process_callback,
             cancel_token=token,
         )
         return
     except OperationCancelled:
         raise
     except Exception as exc:
-        if any(seg.path.suffix.lower() == ".hevc" for seg in paste_segments):
-            temp_inputs: list[Path] = []
-            try:
-                if log_callback:
-                    log_callback(
-                        f"[pre-extract] GPU paste failed on raw HEVC input: {type(exc).__name__}: {exc}; "
-                        "retrying with temporary mp4-wrapped restored segments"
-                    )
-                from gpu_engine import files as gpu_files
-
-                materialized_segments, temp_inputs = _materialize_raw_hevc_segments(
-                    restored_path,
-                    paste_segments,
-                    log_callback=log_callback,
-                )
-                token = gpu_files.CancelToken()
-                if process_callback:
-                    process_callback(token)
-                gpu_files.paste_segments_gpu(
-                    base_path,
-                    restored_path,
-                    materialized_segments,
-                    keep_audio=keep_audio,
-                    bitrate_bps=bitrate_bps,
-                    log_callback=log_callback,
-                    cancel_token=token,
-                )
-                return
-            except OperationCancelled:
-                raise
-            except Exception as retry_exc:
-                if log_callback:
-                    log_callback(
-                        f"[pre-extract] GPU paste retry with mp4-wrapped raw failed: "
-                        f"{type(retry_exc).__name__}: {retry_exc}; using ffmpeg overlay fallback"
-                    )
-            finally:
-                for path in temp_inputs:
-                    try:
-                        path.unlink()
-                    except OSError:
-                        pass
         if log_callback:
             log_callback(f"[pre-extract] GPU paste failed: {type(exc).__name__}: {exc}; using ffmpeg overlay fallback")
+    finally:
+        for path in temp_inputs:
+            try:
+                path.unlink()
+            except OSError:
+                pass
     _paste_segments_ffmpeg(
         base_path,
         restored_path,
-        paste_segments,
+        original_paste_segments,
         keep_audio,
         log_callback,
         process_callback,
         bitrate_bps=bitrate_bps,
+        max_bitrate_bps=max_bitrate_bps,
     )
 
 
 def _materialize_raw_hevc_segments(restored_path: str | Path,
                                    segments: list[PasteSeg],
-                                   log_callback=None) -> tuple[list[PasteSeg], list[Path]]:
+                                   log_callback=None,
+                                   process_callback=None,
+                                   cancel_token=None) -> tuple[list[PasteSeg], list[Path]]:
     temp_inputs: list[Path] = []
     materialized_segments: list[PasteSeg] = []
     parent = Path(restored_path).parent
@@ -510,6 +504,8 @@ def _materialize_raw_hevc_segments(restored_path: str | Path,
                 color=meta.color,
                 audio_source=None,
                 log_callback=log_callback,
+                process_callback=process_callback,
+                cancel_token=cancel_token,
             )
             temp_inputs.append(temp_mp4)
             materialized_segments.append(replace(seg, path=temp_mp4))
@@ -520,7 +516,8 @@ def _materialize_raw_hevc_segments(restored_path: str | Path,
 
 def _paste_segments_ffmpeg(base_path: str | Path, restored_path: str | Path,
                            segments: list[PasteSeg], keep_audio: bool = True, log_callback=None,
-                           process_callback=None, bitrate_bps: int | None = None) -> None:
+                           process_callback=None, bitrate_bps: int | None = None,
+                           max_bitrate_bps: int | None = None) -> None:
     if not segments:
         shutil.copy2(base_path, restored_path)
         return
@@ -540,6 +537,7 @@ def _paste_segments_ffmpeg(base_path: str | Path, restored_path: str | Path,
             log_callback,
             process_callback,
             bitrate_bps=bitrate_bps,
+            max_bitrate_bps=max_bitrate_bps,
         )
     finally:
         for path in temp_inputs:
@@ -551,10 +549,17 @@ def _paste_segments_ffmpeg(base_path: str | Path, restored_path: str | Path,
 
 def _paste_segments_ffmpeg_impl(base_path: str | Path, restored_path: str | Path,
                                 segments: list[PasteSeg], keep_audio: bool = True, log_callback=None,
-                                process_callback=None, bitrate_bps: int | None = None) -> None:
+                                process_callback=None, bitrate_bps: int | None = None,
+                                max_bitrate_bps: int | None = None) -> None:
     if not segments:
         shutil.copy2(base_path, restored_path)
         return
+
+    base_meta = None
+    try:
+        base_meta = probe.probe_video(base_path)
+    except Exception:
+        base_meta = None
 
     ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-stats", "-y", "-i", str(base_path)]
@@ -583,21 +588,27 @@ def _paste_segments_ffmpeg_impl(base_path: str | Path, restored_path: str | Path
     ] if keep_audio else [
         "-an",
     ])
-    cmd.extend([
-        "-c:v", "hevc_nvenc",
-        "-preset", "p7",
-        "-rc", "vbr",
-    ])
+    cmd.extend(encode_config.build_ffmpeg_nvenc_base_args())
+    cmd.extend(["-rc", "vbr"])
     if bitrate_bps and bitrate_bps > 0:
         kbps = max(1, int(bitrate_bps) // 1000)
+        if max_bitrate_bps and max_bitrate_bps > 0:
+            maxrate = max(kbps, int(max_bitrate_bps) // 1000)
+        else:
+            maxrate = max(kbps, int(kbps * encode_config.maxrate_multiplier()))
+        bufsize = max(int(kbps * 2), int(maxrate * 2))
         cmd.extend([
             "-b:v", f"{kbps}k",
-            "-maxrate:v", f"{int(kbps * 1.2)}k",
-            "-bufsize:v", f"{int(kbps * 2)}k",
+            "-maxrate:v", f"{maxrate}k",
+            "-bufsize:v", f"{bufsize}k",
         ])
     else:
         cmd.extend(["-cq", "18"])
     size_hint = Path(base_path).stat().st_size if Path(base_path).exists() else None
+    cmd.extend(encode_config.build_ffmpeg_pix_fmt_args(getattr(base_meta, "bit_depth", 8)))
+    color = getattr(base_meta, "color", None)
+    if color is not None:
+        cmd.extend(color.ffmpeg_args())
     cmd.extend([
         "-g", "60",
         "-bf", "0",

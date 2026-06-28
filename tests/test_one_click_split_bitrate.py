@@ -5,13 +5,109 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from gpu_engine.probe import BackendDecision, VideoMetadata
+from gpu_engine.probe import BackendDecision, ColorMetadata, VideoMetadata
 from one_click import logic
+from utils import app_config
 
 
 class OneClickSplitBitrateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._old_cache = dict(app_config._cache)
+
+    def tearDown(self) -> None:
+        app_config._cache = self._old_cache
+
     def test_single_eye_split_vbr_uses_75_percent_target_and_source_max(self) -> None:
         self.assertEqual(logic._single_eye_split_vbr_bps(20_000_000), (15_000_000, 20_000_000))
+
+    def test_nvenc_cq_args_use_vbr_so_multipass_applies(self) -> None:
+        app_config._cache = {"gpu_encode_profile": "highest_quality"}
+
+        args = logic._nvenc_vbr_or_cq_args(None)
+
+        self.assertIn("-rc", args)
+        self.assertEqual(args[args.index("-rc") + 1], "vbr")
+        self.assertIn("-cq", args)
+        self.assertIn("-multipass", args)
+        self.assertEqual(args[args.index("-multipass") + 1], "fullres")
+
+    def test_nvenc_vbr_args_use_code_default_maxrate_multiplier(self) -> None:
+        app_config._cache = {
+            "gpu_encode_profile": "fast_quality",
+            "gpu_encode_maxrate_multiplier": 1.5,
+        }
+
+        args = logic._nvenc_vbr_or_cq_args(1000)
+
+        self.assertEqual(args[args.index("-b:v") + 1], "1000k")
+        self.assertEqual(args[args.index("-maxrate:v") + 1], "2000k")
+        self.assertEqual(args[args.index("-bufsize:v") + 1], "4000k")
+
+    def test_final_ffmpeg_merge_preserves_10bit_and_uses_final_efficiency_args(self) -> None:
+        meta = VideoMetadata(
+            path="left.mp4",
+            bit_depth=10,
+            source_fps=60.0,
+            color=ColorMetadata("tv", "bt709", "bt709", "bt709"),
+        )
+
+        with (
+            patch("gpu_engine.probe.probe_video", return_value=meta),
+            patch("utils.app_config.get", side_effect=lambda key, default=None: {
+                "gpu_final_encode_bframes": 2,
+                "gpu_final_encode_gop_sec": 2.0,
+            }.get(key, default)),
+            patch("one_click.logic.run_process") as run_process,
+        ):
+            logic._merge_videos_ffmpeg(
+                "left.mp4",
+                "right.mp4",
+                "out.mp4",
+                original_bitrate=0,
+                bitrate_bps=80_000_000,
+            )
+
+        cmd = run_process.call_args.args[0]
+        self.assertEqual(cmd[cmd.index("-pix_fmt") + 1], "p010le")
+        self.assertEqual(cmd[cmd.index("-profile:v") + 1], "main10")
+        self.assertEqual(cmd[cmd.index("-g") + 1], "120")
+        self.assertEqual(cmd[cmd.index("-bf") + 1], "2")
+        self.assertIn("-color_trc", cmd)
+
+    def test_final_merge_uses_final_maxrate_multiplier_not_intermediate(self) -> None:
+        # The final delivered re-encode must tighten the VBR peak toward source
+        # (gpu_final_encode_maxrate_multiplier) instead of the looser intermediate
+        # gpu_encode_maxrate_multiplier, so the output converges near source.
+        meta = VideoMetadata(path="left.mp4", source_fps=60.0)
+
+        with (
+            patch("gpu_engine.probe.probe_video", return_value=meta),
+            patch("utils.app_config.get", side_effect=lambda key, default=None: {
+                "gpu_encode_maxrate_multiplier": 2.0,
+                "gpu_final_encode_maxrate_multiplier": 1.5,
+            }.get(key, default)),
+            patch("one_click.logic.run_process") as run_process,
+        ):
+            logic._merge_videos_ffmpeg(
+                "left.mp4",
+                "right.mp4",
+                "out.mp4",
+                original_bitrate=0,
+                bitrate_bps=40_000_000,
+            )
+
+        cmd = run_process.call_args.args[0]
+        self.assertEqual(cmd[cmd.index("-b:v") + 1], "40000k")
+        # 40000 * 1.5 (final), not * 2.0 (intermediate)
+        self.assertEqual(cmd[cmd.index("-maxrate:v") + 1], "60000k")
+
+    def test_final_max_bitrate_helper_applies_final_multiplier(self) -> None:
+        with patch("utils.app_config.get", side_effect=lambda key, default=None: {
+            "gpu_final_encode_maxrate_multiplier": 1.5,
+        }.get(key, default)):
+            self.assertEqual(logic._final_max_bitrate_bps(40_000_000), 60_000_000)
+            self.assertIsNone(logic._final_max_bitrate_bps(None))
+            self.assertIsNone(logic._final_max_bitrate_bps(0))
 
     def test_area_scaled_bitrate_uses_rect_area_and_expansion(self) -> None:
         self.assertEqual(
@@ -43,8 +139,8 @@ class OneClickSplitBitrateTests(unittest.TestCase):
             )
             final = logic._resolve_pipeline_bitrate("final", 8192, 4096, 30.0, 80_000_000, False)
             # Intermediate stage is decoupled from keep_original: even with the
-            # user toggle on, intermediate keeps a 2x headroom for downstream
-            # re-encode quality.
+            # user toggle on, intermediate keeps the configured headroom for
+            # downstream re-encode quality.
             kept_intermediate = logic._resolve_pipeline_bitrate(
                 "intermediate",
                 512,

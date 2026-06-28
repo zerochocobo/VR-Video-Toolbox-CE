@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tool_dlna.media_library import MediaLibrary, build_media_roots, parse_video_dirs
+from tool_dlna.media_library import MediaLibrary, build_media_roots, is_unc_path, parse_video_dirs, safe_resolve_path
 
 
 class MediaLibraryTests(unittest.TestCase):
@@ -25,6 +25,25 @@ class MediaLibraryTests(unittest.TestCase):
             roots = parse_video_dirs(raw, Path("videos"))
 
         self.assertEqual(roots, [expected])
+
+    def test_is_unc_path_detects_network_share_prefixes(self) -> None:
+        self.assertTrue(is_unc_path(r"\\NAS\VR"))
+        self.assertTrue(is_unc_path("//NAS/VR"))
+        self.assertFalse(is_unc_path(r"D:\VR"))
+        self.assertFalse(is_unc_path(r"\local-root-relative"))
+
+    def test_parse_video_dirs_skips_unc_paths(self) -> None:
+        roots = parse_video_dirs(r"\\NAS\VR|D:\VR|//NAS/Other", Path("videos"))
+
+        self.assertEqual(len(roots), 1)
+        self.assertTrue(str(roots[0]).endswith("D:\\VR"))
+
+    def test_parse_video_dirs_falls_back_when_only_unc_paths_are_configured(self) -> None:
+        default = Path("videos")
+
+        roots = parse_video_dirs(r"\\NAS\VR|//NAS/Other", default)
+
+        self.assertEqual(roots, [safe_resolve_path(default)])
 
     def test_duplicate_names_are_numbered(self) -> None:
         roots = build_media_roots([Path(r"D:\VR"), Path(r"E:\VR"), Path(r"F:\Movies")])

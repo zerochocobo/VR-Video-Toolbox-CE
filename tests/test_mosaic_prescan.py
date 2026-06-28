@@ -190,6 +190,161 @@ class MosaicPrescanAggregationTests(unittest.TestCase):
 
         self.assertEqual(len(segs), 1)
 
+    def test_position_jump_splits_continuous_mosaic_run(self) -> None:
+        hits = []
+        for idx in range(24):
+            if idx < 12:
+                box = (500.0, 2200.0, 1000.0, 3300.0, 0.91)
+            else:
+                box = (3000.0, 2200.0, 3500.0, 3300.0, 0.92)
+            hits.append({"t": idx * 0.5, "boxes": [box]})
+        meta = VideoMetadata(path="synthetic.mp4", width=4096, height=4096, duration=14.0, source_fps=30.0)
+        cfg = {
+            "pre_extract_segment_max_area_ratio": 0.30,
+            "pre_extract_segment_jump_min_dur_s": 1.5,
+            "pre_extract_segment_min_dur_s": 10.0,
+        }
+
+        with patch.object(mosaic_prescan, "_cfg", side_effect=lambda key, default: cfg.get(key, default)):
+            segments = mosaic_prescan._aggregate_hits(hits, meta)
+
+        self.assertEqual(len(segments), 2)
+        self.assertLessEqual(segments[0].end_s, 6.0)
+        self.assertGreaterEqual(segments[1].start_s, 5.5)
+        self.assertLess(segments[0].x, 1000)
+        self.assertGreater(segments[1].x, 2500)
+
+    def test_position_jump_splits_even_when_area_stays_under_cap(self) -> None:
+        # A small mosaic (union never exceeds the area cap) that teleports to a
+        # nearby-but-clearly-different spot must still split: the jump trigger is
+        # independent of the area cap, gated only by ``jump_min_dur_s``.
+        hits = []
+        for idx in range(100):
+            if idx < 62:  # ~30.5s at position A
+                box = (200.0, 200.0, 600.0, 600.0, 0.91)
+            else:         # teleport to B (center moved > jump_center_ratio*frame)
+                box = (1000.0, 200.0, 1400.0, 600.0, 0.92)
+            hits.append({"t": idx * 0.5, "boxes": [box]})
+        meta = VideoMetadata(path="synthetic.mp4", width=4096, height=4096, duration=52.0, source_fps=30.0)
+        cfg = {
+            "pre_extract_segment_max_area_ratio": 0.30,
+            "pre_extract_segment_jump_min_dur_s": 30.0,
+            "pre_extract_segment_jump_center_ratio": 0.18,
+            "pre_extract_segment_jump_min_overlap": 0.10,
+            "pre_extract_segment_min_dur_s": 10.0,
+        }
+
+        with patch.object(mosaic_prescan, "_cfg", side_effect=lambda key, default: cfg.get(key, default)):
+            segments = mosaic_prescan._aggregate_hits(hits, meta)
+
+        self.assertEqual(len(segments), 2)
+        segs = sorted(segments, key=lambda s: s.start_s)
+        # A *time* split: the two windows are sequential, not two spatial clusters
+        # both spanning the whole run. (Union stays under the area cap throughout,
+        # so this split can only have come from the jump rule.)
+        self.assertLess(segs[0].end_s, 35.0)
+        self.assertAlmostEqual(segs[0].end_s, segs[1].start_s, delta=0.6)
+        eye_area = 4096 * 4096
+        self.assertLess(max((seg.w * seg.h) / eye_area for seg in segments), 0.30)
+
+    def test_position_jump_holds_until_min_duration(self) -> None:
+        # The same teleport, but it happens before ``jump_min_dur_s`` elapses and
+        # the union stays under the area cap -> no split (avoids tiny segments).
+        hits = []
+        for idx in range(100):
+            if idx < 20:  # ~9.5s at position A, shorter than jump_min_dur_s
+                box = (200.0, 200.0, 600.0, 600.0, 0.91)
+            else:
+                box = (1000.0, 200.0, 1400.0, 600.0, 0.92)
+            hits.append({"t": idx * 0.5, "boxes": [box]})
+        meta = VideoMetadata(path="synthetic.mp4", width=4096, height=4096, duration=52.0, source_fps=30.0)
+        cfg = {
+            "pre_extract_segment_max_area_ratio": 0.30,
+            "pre_extract_segment_jump_min_dur_s": 30.0,
+            "pre_extract_segment_min_dur_s": 10.0,
+        }
+
+        with patch.object(mosaic_prescan, "_cfg", side_effect=lambda key, default: cfg.get(key, default)):
+            segments = mosaic_prescan._aggregate_hits(hits, meta)
+
+        # No *time* split: A and B still become two spatial clusters, but both
+        # span the same (full) window -- proving the jump did not cut early.
+        self.assertEqual(len(segments), 2)
+        segs = sorted(segments, key=lambda s: s.start_s)
+        self.assertAlmostEqual(segs[0].start_s, segs[1].start_s, delta=0.5)
+        self.assertAlmostEqual(segs[0].end_s, segs[1].end_s, delta=0.5)
+
+    def test_two_simultaneous_small_mosaics_are_not_time_fragmented(self) -> None:
+        # Two small mosaics present at the same time but far apart: their combined
+        # bounding box spans most of the frame (> area cap), but each crop is tiny.
+        # The area cap is measured per spatial cluster, so this must NOT be sliced
+        # into many short windows -- it stays one window, split spatially into two
+        # long segments (the IPVR-385 over-fragmentation regression).
+        hits = []
+        for idx in range(160):  # 80s, both mosaics every sample
+            tl = (100.0, 100.0, 500.0, 500.0, 0.90)
+            br = (3500.0, 3500.0, 3900.0, 3900.0, 0.91)
+            hits.append({"t": idx * 0.5, "boxes": [tl, br]})
+        meta = VideoMetadata(path="synthetic.mp4", width=4096, height=4096, duration=82.0, source_fps=30.0)
+        cfg = {
+            "pre_extract_segment_max_area_ratio": 0.30,
+            "pre_extract_segment_jump_min_dur_s": 30.0,
+            "pre_extract_segment_min_dur_s": 10.0,
+        }
+
+        with patch.object(mosaic_prescan, "_cfg", side_effect=lambda key, default: cfg.get(key, default)):
+            segments = mosaic_prescan._aggregate_hits(hits, meta)
+
+        # Exactly two segments (one per region), both spanning the full run, both
+        # with a tiny crop -- no time fragmentation from the huge combined union.
+        self.assertEqual(len(segments), 2)
+        segs = sorted(segments, key=lambda s: s.start_s)
+        self.assertAlmostEqual(segs[0].start_s, segs[1].start_s, delta=0.5)
+        self.assertAlmostEqual(segs[0].end_s, segs[1].end_s, delta=0.5)
+        self.assertGreater(segs[0].end_s - segs[0].start_s, 60.0)
+        eye_area = 4096 * 4096
+        self.assertLess(max((s.w * s.h) / eye_area for s in segments), 0.10)
+
+    def test_area_growth_without_gap_splits_continuous_mosaic_run(self) -> None:
+        hits = []
+        for idx in range(60):
+            x = 200.0 + idx * 55.0
+            hits.append({"t": idx * 0.5, "boxes": [(x, 2200.0, x + 600.0, 3300.0, 0.90)]})
+        meta = VideoMetadata(path="synthetic.mp4", width=4096, height=4096, duration=32.0, source_fps=30.0)
+        cfg = {
+            "pre_extract_segment_max_area_ratio": 0.30,
+            "pre_extract_segment_cut_continuous_area": True,
+            "pre_extract_segment_min_dur_s": 5.0,
+        }
+
+        with patch.object(mosaic_prescan, "_cfg", side_effect=lambda key, default: cfg.get(key, default)):
+            segments = mosaic_prescan._aggregate_hits(hits, meta)
+
+        self.assertGreaterEqual(len(segments), 2)
+        eye_area = 4096 * 4096
+        self.assertLess(max((seg.w * seg.h) / eye_area for seg in segments), 0.40)
+
+    def test_large_stable_mosaic_is_not_fragmented(self) -> None:
+        # A single mosaic whose own expanded footprint already exceeds the area
+        # cap must stay one continuous segment: splitting cannot shrink the crop,
+        # it would only add model warmups and break temporal restoration.
+        box = (200.0, 200.0, 2600.0, 2600.0, 0.92)
+        hits = [{"t": idx * 0.5, "boxes": [box]} for idx in range(120)]
+        meta = VideoMetadata(path="synthetic.mp4", width=4096, height=4096, duration=62.0, source_fps=30.0)
+        cfg = {
+            "pre_extract_segment_max_area_ratio": 0.30,
+            "pre_extract_segment_cut_continuous_area": True,
+            "pre_extract_segment_min_dur_s": 10.0,
+        }
+
+        with patch.object(mosaic_prescan, "_cfg", side_effect=lambda key, default: cfg.get(key, default)):
+            segments = mosaic_prescan._aggregate_hits(hits, meta)
+
+        # Single spatial cluster, single time window -> exactly one segment.
+        self.assertEqual(len(segments), 1)
+        eye_area = 4096 * 4096
+        self.assertGreater((segments[0].w * segments[0].h) / eye_area, 0.30)
+
     def test_same_time_far_regions_produce_multiple_segments(self) -> None:
         hits = []
         for idx in range(8):

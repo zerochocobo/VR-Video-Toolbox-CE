@@ -68,9 +68,19 @@ class OffloadedTensor:
         return cls(cpu_tensor=cpu_tensor, original_device=tensor.device, ready_event=event)
 
     def to_device(self, device=None):
-        if self.ready_event is not None:
-            self.ready_event.synchronize()
+        import torch
+
         target = device or self.original_device
+        if self.ready_event is not None:
+            # Order the H->D restore after the D->H offload finished. Prefer a
+            # device-side wait (no host block) when restoring to a CUDA device so
+            # the consuming thread keeps issuing work; fall back to a host sync
+            # for CPU targets where there is no stream to enqueue the wait on.
+            target_dev = torch.device(target)
+            if target_dev.type == "cuda":
+                torch.cuda.current_stream(target_dev).wait_event(self.ready_event)
+            else:
+                self.ready_event.synchronize()
         return self.cpu_tensor.to(target, non_blocking=True)
 
 

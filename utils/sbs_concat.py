@@ -12,6 +12,7 @@ from gpu_engine import mux
 from gpu_engine import probe
 from gpu_engine import restored_sidecar
 from gpu_engine.fallback import OperationCancelled
+from utils import encode_config
 
 _SIGNATURE_FIELDS = (
     "codec",
@@ -365,27 +366,36 @@ def concat_timeline_hevc_fast(
         raise RuntimeError("fast merge parameter mismatch: " + "; ".join(mismatch_messages[:3]))
 
     try:
-        _concat_timeline_hevc_demuxer(
-            entries,
-            output,
-            source_meta=source_meta,
-            audio_source=audio_source,
-            log_callback=log_callback,
-            process_callback=process_callback,
-        )
-        return
-    except OperationCancelled:
-        raise
-    except Exception as exc:
-        if log_callback:
-            log_callback(
-                f"[source-scan] fast HEVC demuxer concat failed; "
-                f"falling back to annex-b stream merge: {type(exc).__name__}: {exc}"
-            )
+        from utils import app_config
+
+        use_demuxer = bool(app_config.get("source_scan_fast_hevc_demuxer", False))
+    except Exception:
+        use_demuxer = False
+    if use_demuxer:
         try:
-            output.unlink()
-        except OSError:
-            pass
+            _concat_timeline_hevc_demuxer(
+                entries,
+                output,
+                source_meta=source_meta,
+                audio_source=audio_source,
+                log_callback=log_callback,
+                process_callback=process_callback,
+            )
+            return
+        except OperationCancelled:
+            raise
+        except Exception as exc:
+            if log_callback:
+                log_callback(
+                    f"[source-scan] fast HEVC demuxer concat failed; "
+                    f"falling back to annex-b stream merge: {type(exc).__name__}: {exc}"
+                )
+            try:
+                output.unlink()
+            except OSError:
+                pass
+    elif log_callback:
+        log_callback("[source-scan] fast HEVC demuxer attempt disabled; using annex-b stream merge")
 
     temp_dir = Path(tempfile.mkdtemp(prefix=f"{output.stem}.fast_hevc_", dir=str(output.parent)))
     raw_parts: list[Path] = []
@@ -444,6 +454,7 @@ def concat_timeline(
     reencode: str = "auto",
     cq: int | None = 18,
     bitrate_bps: int | None = None,
+    max_bitrate_bps: int | None = None,
 ) -> None:
     """Concat timeline entries using video-only concat, then mux source audio once.
 
@@ -531,15 +542,25 @@ def concat_timeline(
             cmd += ["-map", "0:v:0", "-c:v", "copy", "-an", "-avoid_negative_ts", "make_zero"]
         else:
             first_meta = probe.probe_video(paths[0])
-            cmd += ["-map", "0:v:0", "-c:v", "hevc_nvenc", "-preset", "p7", "-rc", "vbr"]
-            cmd += ["-pix_fmt", "p010le" if int(first_meta.bit_depth) > 8 else "yuv420p", "-bf", "0"]
+            cmd += ["-map", "0:v:0"]
+            cmd += encode_config.build_ffmpeg_nvenc_base_args()
+            cmd += ["-rc", "vbr"]
+            cmd += encode_config.build_ffmpeg_pix_fmt_args(first_meta.bit_depth)
             if bitrate_bps and bitrate_bps > 0:
                 kbps = max(1, int(bitrate_bps / 1000))
-                cmd += ["-b:v", f"{kbps}k", "-maxrate:v", f"{int(kbps * 1.2)}k", "-bufsize:v", f"{int(kbps * 2)}k"]
+                if max_bitrate_bps and max_bitrate_bps > 0:
+                    maxrate = max(kbps, int(max_bitrate_bps / 1000))
+                else:
+                    # Final delivered re-encode: tighten the VBR peak so the output
+                    # converges near source instead of drifting toward a 2x peak.
+                    maxrate = max(kbps, int(kbps * encode_config.final_maxrate_multiplier()))
+                bufsize = max(int(kbps * 2), int(maxrate * 2))
+                cmd += ["-b:v", f"{kbps}k", "-maxrate:v", f"{maxrate}k", "-bufsize:v", f"{bufsize}k"]
             else:
                 cmd += ["-cq", str(int(cq if cq is not None else 18))]
             if first_meta.color is not None:
                 cmd += first_meta.color.ffmpeg_args()
+            cmd += encode_config.build_final_ffmpeg_reencode_tail_args(first_meta.source_fps)
             cmd += ["-an"]
         if copy_mode:
             size_hint = sum(path.stat().st_size for path in paths if path.exists())

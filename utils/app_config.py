@@ -37,11 +37,26 @@ _DEFAULTS = {
     'transcode_backend': 'auto',  # auto | gpu | ffmpeg
     'mosaic_engine': 'lada',      # lada | jasna | native_gpu placeholder, not implemented.
     'gpu_log_verbose': False,
-    'gpu_bitrate_multiplier': 2.0,  # Intermediate target bitrate = source bitrate * this. Decoupled from keep_original_bitrate so downstream re-encodes always keep headroom for high-detail regions.
+    'gpu_bitrate_multiplier': 1.2,  # Intermediate target bitrate = source bitrate * this. Keep intermediates clearer than source while limiting temp file size.
     'gpu_bitrate_final_multiplier': 1.0,  # Final OneClick outputs converge to source bitrate by default.
-    'gpu_encode_preset': 'P7',      # NVENC presets P1 fast/low quality through P7 slow/high quality; frontend may expose P4-P7.
+    'gpu_encode_profile': 'balanced_high_quality',  # UI-level profile; expands in utils.encode_config so every OneClick encode stage shares one definition. Known profiles take precedence; the raw keys below are read only for custom/unknown profiles.
+    'gpu_encode_preset': 'P4',      # Default profile is balanced high quality: P4 + AQ + fullres multipass.
+    'gpu_encode_multipass': 'fullres',  # off | qres | fullres. Two-pass RC improves 8K patch/background quality at fixed bitrate.
+    'gpu_encode_aq': True,          # Spatial AQ biases bits toward high-detail restored regions.
+    'gpu_encode_aq_strength': 6,     # FFmpeg/Lada spatial AQ strength; matches Lada's historical NVENC preset value.
+    'gpu_encode_temporal_aq': False, # Temporal AQ is config-gated pending visual flicker validation on motion-heavy videos.
+    'gpu_encode_maxrate_multiplier': 2.0,  # VBR peak cap when no explicit maxrate is supplied; gives extra headroom for detailed intermediate frames.
+    'gpu_final_encode_maxrate_multiplier': 1.1,  # Final delivered encode peak cap; keeps keep-bitrate outputs near source bitrate.
+    'gpu_final_encode_bframes': 2,  # Final ffmpeg re-encode only. Keep paste/crop frame-accurate paths at bf=0.
+    'gpu_final_encode_gop_sec': 2.0,  # Final ffmpeg re-encode GOP length in seconds; 0 disables explicit -g.
+    'native_stream_enabled': False,
+    'native_detection_model': '',
     'progress_log_interval_s': 5.0,
     'progress_log_min_pct': 5.0,
+    'progress_log_vram': True,
+    'progress_vram_query_interval_s': 5.0,
+    'progress_native_log_interval_s': 5.0,
+    'progress_native_log_min_pct': 20.0,
     'output_mp4_faststart': 'auto',  # auto | always | off. Auto disables faststart for very large muxes.
     # OneClick pre-extract: detect/crop mosaic time ranges and regions before sending them to lada/jasna.
     'pre_extract_detection_model': 'lada_vr_mosaic_detection_model_v2_accurate.pt',#'lada_vr_mosaic_detection_model_v2_fast.pt',
@@ -92,7 +107,10 @@ _DEFAULTS = {
     'source_scan_min_segment_s': 30.0,
     'source_scan_head_tail_pad_s': 5.0,
     'source_scan_max_segment_s': 0.0,
+    'source_scan_whole_source_min_coverage': 0.98,
+    'source_scan_whole_source_max_edge_gap_s': 15.0,
     'source_scan_keep_segments': False,
+    'source_scan_fast_hevc_demuxer': False,
     'source_scan_final_merge_mode': 'auto',  # auto | fast | gpu
 }
 
@@ -101,8 +119,25 @@ _CODE_DEFAULT_ONLY_KEYS = {
     'gpu_log_verbose',
     'gpu_bitrate_multiplier',
     'gpu_bitrate_final_multiplier',
+    'transcode_backend',
+    'mosaic_engine',
+    'gpu_encode_preset',
+    'gpu_encode_multipass',
+    'gpu_encode_aq',
+    'gpu_encode_aq_strength',
+    'gpu_encode_temporal_aq',
+    'gpu_encode_maxrate_multiplier',
+    'gpu_final_encode_maxrate_multiplier',
+    'gpu_final_encode_bframes',
+    'gpu_final_encode_gop_sec',
+    'native_stream_enabled',
+    'native_detection_model',
     'progress_log_interval_s',
     'progress_log_min_pct',
+    'progress_log_vram',
+    'progress_vram_query_interval_s',
+    'progress_native_log_interval_s',
+    'progress_native_log_min_pct',
     'output_mp4_faststart',
     'paste_passthrough_enabled',
     'paste_passthrough_min_frames',

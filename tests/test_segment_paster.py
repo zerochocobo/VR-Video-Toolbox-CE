@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from gpu_engine.fallback import OperationCancelled
-from gpu_engine.probe import VideoMetadata
+from gpu_engine.probe import ColorMetadata, VideoMetadata
 from utils.mosaic_prescan import MosaicSegment
 from utils.segment_paster import (
     PasteSeg,
@@ -87,6 +87,94 @@ class SegmentPasterTests(unittest.TestCase):
         self.assertIn("-an", captured["cmd"])
         self.assertNotIn("0:a?", captured["cmd"])
 
+    def test_ffmpeg_fallback_preserves_10bit_output_format(self) -> None:
+        segment = PasteSeg(
+            seg_id=0,
+            path=Path("restored.mp4"),
+            base_frame_start=30,
+            base_frame_end=60,
+            start_s=1.0,
+            end_s=2.0,
+            x=10,
+            y=20,
+            w=128,
+            h=128,
+        )
+        captured = {}
+        meta = VideoMetadata(
+            path="base.mp4",
+            width=1920,
+            height=1080,
+            bit_depth=10,
+            source_fps=60.0,
+            color=ColorMetadata("tv", "bt709", "bt709", "bt709"),
+        )
+
+        class Proc:
+            stdout = None
+            returncode = 0
+
+            def wait(self):
+                return 0
+
+        def fake_popen(cmd, **_kwargs):
+            captured["cmd"] = cmd
+            return Proc()
+
+        with (
+            patch("utils.segment_paster.probe.probe_video", return_value=meta),
+            patch("subprocess.Popen", side_effect=fake_popen),
+        ):
+            _paste_segments_ffmpeg("base.mp4", "out.mp4", [segment], keep_audio=False)
+
+        self.assertEqual(captured["cmd"][captured["cmd"].index("-pix_fmt") + 1], "p010le")
+        self.assertEqual(captured["cmd"][captured["cmd"].index("-profile:v") + 1], "main10")
+        self.assertIn("-color_trc", captured["cmd"])
+        self.assertEqual(captured["cmd"][captured["cmd"].index("-bf") + 1], "0")
+
+    def test_ffmpeg_paste_uses_explicit_max_bitrate(self) -> None:
+        # In the default fast-copy merge the paste output is delivered verbatim,
+        # so the paste honours an explicit tightened peak (final multiplier) rather
+        # than the looser intermediate maxrate_multiplier.
+        segment = PasteSeg(
+            seg_id=0,
+            path=Path("restored.mp4"),
+            base_frame_start=30,
+            base_frame_end=60,
+            start_s=1.0,
+            end_s=2.0,
+            x=10,
+            y=20,
+            w=128,
+            h=128,
+        )
+        captured = {}
+        meta = VideoMetadata(path="base.mp4", width=1920, height=1080, source_fps=60.0)
+
+        class Proc:
+            stdout = None
+            returncode = 0
+
+            def wait(self):
+                return 0
+
+        def fake_popen(cmd, **_kwargs):
+            captured["cmd"] = cmd
+            return Proc()
+
+        with (
+            patch("utils.segment_paster.probe.probe_video", return_value=meta),
+            patch("subprocess.Popen", side_effect=fake_popen),
+        ):
+            _paste_segments_ffmpeg(
+                "base.mp4", "out.mp4", [segment], keep_audio=False,
+                bitrate_bps=40_000_000, max_bitrate_bps=60_000_000,
+            )
+
+        cmd = captured["cmd"]
+        self.assertEqual(cmd[cmd.index("-b:v") + 1], "40000k")
+        self.assertEqual(cmd[cmd.index("-maxrate:v") + 1], "60000k")
+
     def test_ffmpeg_fallback_materializes_raw_hevc_inputs(self) -> None:
         segment = PasteSeg(
             seg_id=0,
@@ -114,14 +202,13 @@ class SegmentPasterTests(unittest.TestCase):
         materialized = paste_impl.call_args.args[2][0]
         self.assertEqual(materialized.path.suffix, ".mp4")
 
-    def test_gpu_paste_raw_hevc_failure_retries_with_wrapped_mp4(self) -> None:
+    def test_gpu_paste_raw_hevc_inputs_are_wrapped_before_first_paste(self) -> None:
         segment = MosaicSegment(0, 1.0, 2.0, 1.0, 2.0, 10, 20, 128, 128, 0.9)
         base_meta = VideoMetadata(path="base.mp4", width=1920, height=1080, duration=10.0, source_fps=30.0)
         raw_meta = VideoMetadata(path="restored.hevc", width=128, height=128, duration=1.0, source_fps=30.0)
 
         def fake_gpu(_src, _dst, segs, **_kwargs):
-            if segs[0].path.suffix.lower() == ".hevc":
-                raise RuntimeError("raw decode failed")
+            self.assertEqual(segs[0].path.suffix.lower(), ".mp4")
             return None
 
         with (
@@ -139,9 +226,8 @@ class SegmentPasterTests(unittest.TestCase):
                 keep_audio=False,
             )
 
-        self.assertEqual(paste_gpu.call_count, 2)
-        self.assertEqual(paste_gpu.call_args_list[0].args[2][0].path.suffix, ".hevc")
-        self.assertEqual(paste_gpu.call_args_list[1].args[2][0].path.suffix, ".mp4")
+        self.assertEqual(paste_gpu.call_count, 1)
+        self.assertEqual(paste_gpu.call_args.args[2][0].path.suffix, ".mp4")
         mux_raw.assert_called_once()
         paste_ffmpeg.assert_not_called()
 

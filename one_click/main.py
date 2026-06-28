@@ -4,7 +4,7 @@ import threading
 import os
 import locale
 import time
-from utils import app_config, i18n
+from utils import app_config, encode_config, i18n
 
 # Import logic module - use try/except to handle both direct run and import from main
 try:
@@ -30,6 +30,7 @@ class VRMosaicOneClickApp:
         self.root = root
         self.on_return = on_return
         self.root.title(get_text('title'))
+        self._pre_extract_rows = []
         
         # Main Frame to hold everything
         main_frame = ttk.Frame(root, padding="10")
@@ -75,6 +76,13 @@ class VRMosaicOneClickApp:
         lang = app_config.get_language()
         return {'zh': zh, 'en': en, 'ja': ja}.get(lang, zh)
 
+    def _show_pre_extract_hint(self):
+        messagebox.showinfo(
+            get_text('opt_pre_extract_hint_title'),
+            get_text('opt_pre_extract_hint'),
+            parent=self.root,
+        )
+
     def _grid_pre_extract_check(self, parent, enabled_variable, conf_variable, row):
         frame = ttk.Frame(parent)
         frame.grid(row=row, column=0, columnspan=2, sticky='w', padx=5, pady=5)
@@ -86,7 +94,27 @@ class VRMosaicOneClickApp:
             width=5,
             values=_FINE_CONF_VALUES,
         ).pack(side='left', padx=(8, 0))
+        ttk.Button(frame, text='?', width=2, command=self._show_pre_extract_hint).pack(side='left', padx=(8, 0))
+        self._pre_extract_rows.append((frame, enabled_variable))
+        self._refresh_pre_extract_visibility()
         return frame
+
+    def _selected_encode_profile_key(self) -> str:
+        if hasattr(self, "encode_profile_var"):
+            return self._encode_profile_disp_to_key.get(
+                self.encode_profile_var.get(),
+                encode_config.DEFAULT_ENCODE_PROFILE,
+            )
+        return self._current_encode_profile() or "custom"
+
+    def _refresh_pre_extract_visibility(self) -> None:
+        hide = self._selected_encode_profile_key() == "highest_quality"
+        for frame, enabled_variable in getattr(self, "_pre_extract_rows", []):
+            if hide:
+                enabled_variable.set(False)
+                frame.grid_remove()
+            else:
+                frame.grid()
 
     def _selected_fine_conf(self, variable):
         try:
@@ -99,48 +127,62 @@ class VRMosaicOneClickApp:
             return float(_DEFAULT_FINE_CONF)
 
     def create_settings_bar(self, parent):
-        """Quality/speed dropdown mapped to NVENC encode presets P4-P7.
+        """User-facing GPU encode profile selector.
 
-        NVENC preset semantics are counterintuitive: P7 is slowest/highest
-        quality, while P4 is faster with slightly lower quality.
+        The UI intentionally exposes a few semantic profiles instead of raw
+        NVENC preset/AQ/multipass combinations. The concrete encoder kwargs are
+        still logged by gpu_engine.files for real-machine testing.
         """
         bar = ttk.Frame(parent)
         bar.pack(fill='x', pady=(0, 8))
 
-        label = self._tr('画质 / 速度：', 'Quality / Speed:', '画質 / 速度：')
-        ttk.Label(bar, text=label).pack(side='left', padx=(0, 5))
+        ttk.Label(bar, text=get_text('lbl_encode_profile')).pack(side='left', padx=(0, 5))
 
-        # (display text, preset value), ordered from higher quality to faster; include NVENC preset codes for advanced users.
-        opts = [
-            (self._tr('最高画质（最慢）', 'Best quality (slowest)', '最高画質（最も遅い）') + ' [P7]', 'P7'),
-            (self._tr('高画质', 'High quality', '高画質') + ' [P6]', 'P6'),
-            (self._tr('均衡', 'Balanced', 'バランス') + ' [P5]', 'P5'),
-            (self._tr('快速（画质略低）', 'Fast (lower quality)', '高速（画質やや低）') + ' [P4]', 'P4'),
-        ]
-        self._preset_disp_to_val = {d: v for d, v in opts}
-        self._preset_val_to_disp = {v: d for d, v in opts}
+        labels = {
+            "highest_quality": get_text('opt_encode_highest_quality'),
+            "balanced_high_quality": get_text('opt_encode_balanced_high_quality'),
+            "fast_quality": get_text('opt_encode_fast_quality'),
+            "ultra_fast_normal": get_text('opt_encode_ultra_fast_normal'),
+        }
+        opts = [(labels[key], key) for key in encode_config.get_profile_keys()]
+        cur = self._current_encode_profile()
+        if cur is None:
+            custom_label = get_text('opt_encode_custom')
+            opts.append((custom_label, "custom"))
+            cur = "custom"
 
-        cur = str(app_config.get('gpu_encode_preset', 'P7') or 'P7').upper()
-        if cur not in self._preset_val_to_disp:
-            cur = 'P7'
-
-        self.preset_var = tk.StringVar(value=self._preset_val_to_disp[cur])
-        combo = ttk.Combobox(bar, textvariable=self.preset_var, state='readonly',
-                             width=26, values=[d for d, _ in opts])
+        self._encode_profile_disp_to_key = {d: v for d, v in opts}
+        self._encode_profile_key_to_disp = {v: d for d, v in opts}
+        self.encode_profile_var = tk.StringVar(value=self._encode_profile_key_to_disp[cur])
+        combo = ttk.Combobox(bar, textvariable=self.encode_profile_var, state='readonly',
+                             width=32, values=[d for d, _ in opts])
         combo.pack(side='left')
-        combo.bind('<<ComboboxSelected>>', self._on_preset_change)
+        combo.bind('<<ComboboxSelected>>', self._on_encode_profile_change)
 
-        hint = self._tr('（仅影响显卡编码，越快画质越低）',
-                        '(GPU encode only; faster = lower quality)',
-                        '（GPUエンコードのみ。速いほど画質低）')
-        ttk.Label(bar, text=hint, foreground='gray').pack(side='left', padx=8)
+        ttk.Label(bar, text=get_text('hint_encode_profile'), foreground='gray').pack(side='left', padx=8)
 
-    def _on_preset_change(self, event=None):
-        val = self._preset_disp_to_val.get(self.preset_var.get(), 'P7')
-        app_config.set('gpu_encode_preset', val)
-        self.log_to_all(self._tr(f'画质/速度已设为 {val}',
-                                 f'Quality/Speed set to {val}',
-                                 f'画質/速度を {val} に設定'))
+    def _current_encode_profile(self) -> str | None:
+        return encode_config.current_encode_profile_key()
+
+    def _apply_encode_profile(self, key: str) -> None:
+        encode_config.apply_encode_profile(key)
+
+    def _on_encode_profile_change(self, event=None):
+        key = self._encode_profile_disp_to_key.get(self.encode_profile_var.get(), encode_config.DEFAULT_ENCODE_PROFILE)
+        if key == "custom":
+            self._refresh_pre_extract_visibility()
+            return
+        self._apply_encode_profile(key)
+        self._refresh_pre_extract_visibility()
+        label = self._encode_profile_key_to_disp.get(key, key)
+        profile = encode_config.resolve_encode_settings(key)
+        self.log_to_all(get_text('log_encode_profile_set').format(
+            profile=label,
+            preset=profile.preset,
+            multipass=profile.multipass,
+            aq="on" if profile.aq else "off",
+            temporal_aq="on" if profile.temporal_aq else "off",
+        ))
 
     def log_to_widget(self, widget, message):
         def _do():

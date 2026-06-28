@@ -6,11 +6,18 @@ mode.
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
+import sys
 import threading
+import time
 from dataclasses import dataclass
 
 _lock = threading.Lock()
 _state: "GpuState | None" = None
+_vram_lock = threading.Lock()
+_vram_cache: dict[tuple[int, str], tuple[float, "VramUsage | None"]] = {}
+_vram_refreshing: set[tuple[int, str]] = set()
 
 
 @dataclass(frozen=True)
@@ -27,6 +34,157 @@ class GpuState:
     @property
     def compute_capability(self) -> float:
         return float(f"{self.cc_major}.{self.cc_minor}")
+
+
+@dataclass(frozen=True)
+class VramUsage:
+    used_mib: int
+    total_mib: int
+    device_index: int = 0
+    smi_id: str = ""
+
+    @property
+    def used_gib(self) -> float:
+        return float(self.used_mib) / 1024.0
+
+    @property
+    def total_gib(self) -> float:
+        return float(self.total_mib) / 1024.0
+
+
+def _nvidia_smi_path() -> str | None:
+    path = shutil.which("nvidia-smi")
+    if path:
+        return path
+    if sys.platform.startswith("win"):
+        system_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR")
+        if system_root:
+            candidate = os.path.join(system_root, "System32", "nvidia-smi.exe")
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+def _hidden_subprocess_kwargs(timeout_s: float) -> dict:
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.DEVNULL,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "timeout": max(0.1, float(timeout_s)),
+    }
+    if sys.platform.startswith("win"):
+        creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
+        if creationflags:
+            kwargs["creationflags"] = creationflags
+        try:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = int(getattr(subprocess, "SW_HIDE", 0) or 0)
+            kwargs["startupinfo"] = startupinfo
+        except Exception:
+            pass
+    return kwargs
+
+
+def _current_cuda_device_index(default: int = 0) -> int:
+    cp = sys.modules.get("cupy")
+    if cp is not None:
+        try:
+            return int(cp.cuda.runtime.getDevice())
+        except Exception:
+            pass
+    torch = sys.modules.get("torch")
+    if torch is not None:
+        try:
+            if torch.cuda.is_available():
+                return int(torch.cuda.current_device())
+        except Exception:
+            pass
+    return int(default)
+
+
+def _resolve_cuda_device_index(device_index: int | None) -> int:
+    if device_index is None:
+        return _current_cuda_device_index(0)
+    return int(device_index)
+
+
+def _nvidia_smi_id_for_cuda_device(device_index: int | None) -> tuple[int, str]:
+    logical_index = _resolve_cuda_device_index(device_index)
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible and visible.lower() not in {"-1", "none", "nodevfiles"}:
+        devices = [part.strip() for part in visible.split(",") if part.strip()]
+        if 0 <= logical_index < len(devices):
+            return logical_index, devices[logical_index]
+    return logical_index, str(logical_index)
+
+
+def _parse_nvidia_smi_memory(stdout: str, device_index: int, smi_id: str | None = None) -> VramUsage | None:
+    lines = [line.strip() for line in str(stdout or "").splitlines() if line.strip()]
+    if not lines:
+        return None
+    parts = [part.strip().replace("MiB", "").replace("Mib", "") for part in lines[0].split(",")]
+    if len(parts) < 2:
+        return None
+    try:
+        used = int(float(parts[0]))
+        total = int(float(parts[1]))
+    except Exception:
+        return None
+    if used < 0 or total <= 0:
+        return None
+    return VramUsage(used_mib=used, total_mib=total, device_index=int(device_index), smi_id=str(smi_id or device_index))
+
+
+def query_vram_usage(*, device_index: int | None = None, min_interval_s: float = 2.0,
+                     timeout_s: float = 0.8, force: bool = False) -> VramUsage | None:
+    """Return current NVIDIA VRAM usage via nvidia-smi, silently cached/throttled."""
+    now = time.monotonic()
+    logical_index, smi_id = _nvidia_smi_id_for_cuda_device(device_index)
+    key = (logical_index, smi_id)
+    min_interval = max(0.0, float(min_interval_s))
+    with _vram_lock:
+        cached_time, cached = _vram_cache.get(key, (0.0, None))
+        if not force and (now - cached_time) < min_interval:
+            return cached
+        if key in _vram_refreshing:
+            return cached
+        _vram_refreshing.add(key)
+
+    smi = _nvidia_smi_path()
+    if not smi:
+        usage = None
+    else:
+        cmd = [
+            smi,
+            f"--id={smi_id}",
+            "--query-gpu=memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ]
+        try:
+            proc = subprocess.run(cmd, **_hidden_subprocess_kwargs(timeout_s))
+            usage = _parse_nvidia_smi_memory(
+                getattr(proc, "stdout", ""),
+                logical_index,
+                smi_id=smi_id,
+            ) if proc.returncode == 0 else None
+        except Exception:
+            usage = None
+
+    with _vram_lock:
+        _vram_cache[key] = (time.monotonic(), usage)
+        _vram_refreshing.discard(key)
+        return usage
+
+
+def format_vram_usage(*, device_index: int | None = None, min_interval_s: float = 2.0) -> str:
+    usage = query_vram_usage(device_index=device_index, min_interval_s=min_interval_s)
+    if usage is None:
+        return ""
+    return f" | VRAM {usage.used_gib:.1f}/{usage.total_gib:.1f} GiB"
 
 
 def _detect() -> GpuState:

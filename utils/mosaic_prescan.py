@@ -12,7 +12,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from gpu_engine import probe
+from gpu_engine import probe, runtime
 
 
 _DETECTOR = None
@@ -65,6 +65,20 @@ def _cfg(key: str, default):
         return default if value is None else value
     except Exception:
         return default
+
+
+def _cfg_bool(key: str, default: bool) -> bool:
+    value = _cfg(key, default)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no", "off"}
+    return bool(value)
+
+
+def _vram_suffix() -> str:
+    if not _cfg_bool("progress_log_vram", True):
+        return ""
+    interval_s = float(_cfg("progress_vram_query_interval_s", 5.0) or 0.0)
+    return runtime.format_vram_usage(min_interval_s=max(0.0, interval_s))
 
 
 def _hidden_kwargs() -> dict:
@@ -749,7 +763,10 @@ def _scan_hits(video_path: str | Path, log_callback=None, cancel_token=None,
                 last_log = now
                 pct = 100.0 * min(frame_idx + 1, total_frames) / total_frames
                 elapsed = max(0.001, now - t0)
-                log_callback(f"[pre-extract] scanned {sampled} samples ({pct:.1f}%) at {sampled / elapsed:.1f} samples/s")
+                log_callback(
+                    f"[pre-extract] scanned {sampled} samples ({pct:.1f}%) "
+                    f"at {sampled / elapsed:.1f} samples/s{_vram_suffix()}"
+                )
             frame_idx += 1
         _flush_batch()
     finally:
@@ -792,16 +809,35 @@ def _keyframe_scan_meta(video_path: str | Path, src_meta: probe.VideoMetadata,
     )
 
 
+def _list_source_scan_keyframes(video_path: str | Path, log_callback=None) -> list[float]:
+    from utils.keyframe_cutter import list_keyframes
+
+    if log_callback:
+        log_callback("[source-scan] listing source keyframes...")
+    t0 = time.perf_counter()
+    keyframes = list_keyframes(video_path)
+    elapsed = time.perf_counter() - t0
+    if log_callback:
+        if keyframes:
+            max_gap = max((b - a) for a, b in zip(keyframes, keyframes[1:])) if len(keyframes) > 1 else 0.0
+            log_callback(
+                f"[source-scan] source keyframes listed: {len(keyframes)} "
+                f"in {elapsed:.1f}s, max_gap={max_gap:.3f}s"
+            )
+        else:
+            log_callback(f"[source-scan] source keyframe list is empty after {elapsed:.1f}s")
+    return keyframes
+
+
 def _scan_hits_keyframes_lowres(video_path: str | Path, log_callback=None,
                                 cancel_token=None,
                                 min_conf: float | None = None) -> tuple[list[dict], probe.VideoMetadata, list[dict]]:
     import numpy as np
     import torch
     from gpu_engine.fallback import OperationCancelled
-    from utils.keyframe_cutter import list_keyframes
 
     meta = probe.probe_video(video_path)
-    keyframes = list_keyframes(video_path)
+    keyframes = _list_source_scan_keyframes(video_path, log_callback=log_callback)
     if not keyframes:
         if log_callback:
             log_callback("[source-scan] no keyframe list available; falling back to normal scan")
@@ -891,7 +927,10 @@ def _scan_hits_keyframes_lowres(video_path: str | Path, log_callback=None,
                 last_log = now
                 pct = 100.0 * min(sampled, len(keyframes)) / max(1, len(keyframes))
                 elapsed = max(0.001, now - t0)
-                log_callback(f"[source-scan] scanned {sampled} keyframes ({pct:.1f}%) at {sampled / elapsed:.1f} samples/s")
+                log_callback(
+                    f"[source-scan] scanned {sampled} keyframes ({pct:.1f}%) "
+                    f"at {sampled / elapsed:.1f} samples/s{_vram_suffix()}"
+                )
         _flush_batch()
     finally:
         if proc.stdout:
@@ -914,13 +953,12 @@ def _scan_hits_keyframes_gpu(video_path: str | Path, log_callback=None,
                              min_conf: float | None = None) -> tuple[list[dict], probe.VideoMetadata, list[dict]]:
     import PyNvVideoCodec as nvc
     from gpu_engine.fallback import OperationCancelled
-    from utils.keyframe_cutter import list_keyframes
 
     src_meta, decision = probe.route(video_path)
     if not decision.is_gpu:
         raise RuntimeError(f"source keyframe GPU scan is not available: {decision.reason}")
 
-    keyframes = list_keyframes(video_path)
+    keyframes = _list_source_scan_keyframes(video_path, log_callback=log_callback)
     if not keyframes:
         raise RuntimeError("no keyframe list available for GPU keyframe scan")
 
@@ -1015,7 +1053,7 @@ def _scan_hits_keyframes_gpu(video_path: str | Path, log_callback=None,
                     elapsed = max(0.001, now - t0)
                     log_callback(
                         f"[source-scan] scanned {sampled} GPU keyframes ({pct:.1f}%) "
-                        f"at {sampled / elapsed:.1f} samples/s"
+                        f"at {sampled / elapsed:.1f} samples/s{_vram_suffix()}"
                     )
 
         while True:
@@ -1026,7 +1064,7 @@ def _scan_hits_keyframes_gpu(video_path: str | Path, log_callback=None,
                 elapsed = max(0.001, now - t0)
                 log_callback(
                     f"[source-scan] scanned {sampled} GPU keyframes ({pct:.1f}%) "
-                    f"at {sampled / elapsed:.1f} samples/s"
+                    f"at {sampled / elapsed:.1f} samples/s{_vram_suffix()}"
                 )
             if cancel_token is not None and getattr(cancel_token, "cancelled", False):
                 raise OperationCancelled("cancelled by user")
@@ -1520,7 +1558,8 @@ def _scan_hits_gpu_transform_pair(video_path: str | Path, *, crop_modes: tuple[s
                 pct = 100.0 * min(frame_idx + 1, total_frames) / max(1, total_frames)
                 elapsed = max(0.001, now - t0)
                 log_callback(
-                    f"[pre-extract] scanned {sampled} GPU samples ({pct:.1f}%) at {sampled / elapsed:.1f} samples/s"
+                    f"[pre-extract] scanned {sampled} GPU samples ({pct:.1f}%) "
+                    f"at {sampled / elapsed:.1f} samples/s{_vram_suffix()}"
                 )
         _flush_batch()
         if log_callback:
@@ -1705,7 +1744,10 @@ def _scan_hits_gpu_transform(video_path: str | Path, *, crop_mode: str,
                 last_log = now
                 pct = 100.0 * min(frame_idx + 1, total_frames) / max(1, total_frames)
                 elapsed = max(0.001, now - t0)
-                log_callback(f"[pre-extract] scanned {sampled} GPU samples ({pct:.1f}%) at {sampled / elapsed:.1f} samples/s")
+                log_callback(
+                    f"[pre-extract] scanned {sampled} GPU samples ({pct:.1f}%) "
+                    f"at {sampled / elapsed:.1f} samples/s{_vram_suffix()}"
+                )
         _flush_batch()
         if log_callback:
             log_callback(f"[pre-extract] detector hits: {len(hits)} transformed sampled frames")
@@ -1763,36 +1805,173 @@ def _segment_area_ratio(union: tuple[float, float, float, float] | None,
     return float(max(0, w) * max(0, h)) / float(fa)
 
 
+def _union_overlap_ratio(a: tuple[float, float, float, float] | None,
+                         b: tuple[float, float, float, float] | None) -> float:
+    """Intersection over the smaller raw union area, used to spot abrupt jumps."""
+    if a is None or b is None:
+        return 1.0
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    iw = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+    ih = max(0.0, min(ay2, by2) - max(ay1, by1))
+    inter = iw * ih
+    area_a = max(1.0, (ax2 - ax1) * (ay2 - ay1))
+    area_b = max(1.0, (bx2 - bx1) * (by2 - by1))
+    return float(inter) / float(max(1.0, min(area_a, area_b)))
+
+
+def _union_center_delta_ratio(a: tuple[float, float, float, float] | None,
+                              b: tuple[float, float, float, float] | None,
+                              frame_w: int, frame_h: int) -> float:
+    """Largest normalized center movement between two adjacent sample unions."""
+    if a is None or b is None:
+        return 0.0
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    acx = (ax1 + ax2) * 0.5
+    acy = (ay1 + ay2) * 0.5
+    bcx = (bx1 + bx2) * 0.5
+    bcy = (by1 + by2) * 0.5
+    return max(
+        abs(acx - bcx) / float(max(1, int(frame_w))),
+        abs(acy - bcy) / float(max(1, int(frame_h))),
+    )
+
+
+def _sample_position_jump(prev_union: tuple[float, float, float, float] | None,
+                          cur_union: tuple[float, float, float, float] | None,
+                          frame_w: int, frame_h: int,
+                          *, min_overlap: float, center_ratio: float) -> bool:
+    if prev_union is None or cur_union is None:
+        return False
+    if _union_overlap_ratio(prev_union, cur_union) < min_overlap:
+        return True
+    if center_ratio > 0.0 and _union_center_delta_ratio(prev_union, cur_union, frame_w, frame_h) > center_ratio:
+        return True
+    return False
+
+
+def _sample_boxes_for_split(boxes) -> list:
+    """Boxes used for window splitting; ignore obvious low-confidence strays.
+
+    A single box is always kept (even when low-confidence); with several boxes
+    the low-confidence ones are dropped only if at least one confident box
+    remains, so a flickering stray never inflates the split geometry.
+    """
+    split_boxes = list(boxes or [])
+    if len(split_boxes) > 1:
+        try:
+            min_conf = float(_cfg("pre_extract_split_min_box_conf", _cfg("pre_extract_far_box_min_conf", 0.50)) or 0.0)
+        except (TypeError, ValueError):
+            min_conf = 0.50
+        confident = [b for b in split_boxes if len(b) < 5 or float(b[4]) >= min_conf]
+        if confident:
+            split_boxes = confident
+    return split_boxes
+
+
+def _sample_union_for_split(boxes, frame_w: int, frame_h: int) -> tuple[float, float, float, float] | None:
+    return _union4(_sample_boxes_for_split(boxes))
+
+
+def _split_cluster_gap_px(frame_w: int, frame_h: int) -> int:
+    """Spatial-merge gap, mirroring ``_spatial_cluster`` so the split-time crop
+    estimate matches the per-cluster rects produced downstream."""
+    gap_ratio = float(_cfg("pre_extract_cluster_gap_ratio", 0.03) or 0.03)
+    return max(20, int(min(frame_w, frame_h) * gap_ratio))
+
+
+def _merge_boxes_into_cluster_rects(rects: list[list[float]], boxes, gap_px: int) -> list[list[float]]:
+    """Single-linkage merge of ``boxes`` into existing cluster bounding rects.
+
+    A drifting mosaic chains into one growing rect (so its crop area grows and
+    eventually trips the cap, keeping each crop tight); spatially separate
+    mosaics stay distinct rects (so two simultaneous small mosaics never look
+    like one oversized crop and never trigger a pointless time split).
+    """
+    out = [list(r) for r in rects]
+    for b in boxes:
+        merged = [float(b[0]), float(b[1]), float(b[2]), float(b[3])]
+        keep: list[list[float]] = []
+        for r in out:
+            if (r[2] + gap_px >= merged[0] and merged[2] + gap_px >= r[0]
+                    and r[3] + gap_px >= merged[1] and merged[3] + gap_px >= r[1]):
+                merged[0] = min(merged[0], r[0])
+                merged[1] = min(merged[1], r[1])
+                merged[2] = max(merged[2], r[2])
+                merged[3] = max(merged[3], r[3])
+            else:
+                keep.append(r)
+        keep.append(merged)
+        out = keep
+    return out
+
+
+def _cluster_rects_for_samples(samples: list[tuple[float, list]], gap_px: int) -> list[list[float]]:
+    rects: list[list[float]] = []
+    for _t, boxes in samples:
+        rects = _merge_boxes_into_cluster_rects(rects, _sample_boxes_for_split(boxes), gap_px)
+    return rects
+
+
+def _max_cluster_area_ratio(rects: list[list[float]], frame_w: int, frame_h: int) -> float:
+    """Largest expanded-crop area ratio across the per-cluster bounding rects."""
+    best = 0.0
+    for r in rects:
+        best = max(best, _segment_area_ratio((r[0], r[1], r[2], r[3]), frame_w, frame_h))
+    return best
+
+
 def _split_samples_by_area(samples: list[tuple[float, list]], frame_w: int, frame_h: int,
                            *, max_area_ratio: float, cut_gap_s: float,
                            min_dur_s: float,
                            scene_cuts: list[float] | None = None) -> list[list[tuple[float, list]]]:
     """Split a time-ordered sample run into sub-windows.
 
-    Two complementary triggers:
+    The area cap is measured **per spatial cluster** (the actual crop), not on
+    the combined bounding box of every mosaic in the frame. Two simultaneous
+    far-apart mosaics are two small crops, so they no longer look like one
+    oversized crop and do not get pointlessly time-split (the spatial split is
+    done downstream by ``_spatial_cluster``). A single mosaic that drifts grows
+    one cluster rect until it trips the cap, which is the only case where cutting
+    actually keeps the crop tight.
+
+    Triggers:
 
     * **Scene cut** (whole-frame, from the histogram detector): a hard boundary
       at the cut time regardless of mosaic state -- handles videos made of
       distinct shots. Empty on single-shot footage.
-    * **Crop area** (mosaic drift within a shot): a new sub-window starts only
-      at a mosaic-free gap (>= ``cut_gap_s``), so cuts never land inside
-      continuous mosaic (which would break the temporal restoration). A cut
-      happens when the running crop rect would grow past ``max_area_ratio`` and
-      the segment so far is at least ``min_dur_s`` long. With no gap to cut at,
-      the window is forced to keep growing (rare; bounded in practice).
+    * **Position jump** (mosaic teleports to a clearly different place): an
+      independent trigger, *not* gated by area -- cut before the jumped sample
+      as long as the window being closed is at least ``jump_min_dur_s`` long
+      (so warmup does not dominate a tiny window). Smooth drift never trips it.
+    * **Crop area** (one cluster drifts/grows within a shot): when the largest
+      cluster crop would grow past ``max_area_ratio``, prefer a mosaic-free gap
+      (>= ``cut_gap_s``); otherwise cut before the current sample once the
+      window is at least ``min_dur_s`` long, but only when the new window would
+      itself start under budget (splitting an already-oversized single mosaic
+      gains nothing).
     """
     if len(samples) <= 1:
         return [samples]
     cuts = sorted(float(c) for c in (scene_cuts or []))
     sc_idx = 0
     area_enabled = max_area_ratio > 0.0
+    continuous_cut = bool(_cfg("pre_extract_segment_cut_continuous_area", True))
+    jump_min_overlap = float(_cfg("pre_extract_segment_jump_min_overlap", 0.10) or 0.0)
+    jump_center_ratio = float(_cfg("pre_extract_segment_jump_center_ratio", 0.18) or 0.0)
+    jump_min_dur_s = float(_cfg("pre_extract_segment_jump_min_dur_s", 30.0) or 0.0)
+    gap_px = _split_cluster_gap_px(frame_w, frame_h)
 
     out: list[list[tuple[float, list]]] = []
     seg_start = 0
     last_gap = None  # index i such that a cuttable gap precedes samples[i]
-    union: tuple[float, float, float, float] | None = None
+    cluster_rects: list[list[float]] = []  # per-cluster rects for samples[seg_start:i]
+    prev_sample_union: tuple[float, float, float, float] | None = None
 
     for i, (t, boxes) in enumerate(samples):
+        cur_boxes = _sample_boxes_for_split(boxes)
+        bu = _union4(cur_boxes)
         # Forced scene-cut boundary between samples[i-1] and samples[i].
         if cuts and i > seg_start:
             prev_t = samples[i - 1][0]
@@ -1801,29 +1980,78 @@ def _split_samples_by_area(samples: list[tuple[float, list]], frame_w: int, fram
             if sc_idx < len(cuts) and prev_t < cuts[sc_idx] <= t:
                 out.append(samples[seg_start:i])
                 seg_start = i
-                union = _union4(boxes)
+                cluster_rects = _merge_boxes_into_cluster_rects([], cur_boxes, gap_px)
                 last_gap = None
+                prev_sample_union = bu
                 continue
 
         if i > seg_start and last_gap != i and (t - samples[i - 1][0]) > cut_gap_s:
             last_gap = i
-        tentative = union
-        bu = _union4(boxes)
-        if bu is not None:
-            tentative = bu if tentative is None else (
-                min(tentative[0], bu[0]), min(tentative[1], bu[1]),
-                max(tentative[2], bu[2]), max(tentative[3], bu[3]),
+
+        prev_window_dur = max(0.0, float(samples[i - 1][0]) - float(samples[seg_start][0])) if i > seg_start else 0.0
+
+        # Position jump: a mosaic that teleports to a clearly different place
+        # starts a new crop window. This is its *own* reason to cut, independent
+        # of the area cap -- but still time-gated by ``jump_min_dur_s`` so the
+        # window we close is not so short that model warmup dominates it. Smooth
+        # drift never trips this (adjacent samples overlap heavily); only real
+        # teleports do, so it does not fragment a slowly moving mosaic. We favour
+        # cutting over letting a crop grow, so a jump still cuts even when the new
+        # window's crop ends up similar in size.
+        if (
+            cluster_rects
+            and i > seg_start
+            and prev_window_dur >= jump_min_dur_s
+            and _sample_position_jump(
+                prev_sample_union,
+                bu,
+                frame_w,
+                frame_h,
+                min_overlap=jump_min_overlap,
+                center_ratio=jump_center_ratio,
             )
-        if area_enabled and union is not None \
-                and _segment_area_ratio(tentative, frame_w, frame_h) > max_area_ratio \
-                and last_gap is not None and last_gap > seg_start \
-                and (samples[last_gap - 1][0] - samples[seg_start][0]) >= min_dur_s:
-            out.append(samples[seg_start:last_gap])
-            seg_start = last_gap
-            union = _union4([b for _, bs in samples[seg_start:i + 1] for b in bs])
+        ):
+            out.append(samples[seg_start:i])
+            seg_start = i
+            cluster_rects = _merge_boxes_into_cluster_rects([], cur_boxes, gap_px)
             last_gap = None
-        else:
-            union = tentative
+            prev_sample_union = bu
+            continue
+
+        tentative_rects = _merge_boxes_into_cluster_rects(cluster_rects, cur_boxes, gap_px)
+        if area_enabled and cluster_rects and _max_cluster_area_ratio(tentative_rects, frame_w, frame_h) > max_area_ratio:
+            cut_at: int | None = None
+            if (
+                last_gap is not None
+                and last_gap > seg_start
+                and (samples[last_gap - 1][0] - samples[seg_start][0]) >= min_dur_s
+            ):
+                cut_at = last_gap
+            elif (
+                continuous_cut
+                and i > seg_start
+                and prev_window_dur >= min_dur_s
+                and _max_cluster_area_ratio(
+                    _merge_boxes_into_cluster_rects([], cur_boxes, gap_px), frame_w, frame_h
+                ) <= max_area_ratio
+            ):
+                # Only worth cutting if the new window would actually start under
+                # budget. A single mosaic whose own footprint already exceeds
+                # ``max_area_ratio`` cannot be made smaller by splitting, so cutting
+                # would just fragment a continuous run into many same-size crops
+                # (extra model warmups, worse temporal restoration) for nothing.
+                cut_at = i
+
+            if cut_at is not None:
+                out.append(samples[seg_start:cut_at])
+                seg_start = cut_at
+                cluster_rects = _cluster_rects_for_samples(samples[seg_start:i + 1], gap_px)
+                last_gap = None
+                prev_sample_union = bu
+                continue
+
+        cluster_rects = tentative_rects
+        prev_sample_union = bu if bu is not None else prev_sample_union
 
     out.append(samples[seg_start:])
     return [s for s in out if s]
@@ -1839,7 +2067,7 @@ def _aggregate_hits(hits: list[dict], meta: probe.VideoMetadata,
     pad_s = float(_cfg("pre_extract_head_tail_pad_s", 2.0) or 2.0)
     min_segment_s = float(_cfg("pre_extract_min_segment_s", 1.5) or 1.5)
 
-    max_area_ratio = float(_cfg("pre_extract_segment_max_area_ratio", 0.33) or 0.0)
+    max_area_ratio = float(_cfg("pre_extract_segment_max_area_ratio", 0.30) or 0.0)
     cut_gap_s = float(_cfg("pre_extract_segment_cut_gap_s", 0.75) or 0.75)
     seg_min_dur_s = float(_cfg("pre_extract_segment_min_dur_s", 10.0) or 0.0)
 

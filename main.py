@@ -18,6 +18,8 @@ _app_dir = os.path.dirname(os.path.abspath(__file__))
 if _app_dir not in sys.path:
     sys.path.insert(0, _app_dir)
 
+from tool_dlna import media_library as dlna_media_library
+
 # When packaged as --onefile exe (PyInstaller), sys.executable points to the real .exe
 # path, NOT the temp extraction dir (_MEIPASS). Prepend the exe's directory to PATH so
 # that ffmpeg.exe / lada-cli placed alongside the exe are found by shutil.which().
@@ -36,10 +38,9 @@ import subprocess
 from tkinter import filedialog
 from tkinter import messagebox
 
-ver_name = "v1.2 (build 2026-06-25)"
+ver_name = "v1.3 (build 2026-06-28)"
 DLNA_SERVER_EXE_NAME = "vr_dlna_server.exe"
 TWO_DVR_DOWNLOAD_URL = "https://wapok.com"
-
 
 def build_hidden_startupinfo():
     if sys.platform != "win32":
@@ -79,6 +80,14 @@ def get_dlna_server_exe_path():
 
 def is_packaged_mode():
     return bool(getattr(sys, 'frozen', False))
+
+
+def split_dlna_video_dirs(raw_dirs):
+    return [d.strip() for d in str(raw_dirs or '').split('|') if d.strip()]
+
+
+def filter_supported_dlna_video_dirs(raw_dirs):
+    return [d for d in split_dlna_video_dirs(raw_dirs) if not dlna_media_library.is_unc_path(d)]
 
 
 def terminate_process_tree(process, timeout=2):
@@ -642,7 +651,7 @@ class VRVideoToolboxLauncher:
 
     def get_configured_dlna_dirs(self):
         raw_dirs = app_config.get('dlna_video_dirs', '') or ''
-        return [d.strip() for d in str(raw_dirs).split('|') if d.strip()]
+        return filter_supported_dlna_video_dirs(raw_dirs)
 
     def toggle_dlna_server(self):
         if self.dlna_process is None:
@@ -699,7 +708,7 @@ class VRVideoToolboxLauncher:
         current_port = app_config.get('dlna_port', 8090)
         current_auto_sub = app_config.get('dlna_auto_subnotes', True) if app_config.get('dlna_auto_subnotes') is not None else app_config.get('dlna_auto_subtitles', True)
         current_dirs_str = app_config.get('dlna_video_dirs', '') or ''
-        current_dirs = [d.strip() for d in str(current_dirs_str).split('|') if d.strip()]
+        current_dirs = filter_supported_dlna_video_dirs(current_dirs_str)
         current_si_enabled = bool(app_config.get('dlna_si_enabled', True))
 
         def _saved_si_value(key, default):
@@ -871,6 +880,13 @@ class VRVideoToolboxLauncher:
             chosen = filedialog.askdirectory(parent=dialog)
             if chosen:
                 chosen = os.path.normpath(chosen)
+                if dlna_media_library.is_unc_path(chosen):
+                    messagebox.showwarning(
+                        get_text('msg_dlna_unc_rejected_title'),
+                        get_text('msg_dlna_unc_rejected'),
+                        parent=dialog,
+                    )
+                    return
                 existing = listbox.get(0, 'end')
                 if chosen not in existing:
                     listbox.insert('end', chosen)
@@ -903,7 +919,14 @@ class VRVideoToolboxLauncher:
                 port = 8090
 
             auto_sub = auto_sub_var.get()
-            dirs = [str(d).strip() for d in listbox.get(0, 'end') if str(d).strip()]
+            raw_dirs = [str(d).strip() for d in listbox.get(0, 'end') if str(d).strip()]
+            dirs = [d for d in raw_dirs if not dlna_media_library.is_unc_path(d)]
+            if len(dirs) != len(raw_dirs):
+                messagebox.showwarning(
+                    get_text('msg_dlna_unc_rejected_title'),
+                    get_text('msg_dlna_unc_rejected'),
+                    parent=dialog,
+                )
             if require_dirs and not dirs:
                 messagebox.showwarning(
                     get_text('msg_dlna_dirs_required_title'),

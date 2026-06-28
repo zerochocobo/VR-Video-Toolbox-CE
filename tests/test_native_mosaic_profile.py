@@ -85,6 +85,7 @@ def test_progress_fps_uses_adjacent_samples(monkeypatch):
     import gpu_engine.files as files
 
     monkeypatch.setattr(files.time, "perf_counter", lambda: now["value"])
+    monkeypatch.setattr(files.runtime, "format_vram_usage", lambda **_kwargs: "")
     progress = _Progress(
         1000,
         logs.append,
@@ -102,6 +103,177 @@ def test_progress_fps_uses_adjacent_samples(monkeypatch):
 
     assert "10.0 fps" in logs[1]
     assert "10.0 fps" in logs[2]
+
+
+def test_progress_includes_vram_suffix(monkeypatch):
+    logs: list[str] = []
+
+    import gpu_engine.files as files
+
+    monkeypatch.setattr(files.runtime, "format_vram_usage", lambda **_kwargs: " | VRAM 1.0/8.0 GiB")
+    progress = _Progress(10, logs.append, min_interval=0.0, min_pct=0.0)
+
+    progress.update(1)
+
+    assert logs
+    assert "VRAM 1.0/8.0 GiB" in logs[-1]
+
+
+def test_progress_prefix_can_be_native(monkeypatch):
+    logs: list[str] = []
+
+    import gpu_engine.files as files
+
+    monkeypatch.setattr(files.runtime, "format_vram_usage", lambda **_kwargs: "")
+    progress = _Progress(10, logs.append, min_interval=0.0, min_pct=0.0, prefix="[native]")
+
+    progress.update(1)
+
+    assert logs[-1].startswith("[native] ")
+
+
+def test_gpu_progress_does_not_log_percent_bursts_before_interval(monkeypatch):
+    now = {"value": 100.0}
+    logs: list[str] = []
+
+    import gpu_engine.files as files
+
+    monkeypatch.setattr(files.time, "perf_counter", lambda: now["value"])
+    monkeypatch.setattr(files.runtime, "format_vram_usage", lambda **_kwargs: "")
+    progress = _Progress(300, logs.append, min_interval=5.0, min_pct=5.0)
+
+    progress.update(1)
+    progress.update(16)
+    progress.update(31)
+    progress.update(46)
+    assert len(logs) == 1
+
+    now["value"] += 4.0
+    progress.update(62)
+    assert len(logs) == 1
+
+    now["value"] += 1.0
+    progress.update(77)
+    assert len(logs) == 2
+
+
+def test_native_stage_progress_uses_slower_default_throttle(monkeypatch):
+    logs: list[str] = []
+    now = {"value": 100.0}
+
+    import gpu_engine.native_mosaic.progress as native_progress
+
+    monkeypatch.setattr(native_progress.time, "perf_counter", lambda: now["value"])
+    monkeypatch.setattr(native_progress, "vram_suffix", lambda: "")
+    progress = native_progress.NativeStageProgress("FrameRestorer compose", logs.append, total=100)
+
+    progress.update(5)
+    progress.update(10)
+    progress.update(15)
+    assert len(logs) == 0
+
+    progress.update(20)
+    assert len(logs) == 1
+
+    now["value"] += 4.0
+    progress.update(25)
+    assert len(logs) == 1
+
+    now["value"] += 1.0
+    progress.update(26)
+    assert len(logs) == 2
+
+
+def test_vram_query_subprocess_is_hidden_on_windows():
+    import subprocess
+    import sys
+
+    from gpu_engine import runtime
+
+    kwargs = runtime._hidden_subprocess_kwargs(0.8)
+
+    if sys.platform.startswith("win"):
+        assert kwargs.get("creationflags", 0) & subprocess.CREATE_NO_WINDOW
+        assert kwargs.get("startupinfo") is not None
+    else:
+        assert "creationflags" not in kwargs
+
+
+def test_vram_query_returns_cached_value_while_refresh_in_progress(monkeypatch):
+    from gpu_engine import runtime
+
+    runtime._vram_cache.clear()
+    runtime._vram_refreshing.clear()
+    cached = runtime.VramUsage(used_mib=512, total_mib=8192, device_index=0, smi_id="0")
+    runtime._vram_cache[(0, "0")] = (0.0, cached)
+    runtime._vram_refreshing.add((0, "0"))
+
+    def fail_run(*_args, **_kwargs):
+        raise AssertionError("subprocess.run should not be called while refresh is in progress")
+
+    monkeypatch.setattr(runtime.subprocess, "run", fail_run)
+
+    assert runtime.query_vram_usage(device_index=0, min_interval_s=0.0) is cached
+
+    runtime._vram_cache.clear()
+    runtime._vram_refreshing.clear()
+
+
+def test_vram_query_maps_cuda_visible_devices_to_nvidia_smi_id(monkeypatch):
+    from types import SimpleNamespace
+
+    from gpu_engine import runtime
+
+    runtime._vram_cache.clear()
+    runtime._vram_refreshing.clear()
+    commands: list[list[str]] = []
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,4")
+    monkeypatch.setattr(runtime, "_nvidia_smi_path", lambda: "nvidia-smi")
+
+    def fake_run(cmd, **_kwargs):
+        commands.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="1024, 8192\n")
+
+    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+
+    usage = runtime.query_vram_usage(device_index=1, min_interval_s=0.0, force=True)
+
+    assert usage is not None
+    assert usage.device_index == 1
+    assert usage.smi_id == "4"
+    assert commands[-1][1] == "--id=4"
+    runtime._vram_cache.clear()
+    runtime._vram_refreshing.clear()
+
+
+def test_vram_cache_is_keyed_by_resolved_device(monkeypatch):
+    from types import SimpleNamespace
+
+    from gpu_engine import runtime
+
+    runtime._vram_cache.clear()
+    runtime._vram_refreshing.clear()
+    commands: list[list[str]] = []
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,4")
+    monkeypatch.setattr(runtime, "_nvidia_smi_path", lambda: "nvidia-smi")
+
+    def fake_run(cmd, **_kwargs):
+        commands.append(cmd)
+        used = "200" if cmd[1] == "--id=4" else "100"
+        return SimpleNamespace(returncode=0, stdout=f"{used}, 8192\n")
+
+    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+
+    first = runtime.query_vram_usage(device_index=0, min_interval_s=999.0)
+    second = runtime.query_vram_usage(device_index=1, min_interval_s=999.0)
+
+    assert first is not None and first.used_mib == 100
+    assert second is not None and second.used_mib == 200
+    assert [cmd[1] for cmd in commands] == ["--id=2", "--id=4"]
+    runtime._vram_cache.clear()
+    runtime._vram_refreshing.clear()
 
 
 def test_inference_tuning_can_be_disabled(monkeypatch):

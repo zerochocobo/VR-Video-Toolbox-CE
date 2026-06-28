@@ -71,10 +71,14 @@ def main() -> int:
             pass
 
     # 4. Enforce fallback video dirs
+    default_video_dir = _exe_dir / "videos"
     if not config.get("dlna_video_dirs"):
-        default_dir = _exe_dir / "videos"
-        default_dir.mkdir(parents=True, exist_ok=True)
-        config["dlna_video_dirs"] = str(default_dir)
+        default_video_dir.mkdir(parents=True, exist_ok=True)
+        config["dlna_video_dirs"] = str(default_video_dir)
+    video_paths = media_library.parse_video_dirs(config["dlna_video_dirs"], default_video_dir)
+    if video_paths == [media_library.safe_resolve_path(default_video_dir)]:
+        default_video_dir.mkdir(parents=True, exist_ok=True)
+    config["dlna_video_dirs"] = "|".join(str(path) for path in video_paths)
 
     lan_ip = _detect_lan_ip()
     port = int(config.get("dlna_port", 8090))
@@ -107,8 +111,7 @@ def main() -> int:
     firewall_ok = firewall.ensure_rules(port)
     logger.info("Firewall rules ok: %s", firewall_ok)
 
-    # 6. Parse media roots
-    video_paths = media_library.parse_video_dirs(config["dlna_video_dirs"], Path(_exe_dir) / "videos")
+    # 6. Build media roots from the sanitized, supported local paths.
     roots = media_library.build_media_roots(video_paths)
     lib = media_library.MediaLibrary(roots)
     logger.info("Media roots  : %s", " | ".join(f"{root.label}={root.path}" for root in roots))

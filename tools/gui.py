@@ -758,10 +758,10 @@ class VRVideoToolsApp:
 
         # Time List Container
         list_frame = ttk.LabelFrame(frame, text=get_text('lbl_time_list'), padding=10)
-        list_frame.pack(fill='both', expand=True, pady=5)
+        list_frame.pack(fill='x', expand=False, pady=5)
         
         # Scrollable Frame for inputs
-        canvas = tk.Canvas(list_frame)
+        canvas = tk.Canvas(list_frame, height=120)
         scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
         self.cut_scroll_frame = ttk.Frame(canvas)
         

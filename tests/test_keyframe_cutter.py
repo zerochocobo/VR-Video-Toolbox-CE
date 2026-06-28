@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import tempfile
+import types
 import unittest
+from fractions import Fraction
 from pathlib import Path
 from unittest.mock import patch
 
@@ -9,6 +11,82 @@ from gpu_engine.probe import VideoMetadata
 from utils import keyframe_cutter
 from utils.mosaic_prescan import MosaicSegment
 from utils.source_time_scanner import TimeInterval
+
+
+class KeyframeListingTests(unittest.TestCase):
+    def test_list_keyframes_uses_pyav_first(self) -> None:
+        class Packet:
+            def __init__(self, pts: int | None, key: bool):
+                self.pts = pts
+                self.is_keyframe = key
+
+        class Container:
+            streams = types.SimpleNamespace(video=[types.SimpleNamespace(time_base=Fraction(1, 1000))])
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def demux(self, _stream):
+                return iter([
+                    Packet(0, True),
+                    Packet(33, False),
+                    Packet(5005, True),
+                    Packet(None, True),
+                ])
+
+        fake_av = types.SimpleNamespace(open=lambda *_args, **_kwargs: Container())
+
+        with (
+            patch.dict("sys.modules", {"av": fake_av}),
+            patch("utils.keyframe_cutter.subprocess.check_output") as check_output,
+        ):
+            keyframes = keyframe_cutter.list_keyframes("source.mp4")
+
+        self.assertEqual(keyframes, [0.0, 5.005])
+        check_output.assert_not_called()
+
+    def test_list_keyframes_falls_back_to_packet_key_flags_when_pyav_fails(self) -> None:
+        calls = []
+
+        def fake_check_output(cmd, **_kwargs):
+            calls.append(cmd)
+            return "0.000000,K__\n0.033367,___\n5.005000,K__\n"
+
+        with (
+            patch("utils.keyframe_cutter._list_keyframes_from_pyav", side_effect=RuntimeError("pyav failed")),
+            patch("utils.keyframe_cutter.shutil.which", return_value="ffprobe"),
+            patch("utils.keyframe_cutter.subprocess.check_output", side_effect=fake_check_output),
+        ):
+            keyframes = keyframe_cutter.list_keyframes("source.mp4")
+
+        self.assertEqual(keyframes, [0.0, 5.005])
+        self.assertEqual(len(calls), 1)
+        self.assertIn("-show_packets", calls[0])
+        self.assertNotIn("-skip_frame", calls[0])
+
+    def test_list_keyframes_falls_back_to_frame_scan_when_packets_are_empty(self) -> None:
+        calls = []
+
+        def fake_check_output(cmd, **_kwargs):
+            calls.append(cmd)
+            if "-show_packets" in cmd:
+                return "0.000000,___\n0.033367,___\n"
+            return b'{"frames":[{"pts_time":"0.000000"},{"best_effort_timestamp_time":"5.005000"}]}'
+
+        with (
+            patch("utils.keyframe_cutter.shutil.which", return_value="ffprobe"),
+            patch("utils.keyframe_cutter.subprocess.check_output", side_effect=fake_check_output),
+        ):
+            keyframes = keyframe_cutter.list_keyframes("source.mp4")
+
+        self.assertEqual(keyframes, [0.0, 5.005])
+        self.assertEqual(len(calls), 2)
+        self.assertIn("-show_packets", calls[0])
+        self.assertIn("-show_frames", calls[1])
+        self.assertIn("-skip_frame", calls[1])
 
 
 class SourceCutTimelineTests(unittest.TestCase):

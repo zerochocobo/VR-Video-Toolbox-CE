@@ -25,7 +25,7 @@ Lada parameter                    Jasna counterpart        Notes
 """
 import re
 import shlex
-from . import app_config
+from . import app_config, encode_config
 
 
 def get_engine_executable() -> "str | None":
@@ -47,16 +47,15 @@ def _extract_cq(encoder_options_str: str) -> str | None:
     return m.group(1) if m else None
 
 
-def get_configured_nvenc_preset(default: str = "P7") -> str:
+def get_configured_nvenc_preset(default: str = "P4") -> str:
     """Return configured NVENC preset as P1..P7."""
-    preset = str(app_config.get("gpu_encode_preset", default) or default).upper()
-    return preset if preset in {f"P{i}" for i in range(1, 8)} else default
+    preset = encode_config.resolve_encode_settings().preset
+    return preset if preset in encode_config.VALID_NVENC_PRESETS else default
 
 
 def build_lada_encoder_options(cq: int | str = 18) -> str:
-    """Build Lada --encoder-options using the shared UI NVENC preset."""
-    preset = get_configured_nvenc_preset().lower()
-    return f" -cq {cq} -preset {preset}"
+    """Build Lada --encoder-options from the shared OneClick encode profile."""
+    return encode_config.build_lada_encoder_options(cq=cq)
 
 
 def build_engine_cmd(

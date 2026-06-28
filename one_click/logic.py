@@ -11,14 +11,14 @@ from pathlib import Path
 
 # Import engine layer and helper methods.
 try:
-    from utils import engine_runner, app_config
+    from utils import engine_runner, app_config, encode_config
     from utils.ffmpeg_checker import get_startupinfo, get_video_bitrate
     from gpu_engine.fallback import OperationCancelled
 except ImportError:
     _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _root not in sys.path:
         sys.path.insert(0, _root)
-    from utils import engine_runner, app_config
+    from utils import engine_runner, app_config, encode_config
     from utils.ffmpeg_checker import get_startupinfo, get_video_bitrate
     from gpu_engine.fallback import OperationCancelled
 
@@ -144,7 +144,7 @@ def _resolve_pipeline_bitrate(stage: str,
     # always reserve quality headroom for high-detail regions regardless of the
     # keep-original toggle (which only governs the final-output convergence).
     if stage_key == "intermediate":
-        multiplier = _config_float("gpu_bitrate_multiplier", 2.0)
+        multiplier = _config_float("gpu_bitrate_multiplier", 1.2)
     else:
         multiplier = 1.0 if keep_original else _config_float("gpu_bitrate_final_multiplier", 1.0)
     try:
@@ -269,18 +269,53 @@ def _log_final_bitrate_summary(final_output: str | Path,
 
 
 def _nvenc_vbr_or_cq_args(target_kbps: int | None, max_kbps: int | None = None) -> list[str]:
+    args = encode_config.build_ffmpeg_nvenc_base_args()
     if target_kbps and target_kbps > 0:
-        maxrate = max(int(target_kbps), int(max_kbps if max_kbps and max_kbps > 0 else target_kbps * 1.2))
+        multiplier = encode_config.maxrate_multiplier()
+        maxrate = max(int(target_kbps), int(max_kbps if max_kbps and max_kbps > 0 else target_kbps * multiplier))
         bufsize = max(int(target_kbps * 2), int(maxrate * 2))
-        return [
-            "-c:v", "hevc_nvenc",
-            "-preset", "p7",
+        args.extend([
             "-rc", "vbr",
             "-b:v", f"{int(target_kbps)}k",
             "-maxrate:v", f"{maxrate}k",
             "-bufsize:v", f"{bufsize}k",
-        ]
-    return ["-c:v", "hevc_nvenc", "-preset", "p7", "-cq", "18"]
+        ])
+        return args
+    args.extend(["-rc", "vbr", "-cq", "18"])
+    return args
+
+
+def _final_max_bitrate_bps(target_bps: int | None) -> int | None:
+    """Tightened VBR peak for the final delivered re-encode (converge near source).
+
+    Intermediate stages keep the looser ``maxrate_multiplier`` headroom; only the
+    final merge/concat output uses this lower ceiling. Returns ``None`` when there
+    is no explicit target (CQ paths keep their own behaviour).
+    """
+    try:
+        target = int(target_bps or 0)
+    except (TypeError, ValueError):
+        target = 0
+    if target <= 0:
+        return None
+    return max(target, int(target * encode_config.final_maxrate_multiplier()))
+
+
+def _ffmpeg_final_reencode_args(reference_file: str | os.PathLike | None) -> list[str]:
+    try:
+        from gpu_engine import probe as gpu_probe
+        meta = gpu_probe.probe_video(reference_file) if reference_file else None
+    except Exception:
+        meta = None
+    args: list[str] = []
+    if meta is not None:
+        args.extend(encode_config.build_ffmpeg_pix_fmt_args(meta.bit_depth))
+        if meta.color is not None:
+            args.extend(meta.color.ffmpeg_args())
+        args.extend(encode_config.build_final_ffmpeg_reencode_tail_args(meta.source_fps))
+    else:
+        args.extend(encode_config.build_final_ffmpeg_reencode_tail_args(None))
+    return args
 
 
 class _ProcessFileLogger:
@@ -821,6 +856,11 @@ def process_lada(input_file, output_file, log_callback=None, process_callback=No
         encoder_options=opts,
     )
     if log_callback: log_callback(f"{tool_name} Processing: {input_file} -> {output_file}")
+    if app_config.get_engine() == 'jasna' and log_callback:
+        log_callback(
+            "[encoder-profile] Jasna CLI only receives cq from the shared encode profile; "
+            "preset/AQ/multipass are applied by NativeGPU/Lada paths, not Jasna."
+        )
     run_process(cmd, log_callback, process_callback)
     return str(output_file)
 
@@ -830,7 +870,6 @@ class PreExtractResult:
     NO_MOSAIC = "no_mosaic"
     SCAN_FAILED = "scan_failed"
     CANCELLED = "cancelled"
-    BYPASS_CROP = "bypass_crop"
 
 
 def _pre_extract_supported(pre_extract, log_callback=None) -> bool:
@@ -854,6 +893,32 @@ def _release_pre_extract_detector_if_needed(pre_extract_enabled, log_callback=No
         from utils.mosaic_prescan import release_detector
 
         release_detector(log_callback=log_callback)
+    except Exception:
+        pass
+
+
+def _release_gpu_models_before_paste(log_callback=None) -> None:
+    """Free model VRAM before 8K GPU paste opens NVDEC/NVENC surfaces."""
+    _release_pre_extract_detector_if_needed(True, log_callback=log_callback)
+    try:
+        if engine_runner.is_native_engine():
+            from gpu_engine import native_mosaic
+
+            native_mosaic.release_engine(log_callback=log_callback)
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[native] release before paste skipped: {type(exc).__name__}: {exc}")
+    try:
+        from gpu_engine import runtime
+
+        runtime.free_memory_pool()
+    except Exception:
+        pass
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     except Exception:
         pass
 
@@ -969,6 +1034,8 @@ def _run_pre_extract_branch(base_path, restored_path, keep_intermediate=False,
                 log_callback(f"[pre-extract] restored segment exists, skipping: {seg_out}")
         restored_segments.append(seg_out)
 
+    _release_gpu_models_before_paste(log_callback=log_callback)
+
     if log_callback:
         log_callback("[pre-extract] pasting restored segments back")
     paste_segments_gpu_or_fallback(
@@ -979,6 +1046,7 @@ def _run_pre_extract_branch(base_path, restored_path, keep_intermediate=False,
         log_callback=log_callback,
         process_callback=process_callback,
         bitrate_bps=output_bitrate_bps,
+        max_bitrate_bps=_final_max_bitrate_bps(output_bitrate_bps),
     )
 
     if not keep_segments:
@@ -1132,46 +1200,6 @@ def _segment_frame_bounds(seg, fps: float) -> tuple[int, int]:
     start = max(0, int(round(float(seg.start_s) * fps)))
     end = max(start + 1, int(round(float(seg.end_s) * fps)))
     return start, end
-
-
-def _pre_extract_bypass_crop_area_threshold() -> float:
-    default = 1.0 / 3.0
-    try:
-        value = app_config.get("pre_extract_bypass_crop_area_ratio", default)
-        threshold = float(default if value is None else value)
-    except (TypeError, ValueError):
-        threshold = default
-    return threshold
-
-
-def _paired_pre_extract_should_bypass_crop(left_segments, right_segments,
-                                           eye_w: int, eye_h: int,
-                                           *, use_fisheye: bool = False,
-                                           log_callback=None) -> bool:
-    threshold = _pre_extract_bypass_crop_area_threshold()
-    if threshold <= 0.0:
-        return False
-    eye_area = max(1, int(eye_w) * int(eye_h))
-    best = None
-    for side_name, side_segments in (("L", left_segments), ("R", right_segments)):
-        for seg in side_segments:
-            area = max(0, int(seg.w)) * max(0, int(seg.h))
-            ratio = float(area) / float(eye_area)
-            if best is None or ratio > best["ratio"]:
-                best = {"side": side_name, "seg": seg, "ratio": ratio, "area": area}
-    if best is None or float(best["ratio"]) <= threshold:
-        return False
-    seg = best["seg"]
-    if log_callback:
-        space_note = " fisheye-space area estimate;" if use_fisheye else ""
-        log_callback(
-            "[source-scan] paired fine crop bypassed for this segment: "
-            f"side={best['side']} seg={int(seg.seg_id)} "
-            f"ratio={float(best['ratio']):.3f} threshold={threshold:.3f} "
-            f"rect={int(seg.x)},{int(seg.y)},{int(seg.w)}x{int(seg.h)} "
-            f"eye={int(eye_w)}x{int(eye_h)};{space_note} using full-eye restore path"
-        )
-    return True
 
 
 def _paired_segment_cache_key(seg, fps: float) -> str:
@@ -1431,6 +1459,8 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
                                          keep_intermediate: bool,
                                          original_bitrate: int | None,
                                          keep_original_bitrate: bool,
+                                         work_dir: str | None = None,
+                                         work_stem: str | None = None,
                                          log_callback=None,
                                          process_callback=None,
                                          fine_conf=None) -> str:
@@ -1442,8 +1472,9 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
 
     base_clip = os.path.abspath(base_clip)
     output_file = os.path.abspath(output_file)
-    base_dir = os.path.dirname(base_clip)
-    stem = os.path.splitext(os.path.basename(base_clip))[0]
+    base_dir = os.path.abspath(work_dir) if work_dir else os.path.dirname(base_clip)
+    os.makedirs(base_dir, exist_ok=True)
+    stem = work_stem or os.path.splitext(os.path.basename(base_clip))[0]
     fine_conf = _resolve_fine_conf(fine_conf)
     if log_callback:
         log_callback(
@@ -1511,15 +1542,6 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
     restored_paths = []
     segment_input_paths = []
     paste_segments = []
-    if _paired_pre_extract_should_bypass_crop(
-        left_segments,
-        right_segments,
-        eye_w,
-        eye_h,
-        use_fisheye=use_fisheye,
-        log_callback=log_callback,
-    ):
-        return PreExtractResult.BYPASS_CROP
 
     save_segments_json(
         left_segments,
@@ -1889,6 +1911,8 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
         paste_segments.append(paste_seg)
         restored_paths.append(restored_actual)
 
+    _release_gpu_models_before_paste(log_callback=log_callback)
+
     if use_fisheye:
         if log_callback:
             log_callback("[source-scan] Stage 3: in-memory fisheye rect patch onto interval")
@@ -1901,8 +1925,10 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
             build_paste_segments(base_clip, paste_segments, restored_paths),
             cq=None if bitrate_bps else 18,
             bitrate_bps=bitrate_bps,
+            max_bitrate_bps=_final_max_bitrate_bps(bitrate_bps),
             keep_audio=False,
             log_callback=log_callback,
+            process_callback=process_callback,
             cancel_token=token,
         )
         cleanup_extra = []
@@ -1918,6 +1944,7 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
             log_callback=log_callback,
             process_callback=process_callback,
             bitrate_bps=bitrate_bps,
+            max_bitrate_bps=_final_max_bitrate_bps(bitrate_bps),
         )
         cleanup_extra = []
 
@@ -2106,6 +2133,51 @@ def _process_single_eye_clip_to_output(input_file, output_file, *, eye_mode: int
                 pass
 
 
+def _source_scan_float_config(key: str, default: float) -> float:
+    try:
+        value = app_config.get(key, default)
+        return float(default if value is None else value)
+    except Exception:
+        return float(default)
+
+
+def _source_scan_whole_source_coverage(intervals, duration_s: float) -> tuple[bool, float, float, float]:
+    duration = max(0.0, float(duration_s or 0.0))
+    if duration <= 0.0 or len(intervals) != 1:
+        return False, 0.0, 0.0, duration
+
+    interval = intervals[0]
+    start = max(0.0, float(getattr(interval, "start_s", 0.0)))
+    end = min(duration, float(getattr(interval, "end_s", 0.0)))
+    coverage = max(0.0, end - start) / duration
+    head_gap = max(0.0, start)
+    tail_gap = max(0.0, duration - end)
+    min_coverage = max(0.0, min(1.0, _source_scan_float_config("source_scan_whole_source_min_coverage", 0.98)))
+    max_edge_gap = max(0.0, _source_scan_float_config("source_scan_whole_source_max_edge_gap_s", 15.0))
+    return coverage >= min_coverage and head_gap <= max_edge_gap and tail_gap <= max_edge_gap, coverage, head_gap, tail_gap
+
+
+def _same_file_path(a: str | Path, b: str | Path) -> bool:
+    try:
+        return os.path.normcase(os.path.abspath(str(a))) == os.path.normcase(os.path.abspath(str(b)))
+    except Exception:
+        return False
+
+
+def _source_scan_mosaic_work_paths(entry, *, scan_input: str, tmp_dir: str,
+                                   mosaic_idx: int) -> tuple[Path, str | None, str | None]:
+    entry_path = Path(entry.path)
+    if (
+        _same_file_path(entry_path, scan_input)
+        and getattr(entry, "inpoint_s", None) is None
+        and getattr(entry, "outpoint_s", None) is None
+    ):
+        suffix = Path(scan_input).suffix or ".mp4"
+        stem = f"mosaic_seg{mosaic_idx:03d}"
+        return Path(tmp_dir) / f"{stem}.restored{suffix}", tmp_dir, stem
+    return entry_path.with_name(f"{entry_path.stem}.restored{entry_path.suffix}"), None, None
+
+
 def _run_source_scan_branch(input_file, final_output, *, use_fisheye: bool,
                             pre_extract_inner: bool,
                             keep_intermediate: bool,
@@ -2119,7 +2191,7 @@ def _run_source_scan_branch(input_file, final_output, *, use_fisheye: bool,
                             fine_conf=None) -> str:
     from gpu_engine import probe as gpu_probe
     from gpu_engine.files import CancelToken
-    from utils.keyframe_cutter import cut_source_by_intervals
+    from utils.keyframe_cutter import TimelineEntry, cut_source_by_intervals
     from utils.sbs_concat import concat_timeline
     from utils.source_time_scanner import save_source_intervals_json, scan_source_time_segments
 
@@ -2198,16 +2270,36 @@ def _run_source_scan_branch(input_file, final_output, *, use_fisheye: bool,
         #   single_eye: virtual gaps are later cropped again to the selected eye by
         #        extract_clip, so materialization is not useful.
         materialize_gaps = (mode == "sbs")
-        timeline = cut_source_by_intervals(
-            scan_input,
-            intervals,
-            tmp_dir,
-            None,
-            log_callback=log_callback,
-            process_callback=process_callback,
-            materialize_gaps=materialize_gaps,
-            materialize_mosaic=True,
-        )
+        use_whole_source, whole_coverage, whole_head_gap, whole_tail_gap = _source_scan_whole_source_coverage(intervals, meta.duration or 0.0)
+        if use_whole_source:
+            if log_callback:
+                log_callback(
+                    f"[source-scan] Stage 2 skipped: single interval covers whole source "
+                    f"(coverage={whole_coverage * 100.0:.2f}%, head_gap={whole_head_gap:.3f}s, "
+                    f"tail_gap={whole_tail_gap:.3f}s); using source directly"
+                )
+            timeline = [
+                TimelineEntry(
+                    start_s=0.0,
+                    end_s=float(meta.duration or intervals[0].end_s),
+                    path=Path(scan_input),
+                    kind="mosaic",
+                    conf_max=float(intervals[0].conf_max),
+                    inpoint_s=None,
+                    outpoint_s=None,
+                )
+            ]
+        else:
+            timeline = cut_source_by_intervals(
+                scan_input,
+                intervals,
+                tmp_dir,
+                None,
+                log_callback=log_callback,
+                process_callback=process_callback,
+                materialize_gaps=materialize_gaps,
+                materialize_mosaic=True,
+            )
         timeline_json = os.path.join(tmp_dir, "timeline.json")
         with open(timeline_json, "w", encoding="utf-8") as f:
             json.dump({"entries": [entry.__dict__ | {"path": str(entry.path)} for entry in timeline]}, f, ensure_ascii=False, indent=2)
@@ -2235,9 +2327,16 @@ def _run_source_scan_branch(input_file, final_output, *, use_fisheye: bool,
             log_callback=log_callback,
         )
         final_bitrate_kbps = _bitrate_bps_to_kbps(single_eye_final_bitrate)
+        mosaic_idx = 0
         for entry in timeline:
             if entry.kind == "mosaic":
-                restored = entry.path.with_name(f"{entry.path.stem}.restored{entry.path.suffix}")
+                restored, work_dir, work_stem = _source_scan_mosaic_work_paths(
+                    entry,
+                    scan_input=scan_input,
+                    tmp_dir=tmp_dir,
+                    mosaic_idx=mosaic_idx,
+                )
+                mosaic_idx += 1
                 if mode == "single_eye":
                     _process_single_eye_clip_to_output(
                         str(entry.path),
@@ -2247,6 +2346,8 @@ def _run_source_scan_branch(input_file, final_output, *, use_fisheye: bool,
                         pre_extract_inner=pre_extract_inner,
                         keep_intermediate=keep_intermediate,
                         final_bitrate_kbps=final_bitrate_kbps,
+                        work_dir=work_dir,
+                        work_stem=work_stem,
                         log_callback=log_callback,
                         process_callback=process_callback,
                         fine_conf=fine_conf,
@@ -2260,27 +2361,14 @@ def _run_source_scan_branch(input_file, final_output, *, use_fisheye: bool,
                             keep_intermediate=keep_intermediate,
                             original_bitrate=original_bitrate,
                             keep_original_bitrate=keep_original_bitrate,
+                            work_dir=work_dir,
+                            work_stem=work_stem,
                             log_callback=log_callback,
                             process_callback=process_callback,
                             fine_conf=fine_conf,
                         )
                         if paired_result == PreExtractResult.CANCELLED:
                             raise OperationCancelled("cancelled by user")
-                        elif paired_result == PreExtractResult.BYPASS_CROP:
-                            if log_callback:
-                                log_callback("[source-scan] paired fine crop bypass applies only to this timeline segment")
-                            _process_sbs_clip_to_output(
-                                str(entry.path),
-                                str(restored),
-                                use_fisheye=use_fisheye,
-                                pre_extract_inner=False,
-                                keep_intermediate=keep_intermediate,
-                                original_bitrate=original_bitrate,
-                                keep_original_bitrate=keep_original_bitrate,
-                                log_callback=log_callback,
-                                process_callback=process_callback,
-                                fine_conf=fine_conf,
-                            )
                         elif paired_result == PreExtractResult.SCAN_FAILED:
                             if log_callback:
                                 log_callback("[source-scan] paired fine path failed; falling back to full-eye restore")
@@ -2292,6 +2380,8 @@ def _run_source_scan_branch(input_file, final_output, *, use_fisheye: bool,
                                 keep_intermediate=keep_intermediate,
                                 original_bitrate=original_bitrate,
                                 keep_original_bitrate=keep_original_bitrate,
+                                work_dir=work_dir,
+                                work_stem=work_stem,
                                 log_callback=log_callback,
                                 process_callback=process_callback,
                                 fine_conf=fine_conf,
@@ -2305,6 +2395,8 @@ def _run_source_scan_branch(input_file, final_output, *, use_fisheye: bool,
                             keep_intermediate=keep_intermediate,
                             original_bitrate=original_bitrate,
                             keep_original_bitrate=keep_original_bitrate,
+                            work_dir=work_dir,
+                            work_stem=work_stem,
                             log_callback=log_callback,
                             process_callback=process_callback,
                             fine_conf=fine_conf,
@@ -2408,6 +2500,7 @@ def _run_source_scan_branch(input_file, final_output, *, use_fisheye: bool,
                 audio_source=scan_input,
                 cq=None if concat_bitrate else 18,
                 bitrate_bps=concat_bitrate,
+                max_bitrate_bps=_final_max_bitrate_bps(concat_bitrate),
                 log_callback=log_callback,
                 cancel_token=merge_token,
             )
@@ -2421,6 +2514,7 @@ def _run_source_scan_branch(input_file, final_output, *, use_fisheye: bool,
                 reencode="auto",
                 cq=None if concat_bitrate else 18,
                 bitrate_bps=concat_bitrate,
+                max_bitrate_bps=_final_max_bitrate_bps(concat_bitrate),
             )
         _log_final_bitrate_summary(final_path, concat_bitrate, log_callback)
         return PreExtractResult.OK
@@ -2473,6 +2567,7 @@ def merge_videos(left_file, right_file, output_file, original_bitrate, keep_orig
             keep_original_bitrate,
             log_callback=log_callback,
         )
+        max_bitrate_bps = _final_max_bitrate_bps(target_bitrate_bps)
 
         def _gpu_fn():
             token = gpu_files.CancelToken()
@@ -2482,6 +2577,7 @@ def merge_videos(left_file, right_file, output_file, original_bitrate, keep_orig
                 left_file, right_file, output_file, "left_right", from_fisheye=False,
                 cq=None if target_bitrate_bps else 18,
                 bitrate_bps=target_bitrate_bps,
+                max_bitrate_bps=max_bitrate_bps,
                 keep_audio=True, log_callback=log_callback, cancel_token=token,
             )
             return True
@@ -2496,6 +2592,7 @@ def merge_videos(left_file, right_file, output_file, original_bitrate, keep_orig
                 log_callback,
                 process_callback,
                 bitrate_bps=target_bitrate_bps,
+                max_bitrate_bps=max_bitrate_bps,
             )
 
         if log_callback: log_callback(f"Merging: {left_file} + {right_file} -> {output_file}")
@@ -2508,7 +2605,7 @@ def merge_videos(left_file, right_file, output_file, original_bitrate, keep_orig
         raise
 
 
-def _merge_videos_ffmpeg(left_file, right_file, output_file, original_bitrate, keep_original_bitrate=False, log_callback=None, process_callback=None, bitrate_bps: int | None = None):
+def _merge_videos_ffmpeg(left_file, right_file, output_file, original_bitrate, keep_original_bitrate=False, log_callback=None, process_callback=None, bitrate_bps: int | None = None, max_bitrate_bps: int | None = None):
     cmd = [
         "ffmpeg",
         "-hide_banner", "-loglevel", "error","-stats",
@@ -2518,29 +2615,19 @@ def _merge_videos_ffmpeg(left_file, right_file, output_file, original_bitrate, k
         "-map", "[v]", "-map", "0:a?",
         "-c:a", "copy"
     ]
-    
+
     if bitrate_bps and bitrate_bps > 0:
         target_kbps = max(1, int(bitrate_bps / 1000))
-        target_bitrate = f"{target_kbps}k"
-        max_rate = f"{int(target_kbps * 1.2)}k"
-        buf_size = f"{int(target_kbps * 2)}k"
-        cmd.extend([
-            "-c:v", "hevc_nvenc", 
-            "-preset", "p7", 
-            "-rc", "vbr",
-            "-b:v", target_bitrate,
-            "-maxrate:v", max_rate,
-            "-bufsize:v", buf_size,
-            "-shortest", output_file, "-y"
-        ])
+        final_max = max_bitrate_bps or _final_max_bitrate_bps(bitrate_bps)
+        max_kbps = int(final_max / 1000) if final_max else None
+        cmd.extend(_nvenc_vbr_or_cq_args(target_kbps, max_kbps))
+        cmd.extend(_ffmpeg_final_reencode_args(left_file))
+        cmd.extend(["-shortest", output_file, "-y"])
     else:
         # Use CQ mode for quality control
-        cmd.extend([
-            "-c:v", "hevc_nvenc", 
-            "-preset", "p7", 
-            "-cq", "18",
-            "-shortest", output_file, "-y"
-        ])
+        cmd.extend(_nvenc_vbr_or_cq_args(None))
+        cmd.extend(_ffmpeg_final_reencode_args(left_file))
+        cmd.extend(["-shortest", output_file, "-y"])
     if log_callback: log_callback(f"Merging: {left_file} + {right_file} -> {output_file}")
     run_process(cmd, log_callback, process_callback)
 
@@ -2558,6 +2645,8 @@ def merge_videos_fisheye(left_fisheye_file, right_fisheye_file, output_file, ori
             log_callback=log_callback,
         )
 
+        max_bitrate_bps = _final_max_bitrate_bps(target_bitrate_bps)
+
         def _gpu_fn():
             token = gpu_files.CancelToken()
             if process_callback:
@@ -2567,6 +2656,7 @@ def merge_videos_fisheye(left_fisheye_file, right_fisheye_file, output_file, ori
                 from_fisheye=True,
                 cq=None if target_bitrate_bps else 18,
                 bitrate_bps=target_bitrate_bps,
+                max_bitrate_bps=max_bitrate_bps,
                 keep_audio=True, log_callback=log_callback, cancel_token=token,
             )
             return True
@@ -2581,6 +2671,7 @@ def merge_videos_fisheye(left_fisheye_file, right_fisheye_file, output_file, ori
                 log_callback,
                 process_callback,
                 bitrate_bps=target_bitrate_bps,
+                max_bitrate_bps=max_bitrate_bps,
             )
 
         if log_callback: log_callback(f"Fisheye->VR + Merging: {left_fisheye_file} + {right_fisheye_file} -> {output_file}")
@@ -2593,7 +2684,7 @@ def merge_videos_fisheye(left_fisheye_file, right_fisheye_file, output_file, ori
         raise
 
 
-def _merge_videos_fisheye_ffmpeg(left_fisheye_file, right_fisheye_file, output_file, original_bitrate, keep_original_bitrate=False, log_callback=None, process_callback=None, bitrate_bps: int | None = None):
+def _merge_videos_fisheye_ffmpeg(left_fisheye_file, right_fisheye_file, output_file, original_bitrate, keep_original_bitrate=False, log_callback=None, process_callback=None, bitrate_bps: int | None = None, max_bitrate_bps: int | None = None):
     """Convert fisheye to VR and merge left/right videos in a single ffmpeg call."""
     cmd = [
         "ffmpeg",
@@ -2604,29 +2695,19 @@ def _merge_videos_fisheye_ffmpeg(left_fisheye_file, right_fisheye_file, output_f
         "-map", "[v]", "-map", "0:a?",
         "-c:a", "copy"
     ]
-    
+
     if bitrate_bps and bitrate_bps > 0:
         target_kbps = max(1, int(bitrate_bps / 1000))
-        target_bitrate = f"{target_kbps}k"
-        max_rate = f"{int(target_kbps * 1.2)}k"
-        buf_size = f"{int(target_kbps * 2)}k"
-        cmd.extend([
-            "-c:v", "hevc_nvenc", 
-            "-preset", "p7", 
-            "-rc", "vbr",
-            "-b:v", target_bitrate,
-            "-maxrate:v", max_rate,
-            "-bufsize:v", buf_size,
-            "-shortest", output_file, "-y"
-        ])
+        final_max = max_bitrate_bps or _final_max_bitrate_bps(bitrate_bps)
+        max_kbps = int(final_max / 1000) if final_max else None
+        cmd.extend(_nvenc_vbr_or_cq_args(target_kbps, max_kbps))
+        cmd.extend(_ffmpeg_final_reencode_args(left_fisheye_file))
+        cmd.extend(["-shortest", output_file, "-y"])
     else:
         # Use CQ mode for quality control
-        cmd.extend([
-            "-c:v", "hevc_nvenc", 
-            "-preset", "p7", 
-            "-cq", "18",
-            "-shortest", output_file, "-y"
-        ])
+        cmd.extend(_nvenc_vbr_or_cq_args(None))
+        cmd.extend(_ffmpeg_final_reencode_args(left_fisheye_file))
+        cmd.extend(["-shortest", output_file, "-y"])
     if log_callback: log_callback(f"Fisheye->VR + Merging: {left_fisheye_file} + {right_fisheye_file} -> {output_file}")
     run_process(cmd, log_callback, process_callback)
 
@@ -2676,20 +2757,10 @@ def _convert_projection_ffmpeg(input_file, output_file, projection, log_callback
     ]
     
     if final_bitrate_kbps:
-        cmd.extend([
-            "-c:v", "hevc_nvenc", 
-            "-preset", "p7", 
-            "-rc", "vbr",
-            "-b:v", f"{final_bitrate_kbps}k",
-            "-maxrate:v", f"{int(final_bitrate_kbps * 1.2)}k",
-            "-bufsize:v", f"{int(final_bitrate_kbps * 2)}k",
-        ])
+        cmd.extend(_nvenc_vbr_or_cq_args(final_bitrate_kbps))
     else:
-        cmd.extend([
-            "-c:v", "hevc_nvenc", 
-            "-preset", "p7", 
-            "-cq", "18",
-        ])
+        cmd.extend(_nvenc_vbr_or_cq_args(None))
+    cmd.extend(_ffmpeg_final_reencode_args(input_file))
     
     cmd.extend([output_file, "-y"])
     if log_callback: log_callback(f"Converting Projection ({projection}): {os.path.basename(input_file)}")

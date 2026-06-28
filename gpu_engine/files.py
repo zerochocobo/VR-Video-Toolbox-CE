@@ -55,14 +55,16 @@ class _Progress:
     """Throttled progress reporter that logs ffmpeg -stats-like progress/FPS/ETA to log_callback.
 
     A silent per-frame GPU loop makes long videos look stalled, so this reports a
-    progress line periodically, rate-limited by time and percentage deltas.
+    progress line periodically. Time throttling is the hard guard; percentage
+    deltas only matter when callers deliberately set a shorter interval.
     """
 
     def __init__(self, total: int, log_callback, min_interval: float | None = None,
                  min_pct: float | None = None, window_sec: float = 60.0,
-                 fps_smoothing_sec: float | None = None):
+                 fps_smoothing_sec: float | None = None, prefix: str = "[GPU]"):
         self.total = max(0, int(total))
         self.log = log_callback
+        self.prefix = str(prefix or "[GPU]")
         if min_interval is None:
             min_interval = _cfg("progress_log_interval_s", 5.0)
         if min_pct is None:
@@ -72,6 +74,8 @@ class _Progress:
         if fps_smoothing_sec is None:
             fps_smoothing_sec = _cfg("progress_fps_smoothing_s", 12.0)
         self.fps_smoothing_sec = max(0.001, float(fps_smoothing_sec))
+        self.log_vram = _cfg_bool("progress_log_vram", True)
+        self.vram_interval_s = max(0.0, float(_cfg("progress_vram_query_interval_s", 5.0) or 0.0))
         # Report current throughput from adjacent progress samples, smoothed by
         # EMA. The old rolling-window display dropped warmup samples over time,
         # making FPS rise monotonically even when current throughput was stable.
@@ -99,7 +103,7 @@ class _Progress:
         now = time.perf_counter()
         pct = (100.0 * done / self.total) if self.total else 0.0
         time_due = (now - self._last) >= self.min_interval
-        pct_due = (pct - self._last_pct) >= self.min_pct
+        pct_due = (pct - self._last_pct) >= self.min_pct and time_due
         if not force and not (time_due or pct_due):
             return
         self._last = now
@@ -121,8 +125,9 @@ class _Progress:
         self._sample_t = now
         self._sample_done = done
         eta = ((self.total - done) / fps) if fps > 0 else 0.0
-        self.log(f"[GPU] {done}/{self.total} ({pct:.1f}%) | {fps:.1f} fps | "
-                 f"elapsed {self._fmt(el)} | ETA {self._fmt(eta)}")
+        vram = runtime.format_vram_usage(min_interval_s=self.vram_interval_s) if self.log_vram else ""
+        self.log(f"{self.prefix} {done}/{self.total} ({pct:.1f}%) | {fps:.1f} fps | "
+                 f"elapsed {self._fmt(el)} | ETA {self._fmt(eta)}{vram}")
 
     def finish(self, done: int) -> None:
         self.update(done, force=True)
@@ -141,6 +146,32 @@ def _pack_planes(out_y, out_uv, bit_depth: int):
     if bit_depth > 8:
         return GpuP016AppFrame(packed, w, h)
     return GpuNv12AppFrame(packed, w, h)
+
+
+def _copy_planes_to_packed_views(src_y, src_uv, bit_depth: int):
+    """Copy decoded planes once into an encoder-packed buffer and return writable views.
+
+    Paste needs a mutable full-frame buffer because NVENC cannot consume the
+    decoded frame after only a small rect is changed. Building the packed buffer
+    first avoids the old path's extra full-frame copy through separate Y/UV
+    temporaries.
+    """
+    import cupy as cp
+
+    h, w = src_y.shape
+    dtype = cp.uint16 if bit_depth > 8 else cp.uint8
+    packed = cp.empty((h * 3 // 2, w), dtype=dtype)
+    y = packed[:h, :]
+    uv = packed[h:, :].reshape(h // 2, w // 2, 2)
+    y[...] = src_y
+    uv[...] = src_uv
+    return packed, y, uv
+
+
+def _app_frame_from_packed(packed, width: int, height: int, bit_depth: int):
+    if bit_depth > 8:
+        return GpuP016AppFrame(packed, width, height)
+    return GpuNv12AppFrame(packed, width, height)
 
 
 def _match_depth(arr, src_bd: int, dst_bd: int):
@@ -187,6 +218,14 @@ def _cfg(key: str, default):
         return default
 
 
+def _cfg_bool(key: str, default: bool) -> bool:
+    """Read a boolean config value, tolerating string forms like '0'/'false'/'off'."""
+    v = _cfg(key, default)
+    if isinstance(v, str):
+        return v.strip().lower() not in {"", "0", "false", "no", "off"}
+    return bool(v)
+
+
 def _quality_bitrate_bps(out_w: int, out_h: int, fps: float) -> int:
     """Fallback for unknown source bitrate: estimate VBR target bitrate from output resolution at about 0.07 bit/px/frame."""
     px = max(1, int(out_w) * int(out_h))
@@ -197,36 +236,44 @@ def _resolve_bitrate(out_w: int, out_h: int, fps: float,
                      bitrate_bps: int | None, source_bitrate_bps: int = 0) -> int:
     """Target bitrate strategy:
       1. Use the caller's explicit value when provided.
-      2. Otherwise use source bitrate times gpu_bitrate_multiplier, default 2.0,
+      2. Otherwise use source bitrate times gpu_bitrate_multiplier, default 1.2,
          keeping intermediate/converted file sizes controlled while staying
          slightly above source quality, per user preference.
       3. If source bitrate is unknown, estimate from output resolution.
     """
     if bitrate_bps and bitrate_bps > 0:
         return int(bitrate_bps)
-    mult = float(_cfg("gpu_bitrate_multiplier", 2.0) or 2.0)
+    mult = float(_cfg("gpu_bitrate_multiplier", 1.2) or 1.2)
     if source_bitrate_bps and source_bitrate_bps > 0:
         return int(source_bitrate_bps * mult)
     return _quality_bitrate_bps(out_w, out_h, fps)
 
 
 def _encoder_kwargs(meta: probe.VideoMetadata, bitrate_bps: int, *,
-                    maxrate_multiplier: float = 1.0,
+                    maxrate_multiplier: float | None = None,
                     max_bitrate_bps: int | None = None) -> dict:
-    """Always use capped VBR to avoid uncontrolled constqp output sizes.
+    """Always use capped VBR with peak headroom to avoid CBR-like clamps.
 
     Note the NVENC preset semantics: P1 is fastest/lowest quality and P7 is
-    slowest/highest quality, which is counterintuitive. Default to P7. The
-    frontend controls this through gpu_encode_preset, typically P4-P7 tradeoffs.
+    slowest/highest quality, which is counterintuitive. User-facing profiles are
+    resolved once in utils.encode_config and shared by every OneClick encode
+    stage, so changing a profile affects crop/paste/merge/Lada fallback together.
     """
-    preset = str(_cfg("gpu_encode_preset", "P7") or "P7").upper()
-    if preset not in {f"P{i}" for i in range(1, 8)}:
-        preset = "P7"
+    try:
+        from utils import encode_config
+
+        profile_kwargs = encode_config.build_pynv_encoder_kwargs()
+        configured_maxrate_multiplier = encode_config.maxrate_multiplier()
+    except Exception:
+        profile_kwargs = {"preset": "P1", "aq": "1", "multipass": "fullres"}
+        configured_maxrate_multiplier = float(_cfg("gpu_encode_maxrate_multiplier", 2.0) or 2.0)
+    preset = str(profile_kwargs.get("preset", "P4") or "P4").upper()
     if max_bitrate_bps and max_bitrate_bps > 0:
         maxrate = max(int(bitrate_bps), int(max_bitrate_bps))
     else:
-        maxrate = max(int(bitrate_bps), int(bitrate_bps * max(1.0, float(maxrate_multiplier or 1.0))))
-    return {
+        multiplier = configured_maxrate_multiplier if maxrate_multiplier is None else maxrate_multiplier
+        maxrate = max(int(bitrate_bps), int(bitrate_bps * max(1.0, float(multiplier or 1.0))))
+    kwargs = {
         "fps": f"{meta.source_fps:.6f}",
         "gop": "30",
         "bf": "0",
@@ -236,6 +283,14 @@ def _encoder_kwargs(meta: probe.VideoMetadata, bitrate_bps: int, *,
         "bitrate": str(int(bitrate_bps)),
         "maxbitrate": str(maxrate),
     }
+    # Quality levers validated in the crop/paste optimization research (2026-06-25):
+    # two-pass rate control (multipass=fullres) plus spatial AQ improve BOTH the
+    # restored patch and the background by several dB at fixed bitrate, while still
+    # running faster than legacy P7 defaults because the preset can be lowered. multipass costs
+    # ~30% encode time. temporalaq adds a further gain but is off by default pending
+    # visual validation on high-motion content (PSNR cannot see temporal flicker).
+    kwargs.update({k: v for k, v in profile_kwargs.items() if k != "preset"})
+    return kwargs
 
 
 def _log_encoder_settings(label: str, out_w: int, out_h: int, bit_depth: int,
@@ -243,11 +298,13 @@ def _log_encoder_settings(label: str, out_w: int, out_h: int, bit_depth: int,
     if not log_callback:
         return
     log_callback(
-        f"[gpu-encoder] {label}: out={int(out_w)}x{int(out_h)} {int(bit_depth)}bit "
+        f"[gpu-encoder requested] {label}: out={int(out_w)}x{int(out_h)} {int(bit_depth)}bit "
         f"preset={kwargs.get('preset')} rc={kwargs.get('rc')} "
         f"bitrate={int(kwargs.get('bitrate', 0)) // 1000}kbps "
         f"maxbitrate={int(kwargs.get('maxbitrate', 0)) // 1000}kbps "
-        f"gop={kwargs.get('gop')} bf={kwargs.get('bf')}"
+        f"gop={kwargs.get('gop')} bf={kwargs.get('bf')} "
+        f"multipass={kwargs.get('multipass', 'off')} aq={kwargs.get('aq', '0')} "
+        f"temporalaq={kwargs.get('temporalaq', '0')}"
     )
 
 
@@ -301,11 +358,17 @@ class _EncodeSink:
         self.f = fobj
         self.pending = _deque(maxlen=max(2, int(ring)))
         self.count = 0
+        sync_mode = str(os.environ.get("VRVT_PASTE_ENCODE_SYNC", "device")).strip().lower()
+        self._sync_current_stream = sync_mode in {"stream", "current_stream", "cupy_stream"}
 
     def feed(self, app, *, force_idr: bool = False) -> None:
         import cupy as cp
+
         # Ensure kernels writing the packed buffer finish before NVENC reads it.
-        cp.cuda.Device().synchronize()
+        if self._sync_current_stream:
+            cp.cuda.get_current_stream().synchronize()
+        else:
+            cp.cuda.Device().synchronize()
         data = self.enc.encode(app, force_idr=force_idr)
         if data:
             self.f.write(data)
@@ -707,6 +770,7 @@ def combine_video(
     from_fisheye: bool = False,
     cq: int | None = 18,
     bitrate_bps: int | None = None,
+    max_bitrate_bps: int | None = None,
     keep_audio: bool = True,
     log_callback=None,
     cancel_token: "CancelToken | None" = None,
@@ -728,7 +792,7 @@ def combine_video(
         raise ValueError(f"unknown combine mode: {mode}")
 
     bitrate_bps = _resolve_bitrate(out_w, out_h, meta.source_fps, bitrate_bps, meta.bitrate_bps)
-    enc_kwargs = _encoder_kwargs(meta, bitrate_bps)
+    enc_kwargs = _encoder_kwargs(meta, bitrate_bps, max_bitrate_bps=max_bitrate_bps)
     _log_encoder_settings("combine video", out_w, out_h, bd, enc_kwargs, log_callback)
     enc = PyNvEncoderSession(out_w, out_h, bit_depth=bd, codec="hevc",
                              **enc_kwargs)
@@ -806,11 +870,13 @@ def paste_segments_gpu(
     *,
     cq: int | None = 18,
     bitrate_bps: int | None = None,
+    max_bitrate_bps: int | None = None,
     keep_audio: bool = True,
     feather_px: int | None = None,
     start_frame: int | None = None,
     end_frame: int | None = None,
     log_callback=None,
+    process_callback=None,
     cancel_token: "CancelToken | None" = None,
 ) -> Path:
     """GPU paste restored cropped segments back onto ``base_src``.
@@ -866,7 +932,7 @@ def paste_segments_gpu(
 
     segs = sorted(segments, key=lambda s: (int(s.base_frame_start), int(s.base_frame_end), int(s.seg_id)))
     bitrate_bps = _resolve_bitrate(info.width, info.height, fps, bitrate_bps, meta.bitrate_bps)
-    enc_kwargs = _encoder_kwargs(meta, bitrate_bps)
+    enc_kwargs = _encoder_kwargs(meta, bitrate_bps, max_bitrate_bps=max_bitrate_bps)
     _log_encoder_settings("pre-extract paste", info.width, info.height, bd, enc_kwargs, log_callback)
     enc = PyNvEncoderSession(
         info.width, info.height, bit_depth=bd, codec="hevc",
@@ -908,11 +974,22 @@ def paste_segments_gpu(
                 frame = base_dec.frame_at(i)
                 cp.cuda.Device().synchronize()
                 base_y_src, base_uv_src = frame.y_uv_cupy()
-                # Intentionally edit this frame view in-place. _pack_planes() copies
-                # the final planes into an independent packed buffer before NVENC
-                # reads them, so decoder ring reuse on the next frame is safe.
-                y = cp.ascontiguousarray(base_y_src)
-                uv = cp.ascontiguousarray(base_uv_src)
+                if base_y_src.shape != (int(info.height), int(info.width)):
+                    raise RuntimeError(
+                        f"decoded luma plane size mismatch: {base_y_src.shape[1]}x{base_y_src.shape[0]}, "
+                        f"expected {info.width}x{info.height}"
+                    )
+                expected_uv_shape = (int(info.height) // 2, int(info.width) // 2, 2)
+                if base_uv_src.shape != expected_uv_shape:
+                    raise RuntimeError(
+                        f"decoded chroma plane size mismatch: {base_uv_src.shape}, "
+                        f"expected {expected_uv_shape}"
+                    )
+                # Copy the decoded full frame directly into the packed encoder
+                # buffer, then patch rect views in-place. This keeps the
+                # lifetime-safe NVENC input buffer while avoiding a second
+                # full-frame Y/UV copy before packing.
+                packed, y, uv = _copy_planes_to_packed_views(base_y_src, base_uv_src, bd)
 
                 for state in list(active):
                     seg = state["seg"]
@@ -943,7 +1020,7 @@ def paste_segments_gpu(
                     a_c = state["alpha_c"][..., None]
                     ruv[:] = cp.rint(a_c * suv.astype(cp.float32) + (1.0 - a_c) * ruv.astype(cp.float32)).astype(uv.dtype)
 
-                app = _pack_planes(y, uv, bd)
+                app = _app_frame_from_packed(packed, info.width, info.height, bd)
                 sink.feed(app, force_idr=(i == frame_start))
                 done += 1
                 prog.update(done)
@@ -968,6 +1045,12 @@ def paste_segments_gpu(
             log_callback("[pre-extract] GPU paste cancelled by user")
         raise OperationCancelled("cancelled by user")
 
+    if log_callback:
+        try:
+            raw_mb = raw.stat().st_size / (1024 * 1024)
+            log_callback(f"[pre-extract] GPU paste raw encoded: {raw} ({raw_mb:.1f} MB); muxing...")
+        except OSError:
+            log_callback(f"[pre-extract] GPU paste raw encoded: {raw}; muxing...")
     mux.mux_hevc_with_audio(
         raw,
         dst,
@@ -975,11 +1058,15 @@ def paste_segments_gpu(
         color=meta.color,
         audio_source=str(base_src) if keep_audio and frame_start == 0 and frame_end == total else None,
         log_callback=log_callback,
+        process_callback=process_callback,
+        cancel_token=cancel_token,
     )
     try:
         raw.unlink()
     except OSError:
         pass
+    if log_callback:
+        log_callback(f"[pre-extract] GPU paste mux done: {dst}")
     return dst
 
 
@@ -991,9 +1078,11 @@ def paste_fisheye_eye_rects_to_sbs_gpu(
     fov: float = 180.0,
     cq: int | None = 18,
     bitrate_bps: int | None = None,
+    max_bitrate_bps: int | None = None,
     keep_audio: bool = True,
     feather_px: int | None = None,
     log_callback=None,
+    process_callback=None,
     cancel_token: "CancelToken | None" = None,
 ) -> Path:
     """Patch restored fisheye-eye rect clips into an SBS hequirect interval.
@@ -1095,7 +1184,7 @@ def paste_fisheye_eye_rects_to_sbs_gpu(
 
     segs = sorted(segments, key=lambda s: (int(s.base_frame_start), int(s.base_frame_end), int(s.seg_id)))
     bitrate_bps = _resolve_bitrate(info.width, info.height, fps, bitrate_bps, meta.bitrate_bps)
-    enc_kwargs = _encoder_kwargs(meta, bitrate_bps)
+    enc_kwargs = _encoder_kwargs(meta, bitrate_bps, max_bitrate_bps=max_bitrate_bps)
     _log_encoder_settings("fisheye eye rect paste", info.width, info.height, bd, enc_kwargs, log_callback)
     enc = PyNvEncoderSession(
         info.width, info.height, bit_depth=bd, codec="hevc",
@@ -1270,6 +1359,12 @@ def paste_fisheye_eye_rects_to_sbs_gpu(
             log_callback("[pre-extract] GPU fisheye patch cancelled by user")
         raise OperationCancelled("cancelled by user")
 
+    if log_callback:
+        try:
+            raw_mb = raw.stat().st_size / (1024 * 1024)
+            log_callback(f"[pre-extract] GPU fisheye patch raw encoded: {raw} ({raw_mb:.1f} MB); muxing...")
+        except OSError:
+            log_callback(f"[pre-extract] GPU fisheye patch raw encoded: {raw}; muxing...")
     mux.mux_hevc_with_audio(
         raw,
         dst,
@@ -1277,11 +1372,15 @@ def paste_fisheye_eye_rects_to_sbs_gpu(
         color=meta.color,
         audio_source=str(base_src) if keep_audio else None,
         log_callback=log_callback,
+        process_callback=process_callback,
+        cancel_token=cancel_token,
     )
     try:
         raw.unlink()
     except OSError:
         pass
+    if log_callback:
+        log_callback(f"[pre-extract] GPU fisheye patch mux done: {dst}")
     return dst
 
 
@@ -1293,6 +1392,7 @@ def replace_timeline_segments_gpu(
     audio_source: str | Path | None = None,
     cq: int | None = 18,
     bitrate_bps: int | None = None,
+    max_bitrate_bps: int | None = None,
     log_callback=None,
     cancel_token: "CancelToken | None" = None,
 ) -> Path:
@@ -1346,7 +1446,7 @@ def replace_timeline_segments_gpu(
             log_callback(f"[source-scan] ... {len(specs) - 30} more GPU merge mosaic entries")
 
     bitrate_bps = _resolve_bitrate(info.width, info.height, fps, bitrate_bps, meta.bitrate_bps)
-    enc_kwargs = _encoder_kwargs(meta, bitrate_bps)
+    enc_kwargs = _encoder_kwargs(meta, bitrate_bps, max_bitrate_bps=max_bitrate_bps)
     _log_encoder_settings("source-scan timeline merge", info.width, info.height, bd, enc_kwargs, log_callback)
     enc = PyNvEncoderSession(
         info.width, info.height, bit_depth=bd, codec="hevc",

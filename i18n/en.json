@@ -64,6 +64,8 @@
       "btn_close": "Close",
       "msg_dlna_dirs_required_title": "Video Directories Required",
       "msg_dlna_dirs_required": "Please add at least one video directory before starting the DLNA server.",
+      "msg_dlna_unc_rejected_title": "Unsupported DLNA Directory",
+      "msg_dlna_unc_rejected": "UNC/network share paths starting with \\\\ are not supported by this DLNA server. Please choose a local drive or a mounted drive letter path.",
       "confirm_running_title": "Tasks Still Running",
       "confirm_running_message": "This window still has running tasks. Leaving this window will stop them first, and unfinished outputs may be unusable.\n\nStop the tasks and leave?",
       "lbl_language": "Language:"
@@ -294,10 +296,20 @@
       "err_invalid_format": "Invalid format",
       "err_time_order": "Start time must be less than End time",
       "opt_fisheye": "Convert to fisheye before processing (Good for some vr manufacturer such as SAVR/URVRSP...)",
-      "opt_pre_extract": "(Experimental) Pre-extract mosaic clips and regions; detection confidence threshold",
+      "opt_pre_extract": "Pre-extract mosaic clips and regions; detection confidence threshold",
+      "opt_pre_extract_hint_title": "Note",
+      "opt_pre_extract_hint": "(Do not use with maximum quality; recommended when mosaic positions are stable)",
       "opt_source_time_filter": "Pre-scan source to skip non-mosaic spans (max speed; whole-video skip when empty)",
       "chk_keep_inter": "Keep intermediate files after execution",
-      "chk_keep_bitrate": "Keep output bitrate same as original video"
+      "chk_keep_bitrate": "Keep output bitrate same as original video",
+      "lbl_encode_profile": "Encode Profile:",
+      "opt_encode_highest_quality": "Maximum quality",
+      "opt_encode_balanced_high_quality": "Balanced high quality",
+      "opt_encode_fast_quality": "Fast high quality",
+      "opt_encode_ultra_fast_normal": "Ultra-fast normal quality",
+      "opt_encode_custom": "Current custom settings",
+      "hint_encode_profile": "Default is balanced high quality; NativeGPU/Lada apply full preset/AQ/two-pass settings, Jasna applies CQ only",
+      "log_encode_profile_set": "Encode profile set to {profile} (preset={preset}, multipass={multipass}, aq={aq}, temporal_aq={temporal_aq})"
     },
     "area_vr2flat": {
       "title": "VR Area Selection Mosaic Removal Tool( VR->Flat->VR)",
@@ -783,6 +795,15 @@
       "opt_preset_p6": "High quality P6",
       "opt_preset_p5": "Balanced P5",
       "opt_preset_p4": "Normal fast P4",
+      "lbl_encode_profile": "Encode Profile:",
+      "opt_encode_maximum_quality": "Balanced high quality",
+      "opt_encode_highest_quality": "Maximum quality",
+      "opt_encode_balanced_high_quality": "Balanced high quality",
+      "opt_encode_fast_quality": "Fast high quality",
+      "opt_encode_ultra_fast_normal": "Ultra-fast normal quality",
+      "opt_encode_custom": "Current custom settings",
+      "hint_encode_profile": "Default is balanced high quality; NativeGPU/Lada apply full preset/AQ/two-pass settings, Jasna applies CQ only",
+      "log_encode_profile_set": "Encode profile set to {profile} (preset={preset}, multipass={multipass}, aq={aq}, temporal_aq={temporal_aq})",
       "warn_dep": "[!] Missing required tools: {}",
       "warn_path": ">> Please refer to the 'readme.txt' in the same folder for step-by-step installation instructions."
     }

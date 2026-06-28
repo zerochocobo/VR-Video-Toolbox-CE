@@ -95,6 +95,23 @@ class NativeMosaicEngine:
         self._patch_detection_gpu_preprocess()
         self._warmup_native_pipeline()
 
+    def release(self) -> None:
+        """Release model references held by the singleton before memory-heavy GPU stages."""
+        self.detection_model = None
+        self.restoration_model = None
+        self.pad_mode = None
+        self._decode_stream = None
+        try:
+            from gpu_engine import runtime
+
+            runtime.free_memory_pool()
+        except Exception:
+            pass
+        try:
+            self.torch.cuda.empty_cache()
+        except Exception:
+            pass
+
     def _patch_detection_gpu_preprocess(self):
         """Fix LADA GPU frame preprocessing for HWC torch frames.
 
@@ -187,6 +204,14 @@ class NativeMosaicEngine:
 
     def _resolve_encoder(self):
         """Choose an nvenc HEVC encoding preset, falling back to reasonable hevc_nvenc options if the CSV preset is unavailable."""
+        try:
+            from utils import encode_config
+
+            return "hevc_nvenc", encode_config.build_lada_encoder_options(cq=18).strip()
+        except Exception:
+            pass
+        # Defensive fallback for early import/bootstrap failures before the
+        # shared OneClick encode profile layer is available.
         from lada.utils import video_utils
         try:
             default_name = video_utils.get_default_preset_name()
@@ -241,6 +266,7 @@ class NativeMosaicEngine:
                 self.device, input_path, max_clip_length, self.restoration_name,
                 self.detection_model, self.restoration_model, self.pad_mode,
                 video_meta_data=video_meta_data, frame_source_factory=frame_source_factory,
+                progress_log_callback=log_callback,
             )
 
         try:
@@ -396,7 +422,15 @@ class NativeMosaicEngine:
         _log(f"[native] encoder=hevc_nvenc(gpu-resident) fp16={self.fp16}")
 
         total = getattr(meta, "frames_count", 0) or 0
-        prog = _Progress(total, log_callback)
+        from gpu_engine.native_mosaic.progress import native_progress_interval_s, native_progress_min_pct
+
+        prog = _Progress(
+            total,
+            log_callback,
+            min_interval=native_progress_interval_s(),
+            min_pct=native_progress_min_pct(),
+            prefix="[native]",
+        )
         written = 0
         success = True
         try:
@@ -506,7 +540,7 @@ class NativeMosaicEngine:
                                   *, log_callback=None, cancel_token=None,
                                   profile=None) -> bool:
         """Fallback to the original Lada VideoWriter encode path for HDR/10-bit/non-PyNv-safe sources."""
-        from gpu_engine.files import _media_temp_path
+        from gpu_engine.files import _Progress, _media_temp_path
         from gpu_engine.native_mosaic import _gpu_ops
         from lada.utils import audio_utils, video_utils
         from lada.utils.threading_utils import STOP_MARKER, ErrorMarker
@@ -526,6 +560,15 @@ class NativeMosaicEngine:
         success = True
         n = 0
         total = getattr(meta, "frames_count", 0) or 0
+        from gpu_engine.native_mosaic.progress import native_progress_interval_s, native_progress_min_pct
+
+        prog = _Progress(
+            total,
+            log_callback,
+            min_interval=native_progress_interval_s(),
+            min_pct=native_progress_min_pct(),
+            prefix="[native]",
+        )
         try:
             with profile.section("restorer.start") if profile else nullcontext():
                 frame_restorer.start()
@@ -552,9 +595,9 @@ class NativeMosaicEngine:
                     n += 1
                     if profile:
                         profile.increment("frames_written_videowriter")
-                    if log_callback and (n % 30 == 0):
-                        pct = f" ({100 * n / total:.0f}%)" if total else ""
-                        _log(f"[native] restored {n}{('/' + str(total)) if total else ''} frames{pct}")
+                    prog.update(n)
+                if success:
+                    prog.finish(n)
         except Exception as e:
             success = False
             _log(f"[native] error: {type(e).__name__}: {e}")
@@ -868,6 +911,7 @@ class NativeMosaicEngine:
         cancel_token=None,
     ):
         from gpu_engine.fallback import OperationCancelled
+        from gpu_engine.native_mosaic.progress import vram_suffix
         from lada.restorationpipeline.frame_restorer import FrameRestorer
         from lada.utils.threading_utils import STOP_MARKER, ErrorMarker
 
@@ -882,6 +926,7 @@ class NativeMosaicEngine:
             self.device, input_path, max_clip_length, self.restoration_name,
             self.detection_model, self.restoration_model, self.pad_mode,
             video_meta_data=lada_meta, frame_source_factory=frame_source_factory,
+            progress_log_callback=log_callback,
         )
 
         n = 0
@@ -898,7 +943,7 @@ class NativeMosaicEngine:
                 if log_callback and n % 30 == 0:
                     total = getattr(lada_meta, "frames_count", 0) or 0
                     suffix = f"/{total}" if total else ""
-                    log_callback(f"[native-stream] {crop_mode} restored {n}{suffix} frames")
+                    log_callback(f"[native-stream] {crop_mode} restored {n}{suffix} frames{vram_suffix()}")
                 yield elem
         finally:
             frame_restorer.stop()
@@ -1023,7 +1068,15 @@ class NativeMosaicEngine:
             start_idx = int(round((start_sec or 0.0) * fps))
             end_idx = int(round(end_sec * fps)) if end_sec is not None else src_meta.nb_frames
             total = max(0, min(end_idx, src_meta.nb_frames) - start_idx)
-        prog = _Progress(total, log_callback)
+        from gpu_engine.native_mosaic.progress import native_progress_interval_s, native_progress_min_pct
+
+        prog = _Progress(
+            total,
+            log_callback,
+            min_interval=native_progress_interval_s(),
+            min_pct=native_progress_min_pct(),
+            prefix="[native]",
+        )
         try:
             with open(raw_path, "wb") as f:
                 sink = _EncodeSink(enc, f)

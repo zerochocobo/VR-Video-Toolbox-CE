@@ -8,6 +8,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from utils import encode_config
 from utils.mosaic_prescan import MosaicSegment
 
 
@@ -81,23 +82,29 @@ def segment_file_matches_rect(path: str | Path, segment: MosaicSegment) -> bool:
     return size == (int(segment.w), int(segment.h))
 
 
-def list_keyframes(path: str | Path) -> list[float]:
-    ffprobe = shutil.which("ffprobe") or "ffprobe"
-    cmd = [
-        ffprobe,
-        "-hide_banner", "-v", "error",
-        "-select_streams", "v:0",
-        "-skip_frame", "nokey",
-        "-show_frames",
-        "-show_entries", "frame=pts_time,best_effort_timestamp_time",
-        "-of", "json",
-        str(path),
-    ]
-    try:
-        raw = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, **_hidden_kwargs())
-        data = json.loads(raw)
-    except Exception:
-        return []
+def _parse_keyframe_packets(raw: str) -> list[float]:
+    out: list[float] = []
+    for line in raw.splitlines():
+        if not line:
+            continue
+        fields = [part.strip() for part in line.split(",") if part.strip()]
+        if not fields:
+            continue
+        timestamp: float | None = None
+        flags = ""
+        for field in fields:
+            try:
+                timestamp = float(field)
+                continue
+            except Exception:
+                flags += field
+        if timestamp is not None and timestamp >= 0.0 and "K" in flags:
+            out.append(timestamp)
+    return sorted(set(out))
+
+
+def _parse_keyframe_frames(raw: bytes | str) -> list[float]:
+    data = json.loads(raw)
     out: list[float] = []
     for frame in data.get("frames", []):
         value = frame.get("pts_time") or frame.get("best_effort_timestamp_time")
@@ -108,6 +115,79 @@ def list_keyframes(path: str | Path) -> list[float]:
         if ts >= 0:
             out.append(ts)
     return sorted(set(out))
+
+
+def _list_keyframes_from_pyav(path: str | Path) -> list[float]:
+    import av
+
+    out: list[float] = []
+    with av.open(str(path), "r") as container:
+        stream = container.streams.video[0]
+        time_base = stream.time_base
+        for packet in container.demux(stream):
+            if packet.pts is None or not packet.is_keyframe:
+                continue
+            ts = float(packet.pts * time_base)
+            if ts >= 0.0:
+                out.append(round(ts, 6))
+    return sorted(set(out))
+
+
+def _list_keyframes_from_packets(path: str | Path, ffprobe: str) -> list[float]:
+    cmd = [
+        ffprobe,
+        "-hide_banner", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_packets",
+        "-show_entries", "packet=pts_time,flags",
+        "-of", "csv=p=0",
+        str(path),
+    ]
+    raw = subprocess.check_output(
+        cmd,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        **_hidden_kwargs(),
+    )
+    return _parse_keyframe_packets(raw)
+
+
+def _list_keyframes_from_frames(path: str | Path, ffprobe: str) -> list[float]:
+    cmd = [
+        ffprobe,
+        "-hide_banner", "-v", "error",
+        "-select_streams", "v:0",
+        "-skip_frame", "nokey",
+        "-show_frames",
+        "-show_entries", "frame=pts_time,best_effort_timestamp_time",
+        "-of", "json",
+        str(path),
+    ]
+    raw = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, **_hidden_kwargs())
+    return _parse_keyframe_frames(raw)
+
+
+def list_keyframes(path: str | Path) -> list[float]:
+    try:
+        keyframes = _list_keyframes_from_pyav(path)
+    except Exception:
+        keyframes = []
+    if keyframes:
+        return keyframes
+
+    ffprobe = shutil.which("ffprobe") or "ffprobe"
+    try:
+        keyframes = _list_keyframes_from_packets(path, ffprobe)
+    except Exception:
+        keyframes = []
+    if keyframes:
+        return keyframes
+    try:
+        return _list_keyframes_from_frames(path, ffprobe)
+    except Exception:
+        return []
 
 
 def _floor_kf(value: float, keyframes: list[float]) -> float:
@@ -341,8 +421,7 @@ def cut_segment(input_path: str | Path, output_path: str | Path, segment: Mosaic
         "-t", f"{duration:.6f}",
         "-vf", crop,
         "-an",
-        "-c:v", "hevc_nvenc",
-        "-preset", "p7",
+        *encode_config.build_ffmpeg_nvenc_base_args(),
         "-rc", "vbr",
         "-cq", "18",
         "-g", "60",

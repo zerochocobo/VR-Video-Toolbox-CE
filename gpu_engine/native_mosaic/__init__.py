@@ -151,6 +151,47 @@ def get_engine():
         return _engine
 
 
+def release_engine(log_callback=None) -> bool:
+    """Drop the cached in-process engine and return its model VRAM to CUDA."""
+    global _engine
+    with _lock:
+        engine = _engine
+        _engine = None
+    if engine is None:
+        return False
+    try:
+        release = getattr(engine, "release", None)
+        if callable(release):
+            release()
+    finally:
+        try:
+            del engine
+        except Exception:
+            pass
+        try:
+            import gc
+
+            gc.collect()
+        except Exception:
+            pass
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        try:
+            from gpu_engine import runtime
+
+            runtime.free_memory_pool()
+        except Exception:
+            pass
+    if log_callback:
+        log_callback("[native] released cached engine before GPU paste")
+    return True
+
+
 def restore_file(input_path, output_path, *, bitrate_bps=None, log_callback=None,
                  cancel_token=None, max_clip_length=180, produce_mp4: bool = True,
                  sidecar_metadata: dict | None = None):

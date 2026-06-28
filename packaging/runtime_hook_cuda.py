@@ -33,6 +33,25 @@ def _add_dll_dir(d: str) -> None:
             pass
 
 
+def _set_cache_dir_env(key: str, path: str) -> None:
+    """Set a writable runtime cache path unless the user already supplied one."""
+    if os.environ.get(key):
+        return
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".write_test")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        try:
+            os.unlink(probe)
+        except OSError:
+            pass
+        os.environ[key] = path
+    except OSError:
+        # Leave the variable unset so CuPy/CUDA can fall back to their defaults.
+        pass
+
+
 def _setup() -> None:
     if not getattr(sys, "frozen", False):
         return
@@ -41,6 +60,10 @@ def _setup() -> None:
 
     exe_dir = os.path.dirname(os.path.abspath(sys.executable))
     meipass = getattr(sys, "_MEIPASS", None) or exe_dir
+    cache_root = os.path.join(exe_dir, "runtime_cache")
+    _set_cache_dir_env("CUPY_CACHE_DIR", os.path.join(cache_root, "cupy_kernel_cache"))
+    _set_cache_dir_env("CUDA_CACHE_PATH", os.path.join(cache_root, "cuda_compute_cache"))
+
     # In onedir mode, _MEIPASS may be exe_dir or exe_dir\_internal, so probe both.
     internal_dir = os.path.join(exe_dir, "_internal")
     if not _isdir(internal_dir):

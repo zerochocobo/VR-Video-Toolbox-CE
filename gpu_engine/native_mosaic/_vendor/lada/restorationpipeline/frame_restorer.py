@@ -20,6 +20,7 @@ from lada.restorationpipeline.mosaic_detector import Clip
 from lada.models.yolo.yolo11_segmentation_model import Yolo11SegmentationModel
 from gpu_engine import vram_offload
 from gpu_engine.native_mosaic import _gpu_ops
+from gpu_engine.native_mosaic.progress import NativeStageProgress
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=LOG_LEVEL)
@@ -27,7 +28,8 @@ logging.basicConfig(level=LOG_LEVEL)
 class FrameRestorer:
     def __init__(self, device, video_file, max_clip_length, mosaic_restoration_model_name,
                  mosaic_detection_model: Yolo11SegmentationModel, mosaic_restoration_model, preferred_pad_mode,
-                 mosaic_detection=False, video_meta_data=None, frame_source_factory=None):
+                 mosaic_detection=False, video_meta_data=None, frame_source_factory=None,
+                 progress_log_callback=None):
         self.device = torch.device(device)
         self.mosaic_restoration_model_name = mosaic_restoration_model_name
         self.max_clip_length = max_clip_length
@@ -39,6 +41,9 @@ class FrameRestorer:
         self.start_ns = 0
         self.start_frame = 0
         self.mosaic_detection = mosaic_detection
+        self.progress_log_callback = progress_log_callback
+        self._clip_progress: NativeStageProgress | None = None
+        self._compose_progress: NativeStageProgress | None = None
         self.eof = False
         self.stop_requested = False
 
@@ -64,7 +69,8 @@ class FrameRestorer:
                                               max_clip_length=self.max_clip_length,
                                               pad_mode=self.preferred_pad_mode,
                                               error_handler=self._on_worker_thread_error,
-                                              frame_source_factory=self.frame_source_factory)
+                                              frame_source_factory=self.frame_source_factory,
+                                              progress_log_callback=progress_log_callback)
 
         self.clip_restoration_thread: PipelineThread | None = None
         self.frame_restoration_thread: PipelineThread | None = None
@@ -81,6 +87,18 @@ class FrameRestorer:
 
             self.start_ns = start_ns
             self.start_frame = video_utils.offset_ns_to_frame_num(self.start_ns, self.video_meta_data.video_fps_exact)
+            total_frames = max(0, int(getattr(self.video_meta_data, "frames_count", 0) or 0) - int(self.start_frame))
+            self._clip_progress = NativeStageProgress(
+                "FrameRestorer restore clips",
+                self.progress_log_callback,
+                unit="clips",
+            )
+            self._compose_progress = NativeStageProgress(
+                "FrameRestorer compose",
+                self.progress_log_callback,
+                total=total_frames,
+                unit="frames",
+            )
             self.stop_requested = False
 
             self.frame_restoration_thread = PipelineThread(name="frame restoration worker", target=self._frame_restoration_worker, error_handler=self._on_worker_thread_error)
@@ -209,8 +227,16 @@ class FrameRestorer:
             clip_img, clip_mask, orig_clip_box, orig_crop_shape, pad_after_resize = buffered_clip.pop()
             clip_img = image_utils.unpad_image(clip_img, pad_after_resize)
             clip_mask = image_utils.unpad_image(clip_mask, pad_after_resize)
-            clip_img = image_utils.resize(clip_img, orig_crop_shape[:2])
-            clip_mask = image_utils.resize(clip_mask, orig_crop_shape[:2],interpolation=cv2.INTER_NEAREST)
+            # Hot path: use the lightweight F.interpolate-based resize for CUDA
+            # tensors instead of image_utils.resize, which allocates a fresh
+            # torchvision Resize transform object on every call. Mirrors the GPU
+            # path already used when building the Clip (see mosaic_detector.Clip).
+            if _gpu_ops.is_cuda_hwc_tensor(clip_img):
+                clip_img = _gpu_ops.resize_hwc_gpu(clip_img, orig_crop_shape[:2], interpolation=cv2.INTER_LINEAR)
+                clip_mask = _gpu_ops.resize_hwc_gpu(clip_mask, orig_crop_shape[:2], interpolation=cv2.INTER_NEAREST)
+            else:
+                clip_img = image_utils.resize(clip_img, orig_crop_shape[:2])
+                clip_mask = image_utils.resize(clip_mask, orig_crop_shape[:2], interpolation=cv2.INTER_NEAREST)
             blend_mask = mask_utils.create_blend_mask(clip_mask.to(device=self.device).float()).to(device=clip_img.device, dtype=target_dtype)
 
             blend(blend_mask, clip_img, orig_clip_box)
@@ -250,6 +276,7 @@ class FrameRestorer:
     def _clip_restoration_worker(self):
         logger.debug("clip restoration worker: started")
         eof = False
+        restored_clips = 0
         while not (eof or self.stop_requested):
             clip = self.mosaic_clip_queue.get()
             if self.stop_requested or clip is STOP_MARKER:
@@ -268,6 +295,9 @@ class FrameRestorer:
                 if self.device.type == 'mps' and hasattr(torch.mps, 'empty_cache'):
                     torch.mps.empty_cache()
                 self.restored_clip_queue.put(clip)
+                restored_clips += 1
+                if self._clip_progress is not None:
+                    self._clip_progress.update(restored_clips, extra=f"frames={len(clip)}")
                 if self.stop_requested:
                     logger.debug("clip restoration worker: restored_clip_queue producer unblocked")
                     break
@@ -338,6 +368,11 @@ class FrameRestorer:
                 if self.stop_requested:
                     logger.debug("frame restoration worker: frame_restoration_queue producer unblocked")
                     break
+            if self._compose_progress is not None:
+                self._compose_progress.update(
+                    frame_num - self.start_frame + 1,
+                    extra=f"active_mosaics={num_mosaics_detected}",
+                )
             frame_num += 1
 
     def _frame_restoration_worker(self):

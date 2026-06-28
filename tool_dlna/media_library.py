@@ -11,6 +11,16 @@ class MediaRoot:
     path: Path
 
 
+def is_unc_path(path: object) -> bool:
+    """Return True for UNC/network-share style paths unsupported by the DLNA scanner."""
+    try:
+        text = os.fspath(path)
+    except TypeError:
+        text = str(path or "")
+    text = str(text).strip()
+    return text.startswith("\\\\") or text.startswith("//")
+
+
 def safe_resolve_path(path: Path) -> Path:
     """Resolve paths without rejecting virtual drives that cannot report volume info."""
     expanded = Path(path).expanduser()
@@ -28,6 +38,8 @@ def parse_video_dirs(raw: object, default: Path) -> list[Path]:
     roots: list[Path] = []
     seen: set[str] = set()
     for part in parts:
+        if is_unc_path(part):
+            continue
         path = safe_resolve_path(Path(part))
         key = str(path).casefold()
         if key in seen:

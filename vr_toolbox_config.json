@@ -5,7 +5,7 @@
   "language": "zh",
   "dlna_server_name": "VR Video Server",
   "dlna_port": 8099,
-  "dlna_video_dirs": "G:\\Downloads|G:\\Downloads\\VR\\VR110|G:\\GIT\\debug\\VR_Video_Toolbox_NE\\videos",
+  "dlna_video_dirs": "G:\\Downloads|G:\\Downloads\\VR\\VR110|G:\\GIT\\debug\\VR_Video_Toolbox_NE\\videos|Y:\\",
   "dlna_auto_subtitles": true,
   "dlna_si_enabled": true,
   "dlna_si_mix_channel": "both",
@@ -13,10 +13,6 @@
   "dlna_si_volume_percent": 100,
   "dlna_si_delay_seconds": 1.0,
   "dlna_si_duck_original": true,
-  "transcode_backend": "auto",
-  "mosaic_engine": "lada",
-  "gpu_encode_preset": "P4",
-  "dlna_auto_subnotes": true,
-  "native_stream_enabled": false,
-  "native_detection_model": ""
+  "gpu_encode_profile": "balanced_high_quality",
+  "dlna_auto_subnotes": true
 }

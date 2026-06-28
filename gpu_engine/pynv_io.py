@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -832,6 +833,7 @@ class PyNvEncoderSession:
         *,
         bit_depth: int = 8,
         codec: str = "hevc",
+        use_cuda_graph: bool | None = None,
         **enc_kwargs: str,
     ):
         import PyNvVideoCodec as nvc
@@ -845,7 +847,10 @@ class PyNvEncoderSession:
         # "P016" is not a valid encoder input format name.
         self.fmt = "P010" if self.bit_depth > 8 else "NV12"
         kwargs = {"codec": codec, **{k: str(v) for k, v in enc_kwargs.items()}}
-        self._enc = nvc.CreateEncoder(self.width, self.height, self.fmt, False, **kwargs)
+        if use_cuda_graph is None:
+            raw = os.environ.get("VRVT_NVENC_CUDA_GRAPH")
+            use_cuda_graph = str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
+        self._enc = nvc.CreateEncoder(self.width, self.height, self.fmt, bool(use_cuda_graph), **kwargs)
         self._frame_index = 0
 
     def encode(self, app_frame: Any, *, force_idr: bool = False) -> bytes:

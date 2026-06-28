@@ -29,6 +29,58 @@ import sys
 _configured = False
 
 
+def _runtime_cache_root() -> str:
+    """Return the app-local runtime cache root used for GPU tool caches."""
+    if getattr(sys, "frozen", False):
+        return os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "runtime_cache")
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "runtime_cache")
+
+
+def _ensure_cache_dir(path: str) -> tuple[bool, str]:
+    """Create and write-probe a cache directory without leaving test files behind."""
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".write_test")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        try:
+            os.unlink(probe)
+        except OSError:
+            pass
+        return True, ""
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def _configure_cache_dirs(info: dict) -> None:
+    """Route CuPy and CUDA driver JIT caches to runtime_cache.
+
+    CuPy defaults to a user-profile cache such as %USERPROFILE%\\.cupy. On some
+    Windows accounts that directory may exist but be non-writable, which can
+    make first-use JIT operations appear to hang. Keep both CuPy's kernel cache
+    and the CUDA driver's compute cache inside the app-local runtime_cache.
+    """
+    root = _runtime_cache_root()
+    requested = {
+        "CUPY_CACHE_DIR": os.path.join(root, "cupy_kernel_cache"),
+        "CUDA_CACHE_PATH": os.path.join(root, "cuda_compute_cache"),
+    }
+    cache_info: dict[str, dict[str, str | bool]] = {}
+    for key, default_path in requested.items():
+        had_value = bool(os.environ.get(key))
+        path = os.environ.get(key) or default_path
+        ok, error = _ensure_cache_dir(path)
+        if ok and not had_value:
+            os.environ[key] = path
+        cache_info[key] = {
+            "path": os.environ.get(key, path),
+            "set_by_vrtb": ok and not had_value,
+            "writable": ok,
+            "error": error,
+        }
+    info["cache_dirs"] = cache_info
+
+
 def _nvidia_wheel_bin_dirs() -> list[str]:
     """Return bin directories from installed nvidia-*-cu12 wheels, including cudart/nvrtc DLLs."""
     dirs: list[str] = []
@@ -59,6 +111,7 @@ def configure() -> dict:
     info: dict = {}
     os.environ.setdefault("CUPY_COMPILE_WITH_PTX", "1")
     info["ptx"] = os.environ.get("CUPY_COMPILE_WITH_PTX")
+    _configure_cache_dirs(info)
 
     if getattr(sys, "frozen", False):
         info["frozen"] = True

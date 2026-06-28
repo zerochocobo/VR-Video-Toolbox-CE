@@ -21,14 +21,26 @@ FIX = ROOT / "tests" / "fixtures"
 OUT = Path(tempfile.gettempdir()) / "phase2_out"
 OUT.mkdir(exist_ok=True)
 logs: list[str] = []
+_backend_mode = "auto"
+_app_config_get = app_config.get
 
 
 def log(m):
     logs.append(str(m))
 
 
+def _verify_app_config_get(key, default=None):
+    if key == "transcode_backend":
+        return _backend_mode
+    return _app_config_get(key, default)
+
+
+app_config.get = _verify_app_config_get
+
+
 def set_backend(mode):
-    app_config.set("transcode_backend", mode)
+    global _backend_mode
+    _backend_mode = mode
 
 
 def clean():
