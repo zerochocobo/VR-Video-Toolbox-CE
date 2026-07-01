@@ -29,7 +29,8 @@ class FrameRestorer:
     def __init__(self, device, video_file, max_clip_length, mosaic_restoration_model_name,
                  mosaic_detection_model: Yolo11SegmentationModel, mosaic_restoration_model, preferred_pad_mode,
                  mosaic_detection=False, video_meta_data=None, frame_source_factory=None,
-                 progress_log_callback=None):
+                 progress_log_callback=None, detector_batch_size=4,
+                 frame_queue_mb=512, clip_queue_mb=512, detector_queue_size=8):
         self.device = torch.device(device)
         self.mosaic_restoration_model_name = mosaic_restoration_model_name
         self.max_clip_length = max_clip_length
@@ -47,16 +48,20 @@ class FrameRestorer:
         self.eof = False
         self.stop_requested = False
 
-        # limit queue size to approx 512MB
-        max_frames_in_frame_restoration_queue = (512 * 1024 * 1024) // (self.video_meta_data.video_width * self.video_meta_data.video_height * 3)
+        frame_queue_bytes = max(16, int(frame_queue_mb)) * 1024 * 1024
+        clip_queue_bytes = max(16, int(clip_queue_mb)) * 1024 * 1024
+
+        # limit queue size by memory budget
+        frame_bytes = max(1, self.video_meta_data.video_width * self.video_meta_data.video_height * 3)
+        max_frames_in_frame_restoration_queue = max(1, frame_queue_bytes // frame_bytes)
         self.frame_restoration_queue = PipelineQueue(name="frame_restoration_queue", maxsize=max_frames_in_frame_restoration_queue)
 
-        # limit queue size to approx 512MB
-        max_clips_in_mosaic_clips_queue = max(1, (512 * 1024 * 1024) // (self.max_clip_length * 256 * 256 * 4)) # 4 = 3 color channels + mask
+        # limit queue size by memory budget
+        max_clips_in_mosaic_clips_queue = max(1, clip_queue_bytes // (self.max_clip_length * 256 * 256 * 4)) # 4 = 3 color channels + mask
         self.mosaic_clip_queue = PipelineQueue(name="mosaic_clip_queue", maxsize=max_clips_in_mosaic_clips_queue)
 
-        # limit queue size to approx 512MB
-        max_clips_in_restored_clips_queue = max(1, (512 * 1024 * 1024) // (self.max_clip_length * 256 * 256 * 4)) # 4 = 3 color channels + mask
+        # limit queue size by memory budget
+        max_clips_in_restored_clips_queue = max(1, clip_queue_bytes // (self.max_clip_length * 256 * 256 * 4)) # 4 = 3 color channels + mask
         self.restored_clip_queue = PipelineQueue(name="restored_clip_queue", maxsize=max_clips_in_restored_clips_queue)
 
         # no queue size limit needed, elements are tiny
@@ -70,7 +75,9 @@ class FrameRestorer:
                                               pad_mode=self.preferred_pad_mode,
                                               error_handler=self._on_worker_thread_error,
                                               frame_source_factory=self.frame_source_factory,
-                                              progress_log_callback=progress_log_callback)
+                                              progress_log_callback=progress_log_callback,
+                                              batch_size=max(1, int(detector_batch_size)),
+                                              queue_size=max(1, int(detector_queue_size)))
 
         self.clip_restoration_thread: PipelineThread | None = None
         self.frame_restoration_thread: PipelineThread | None = None

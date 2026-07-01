@@ -185,7 +185,7 @@ class Clip:
         return vram_offload.restore_tensor(self.frames[item]), vram_offload.restore_tensor(self.masks[item]), self.boxes[item]
 
 class MosaicDetector:
-    def __init__(self, model: Yolo11SegmentationModel, video_metadata: VideoMetadata, frame_detection_queue: PipelineQueue, mosaic_clip_queue: PipelineQueue, error_handler: Callable[[ErrorMarker], None], max_clip_length=30, clip_size=256, device: torch.device | None = None, pad_mode='reflect', batch_size=4, frame_source_factory=None, progress_log_callback=None):
+    def __init__(self, model: Yolo11SegmentationModel, video_metadata: VideoMetadata, frame_detection_queue: PipelineQueue, mosaic_clip_queue: PipelineQueue, error_handler: Callable[[ErrorMarker], None], max_clip_length=30, clip_size=256, device: torch.device | None = None, pad_mode='reflect', batch_size=4, frame_source_factory=None, progress_log_callback=None, queue_size=8):
         self.model = model
         self.video_meta_data = video_metadata
         self.frame_source_factory = frame_source_factory
@@ -199,8 +199,9 @@ class MosaicDetector:
         self.start_frame = 0
         self.frame_detection_queue = frame_detection_queue
         self.mosaic_clip_queue = mosaic_clip_queue
-        self.frame_feeder_queue = PipelineQueue(name="frame_feeder_queue", maxsize=8)
-        self.inference_queue = PipelineQueue(name="frame_feeder_queue", maxsize=8)
+        queue_size = max(1, int(queue_size))
+        self.frame_feeder_queue = PipelineQueue(name="frame_feeder_queue", maxsize=queue_size)
+        self.inference_queue = PipelineQueue(name="inference_queue", maxsize=queue_size)
         self.error_handler = error_handler
         self.frame_detector_thread: PipelineThread | None = None
         self.frame_feeder_thread: PipelineThread | None = None

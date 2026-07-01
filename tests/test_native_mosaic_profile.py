@@ -11,7 +11,7 @@ from gpu_engine._profile import DecodeProfile
 from gpu_engine.files import _Progress
 from gpu_engine.native_mosaic import _gpu_ops, _torch_tuning
 from gpu_engine.native_mosaic._cuda_graph_runner import CudaGraphRunner
-from gpu_engine.native_mosaic.engine import NativeMosaicEngine, _gpu_frame_source_decision
+from gpu_engine.native_mosaic.engine import NativeMosaicEngine, _gpu_frame_source_decision, _native_restore_limits
 
 
 def test_decode_profile_writes_sections_and_counters(tmp_path):
@@ -65,6 +65,154 @@ def test_gpu_frame_source_decision_threshold_can_be_enabled(monkeypatch):
     assert ok is False
     assert min_pixels == 2_000_000
     assert "input too small" in reason
+
+
+def test_native_restore_limits_guard_large_frames_on_16gb_gpu(monkeypatch):
+    monkeypatch.delenv("VRVT_NATIVE_VRAM_GUARD", raising=False)
+    monkeypatch.delenv("VRVT_NATIVE_MAX_CLIP_LENGTH", raising=False)
+    monkeypatch.delenv("VRVT_NATIVE_DETECT_BATCH", raising=False)
+    monkeypatch.delenv("VRVT_NATIVE_FRAME_QUEUE_MB", raising=False)
+    monkeypatch.delenv("VRVT_NATIVE_CLIP_QUEUE_MB", raising=False)
+    monkeypatch.delenv("VRVT_NATIVE_DETECT_QUEUE", raising=False)
+
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def mem_get_info():
+            return 1 * 1024 ** 3, 16 * 1024 ** 3
+
+    limits = _native_restore_limits(
+        SimpleNamespace(width=4096, height=4096),
+        180,
+        torch_module=SimpleNamespace(cuda=FakeCuda),
+    )
+
+    assert limits.max_clip_length == 64
+    assert limits.detector_batch_size == 1
+    assert limits.frame_queue_mb == 128
+    assert limits.clip_queue_mb == 128
+    assert limits.detector_queue_size == 2
+    assert "large restore frame" in limits.reason
+
+
+def test_native_restore_limits_guard_4k_frames_on_8gb_gpu(monkeypatch):
+    monkeypatch.delenv("VRVT_NATIVE_VRAM_GUARD", raising=False)
+    monkeypatch.delenv("VRVT_NATIVE_MAX_CLIP_LENGTH", raising=False)
+    monkeypatch.delenv("VRVT_NATIVE_DETECT_BATCH", raising=False)
+    monkeypatch.delenv("VRVT_NATIVE_FRAME_QUEUE_MB", raising=False)
+    monkeypatch.delenv("VRVT_NATIVE_CLIP_QUEUE_MB", raising=False)
+    monkeypatch.delenv("VRVT_NATIVE_DETECT_QUEUE", raising=False)
+
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def mem_get_info():
+            return 1 * 1024 ** 3, 8 * 1024 ** 3
+
+    limits = _native_restore_limits(
+        SimpleNamespace(width=3840, height=2160),
+        180,
+        torch_module=SimpleNamespace(cuda=FakeCuda),
+    )
+
+    assert limits.max_clip_length == 24
+    assert limits.detector_batch_size == 1
+    assert limits.frame_queue_mb == 64
+    assert limits.clip_queue_mb == 64
+    assert limits.detector_queue_size == 1
+    assert "threshold 6000000" in limits.reason
+
+
+def test_native_restore_limits_keep_defaults_for_small_frames(monkeypatch):
+    monkeypatch.delenv("VRVT_NATIVE_VRAM_GUARD", raising=False)
+    monkeypatch.delenv("VRVT_NATIVE_MAX_CLIP_LENGTH", raising=False)
+    monkeypatch.delenv("VRVT_NATIVE_DETECT_BATCH", raising=False)
+    monkeypatch.delenv("VRVT_NATIVE_FRAME_QUEUE_MB", raising=False)
+    monkeypatch.delenv("VRVT_NATIVE_CLIP_QUEUE_MB", raising=False)
+    monkeypatch.delenv("VRVT_NATIVE_DETECT_QUEUE", raising=False)
+
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def mem_get_info():
+            return 1 * 1024 ** 3, 16 * 1024 ** 3
+
+    limits = _native_restore_limits(
+        SimpleNamespace(width=1920, height=1080),
+        180,
+        torch_module=SimpleNamespace(cuda=FakeCuda),
+    )
+
+    assert limits.max_clip_length == 180
+    assert limits.detector_batch_size == 4
+    assert limits.frame_queue_mb == 512
+    assert limits.clip_queue_mb == 512
+    assert limits.detector_queue_size == 8
+    assert limits.reason == ""
+
+
+def test_native_restore_limits_guard_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("VRVT_NATIVE_VRAM_GUARD", "0")
+    monkeypatch.delenv("VRVT_NATIVE_MAX_CLIP_LENGTH", raising=False)
+    monkeypatch.delenv("VRVT_NATIVE_DETECT_BATCH", raising=False)
+    monkeypatch.delenv("VRVT_NATIVE_FRAME_QUEUE_MB", raising=False)
+    monkeypatch.delenv("VRVT_NATIVE_CLIP_QUEUE_MB", raising=False)
+    monkeypatch.delenv("VRVT_NATIVE_DETECT_QUEUE", raising=False)
+
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def mem_get_info():
+            return 1 * 1024 ** 3, 16 * 1024 ** 3
+
+    limits = _native_restore_limits(
+        SimpleNamespace(width=4096, height=4096),
+        180,
+        torch_module=SimpleNamespace(cuda=FakeCuda),
+    )
+
+    assert limits.max_clip_length == 180
+    assert limits.detector_batch_size == 4
+    assert limits.reason == ""
+
+
+def test_native_restore_limits_env_clip_cannot_raise_guarded_clip(monkeypatch):
+    monkeypatch.delenv("VRVT_NATIVE_VRAM_GUARD", raising=False)
+    monkeypatch.setenv("VRVT_NATIVE_MAX_CLIP_LENGTH", "120")
+    monkeypatch.delenv("VRVT_NATIVE_DETECT_BATCH", raising=False)
+    monkeypatch.delenv("VRVT_NATIVE_FRAME_QUEUE_MB", raising=False)
+    monkeypatch.delenv("VRVT_NATIVE_CLIP_QUEUE_MB", raising=False)
+    monkeypatch.delenv("VRVT_NATIVE_DETECT_QUEUE", raising=False)
+
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def mem_get_info():
+            return 1 * 1024 ** 3, 16 * 1024 ** 3
+
+    limits = _native_restore_limits(
+        SimpleNamespace(width=4096, height=4096),
+        180,
+        torch_module=SimpleNamespace(cuda=FakeCuda),
+    )
+
+    assert limits.max_clip_length == 64
+    assert "120 (max_clip_length 64->64)" in limits.reason
 
 
 def test_vram_offload_can_be_disabled(monkeypatch):

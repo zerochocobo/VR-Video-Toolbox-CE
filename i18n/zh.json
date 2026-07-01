@@ -74,7 +74,7 @@
       "title": "克隆翻译配音",
       "btn_return": "返回模式选择",
       "lbl_dlna_si_note": "用本软件的DLNA服务器，也可以通过直播流[SI]混音.SI.WAV，无需另外生成混音MP4",
-      "tab_clone": "克隆语音并翻译",
+      "tab_clone": "一键克隆",
       "tab_mix": "音频回混",
       "tab_mix_video_audio": "混合视频音轨",
       "tab_batch_mix_video_audio": "批量混合视频音轨",

@@ -12,12 +12,24 @@ from __future__ import annotations
 
 import os
 from contextlib import nullcontext
+from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
 
 _FALSE_VALUES = {"", "0", "false", "no", "off"}
 _DEFAULT_GPU_FRAME_SOURCE_MIN_PIXELS = 0
+_GIB = 1024 ** 3
+
+
+@dataclass(frozen=True)
+class _NativeRestoreLimits:
+    max_clip_length: int
+    detector_batch_size: int
+    frame_queue_mb: int
+    clip_queue_mb: int
+    detector_queue_size: int
+    reason: str = ""
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -34,6 +46,100 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _env_int_optional(name: str) -> int | None:
+    value = os.environ.get(name)
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return None
+
+
+def _cuda_total_vram_bytes(torch_module=None, device=None) -> int | None:
+    try:
+        torch = torch_module
+        if torch is None:
+            import torch as _torch
+
+            torch = _torch
+        if not torch.cuda.is_available():
+            return None
+        if device is None:
+            _free, total = torch.cuda.mem_get_info()
+        else:
+            with torch.cuda.device(device):
+                _free, total = torch.cuda.mem_get_info()
+        return int(total)
+    except Exception:
+        return None
+
+
+def _video_dimensions(meta) -> tuple[int, int]:
+    width = int(getattr(meta, "width", 0) or getattr(meta, "video_width", 0) or 0)
+    height = int(getattr(meta, "height", 0) or getattr(meta, "video_height", 0) or 0)
+    return max(0, width), max(0, height)
+
+
+def _native_restore_limits(meta, requested_max_clip_length: int,
+                           *, torch_module=None, device=None) -> _NativeRestoreLimits:
+    """Pick conservative native restore limits for memory-bound GPU restores."""
+    requested = max(1, int(requested_max_clip_length or 180))
+    width, height = _video_dimensions(meta)
+    pixels = width * height
+    total_vram = _cuda_total_vram_bytes(torch_module=torch_module, device=device)
+
+    max_clip = requested
+    detector_batch = 4
+    frame_queue_mb = 512
+    clip_queue_mb = 512
+    detector_queue_size = 8
+    reason = ""
+
+    guard_enabled = _env_bool("VRVT_NATIVE_VRAM_GUARD", True)
+    guard_profile = None
+    if total_vram is not None:
+        if total_vram <= 10 * _GIB:
+            guard_profile = (6_000_000, 24, 64, 1)
+        elif total_vram <= 12 * _GIB:
+            guard_profile = (8_000_000, 48, 96, 2)
+        elif total_vram <= 18 * _GIB:
+            guard_profile = (12_000_000, 64, 128, 2)
+    if guard_enabled and guard_profile is not None and pixels >= guard_profile[0]:
+        min_pixels, guarded_clip, guarded_queue_mb, guarded_queue_size = guard_profile
+        max_clip = min(max_clip, guarded_clip)
+        detector_batch = 1
+        frame_queue_mb = guarded_queue_mb
+        clip_queue_mb = guarded_queue_mb
+        detector_queue_size = guarded_queue_size
+        reason = (
+            f"large restore frame {width}x{height} ({pixels} pixels, threshold {min_pixels}) "
+            f"on {total_vram / _GIB:.1f}GiB GPU; max_clip_length {requested}->{max_clip}, "
+            f"detector batch=1, queue_mb={guarded_queue_mb}, queues={detector_queue_size}"
+        )
+
+    env_clip = _env_int_optional("VRVT_NATIVE_MAX_CLIP_LENGTH")
+    if env_clip is not None:
+        old_clip = max_clip
+        max_clip = max(1, min(max_clip, env_clip))
+        reason = f"{reason}; " if reason else ""
+        reason += f"VRVT_NATIVE_MAX_CLIP_LENGTH={env_clip} (max_clip_length {old_clip}->{max_clip})"
+
+    detector_batch = max(1, _env_int("VRVT_NATIVE_DETECT_BATCH", detector_batch))
+    frame_queue_mb = max(16, _env_int("VRVT_NATIVE_FRAME_QUEUE_MB", frame_queue_mb))
+    clip_queue_mb = max(16, _env_int("VRVT_NATIVE_CLIP_QUEUE_MB", clip_queue_mb))
+    detector_queue_size = max(1, _env_int("VRVT_NATIVE_DETECT_QUEUE", detector_queue_size))
+
+    return _NativeRestoreLimits(
+        max_clip_length=max_clip,
+        detector_batch_size=detector_batch,
+        frame_queue_mb=frame_queue_mb,
+        clip_queue_mb=clip_queue_mb,
+        detector_queue_size=detector_queue_size,
+        reason=reason,
+    )
+
+
 def _gpu_frame_source_decision(src_meta) -> tuple[bool, str, int, int]:
     """Decide whether restore_file should use NVDEC-backed frame source."""
     width = int(getattr(src_meta, "width", 0) or 0)
@@ -46,6 +152,19 @@ def _gpu_frame_source_decision(src_meta) -> tuple[bool, str, int, int]:
     if min_pixels > 0 and pixels < min_pixels:
         return False, f"input too small ({width}x{height}, {pixels} < {min_pixels} pixels)", pixels, min_pixels
     return True, f"gpu frame source eligible ({width}x{height}, {pixels} >= {min_pixels} pixels)", pixels, min_pixels
+
+
+def _log_error_marker(elem, log_func, *, prefix: str = "[native]") -> None:
+    message = str(elem) or type(elem).__name__
+    log_func(f"{prefix} frame restorer error: {message}")
+    stack = getattr(elem, "stack_trace", "") or ""
+    if not stack:
+        return
+    lines = [line.rstrip() for line in stack.splitlines() if line.strip()]
+    if not lines:
+        return
+    for line in lines[-10:]:
+        log_func(f"{prefix} {line}")
 
 
 class _GpuEncodeSetupError(Exception):
@@ -260,32 +379,30 @@ class NativeMosaicEngine:
         )
         previous_profile = get_active_profile()
         set_active_profile(profile)
+        restore_limits = _NativeRestoreLimits(
+            max_clip_length=max(1, int(max_clip_length or 180)),
+            detector_batch_size=4,
+            frame_queue_mb=512,
+            clip_queue_mb=512,
+            detector_queue_size=8,
+        )
 
         def _make_restorer(frame_source_factory=None, video_meta_data=None):
             return FrameRestorer(
-                self.device, input_path, max_clip_length, self.restoration_name,
+                self.device, input_path, restore_limits.max_clip_length, self.restoration_name,
                 self.detection_model, self.restoration_model, self.pad_mode,
                 video_meta_data=video_meta_data, frame_source_factory=frame_source_factory,
                 progress_log_callback=log_callback,
+                detector_batch_size=restore_limits.detector_batch_size,
+                frame_queue_mb=restore_limits.frame_queue_mb,
+                clip_queue_mb=restore_limits.clip_queue_mb,
+                detector_queue_size=restore_limits.detector_queue_size,
             )
 
         try:
             with profile.section("restore_file.total"):
                 with profile.section("metadata.lada_video"):
                     meta = video_utils.get_video_meta_data(input_path)
-
-                # Pre-capture the restoration CUDA graph for this clip length now,
-                # while we are still single-threaded. Most clips are exactly
-                # max_clip_length, so this captures the dominant shape. Runtime
-                # capture is forbidden (it races with the detection/encode threads),
-                # so any other clip length falls back to eager.
-                try:
-                    warm = getattr(self.restoration_model, "warmup_graph", None)
-                    if callable(warm):
-                        warm(int(max_clip_length))
-                        self.torch.cuda.current_stream(self.device).synchronize()
-                except Exception as exc:
-                    _log(f"[native] graph warmup skipped: {type(exc).__name__}: {exc}")
 
                 gpu_ok = False
                 frame_source_ok = False
@@ -317,6 +434,22 @@ class NativeMosaicEngine:
                         frame_source_min_pixels=int(frame_source_min_pixels),
                         frame_source_reason=frame_source_reason,
                     )
+                    restore_limits = _native_restore_limits(
+                        src_meta,
+                        max_clip_length,
+                        torch_module=self.torch,
+                        device=self.device,
+                    )
+                    profile.metadata(
+                        native_max_clip_length=int(restore_limits.max_clip_length),
+                        native_detector_batch_size=int(restore_limits.detector_batch_size),
+                        native_frame_queue_mb=int(restore_limits.frame_queue_mb),
+                        native_clip_queue_mb=int(restore_limits.clip_queue_mb),
+                        native_detector_queue_size=int(restore_limits.detector_queue_size),
+                        native_restore_limits_reason=restore_limits.reason,
+                    )
+                    if restore_limits.reason:
+                        _log(f"[native] VRAM guard: {restore_limits.reason}")
                     if not gpu_ok:
                         _log(f"[native] GPU NVENC unavailable ({decision.reason or 'non-SDR/10-bit'}); using VideoWriter")
                         if not produce_mp4:
@@ -325,6 +458,31 @@ class NativeMosaicEngine:
                     _log(f"[native] probe failed, using VideoWriter: {type(e).__name__}: {e}")
                     gpu_ok = False
                     frame_source_ok = False
+                    restore_limits = _native_restore_limits(
+                        meta,
+                        max_clip_length,
+                        torch_module=self.torch,
+                        device=self.device,
+                    )
+                    if restore_limits.reason:
+                        _log(f"[native] VRAM guard: {restore_limits.reason}")
+
+                # Pre-capture the restoration CUDA graph for this clip length now,
+                # while we are still single-threaded. Most clips are exactly the
+                # effective max_clip_length, so this captures the dominant shape.
+                # Runtime capture is forbidden (it races with the detection/encode
+                # threads), so any other clip length falls back to eager.
+                try:
+                    warm = getattr(self.restoration_model, "warmup_graph", None)
+                    if callable(warm):
+                        warm(int(restore_limits.max_clip_length))
+                        self.torch.cuda.current_stream(self.device).synchronize()
+                except Exception as exc:
+                    _log(f"[native] graph warmup skipped: {type(exc).__name__}: {exc}")
+                    try:
+                        self.torch.cuda.empty_cache()
+                    except Exception:
+                        pass
 
                 frame_source_factory = None
                 restorer_meta = None
@@ -445,7 +603,10 @@ class NativeMosaicEngine:
                         break
                     if elem is STOP_MARKER or isinstance(elem, ErrorMarker):
                         success = False
-                        _log("[native] frame restorer stopped prematurely")
+                        if isinstance(elem, ErrorMarker):
+                            _log_error_marker(elem, _log)
+                        else:
+                            _log("[native] frame restorer stopped prematurely")
                         break
                     restored_frame, _pts = elem
                     with profile.section("encode.prepare_nv12", torch_module=self.torch, cuda=True) if profile else nullcontext():
@@ -584,7 +745,10 @@ class NativeMosaicEngine:
                         break
                     if elem is STOP_MARKER or isinstance(elem, ErrorMarker):
                         success = False
-                        _log("[native] frame restorer stopped prematurely")
+                        if isinstance(elem, ErrorMarker):
+                            _log_error_marker(elem, _log)
+                        else:
+                            _log("[native] frame restorer stopped prematurely")
                         break
                     restored_frame, restored_pts = elem
                     _gpu_ops.wait_decode_event(restored_frame)
@@ -922,11 +1086,35 @@ class NativeMosaicEngine:
             start_sec=start_sec,
             end_sec=end_sec,
         )
+        restore_limits = _native_restore_limits(
+            lada_meta,
+            max_clip_length,
+            torch_module=self.torch,
+            device=self.device,
+        )
+        if log_callback and restore_limits.reason:
+            log_callback(f"[native-stream] VRAM guard: {restore_limits.reason}")
+        try:
+            warm = getattr(self.restoration_model, "warmup_graph", None)
+            if callable(warm):
+                warm(int(restore_limits.max_clip_length))
+                self.torch.cuda.current_stream(self.device).synchronize()
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[native-stream] graph warmup skipped: {type(exc).__name__}: {exc}")
+            try:
+                self.torch.cuda.empty_cache()
+            except Exception:
+                pass
         frame_restorer = FrameRestorer(
-            self.device, input_path, max_clip_length, self.restoration_name,
+            self.device, input_path, restore_limits.max_clip_length, self.restoration_name,
             self.detection_model, self.restoration_model, self.pad_mode,
             video_meta_data=lada_meta, frame_source_factory=frame_source_factory,
             progress_log_callback=log_callback,
+            detector_batch_size=restore_limits.detector_batch_size,
+            frame_queue_mb=restore_limits.frame_queue_mb,
+            clip_queue_mb=restore_limits.clip_queue_mb,
+            detector_queue_size=restore_limits.detector_queue_size,
         )
 
         n = 0
@@ -938,6 +1126,7 @@ class NativeMosaicEngine:
                 if elem is STOP_MARKER:
                     raise RuntimeError("native frame restorer stopped")
                 if isinstance(elem, ErrorMarker):
+                    _log_error_marker(elem, log_callback or (lambda _m: None))
                     raise RuntimeError(f"native frame restorer error: {elem}")
                 n += 1
                 if log_callback and n % 30 == 0:
