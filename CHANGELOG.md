@@ -2,6 +2,79 @@
 
 ## English
 
+### 2026-07-06
+
+- Documentation: Updated the public README files and release-package user guides to explain the three separate fisheye-related entry points: OneClick's internal fisheye working view, Split/Combine fisheye input/output, and explicit Hequirect/Fisheye projection conversion.
+- Documentation: Rewrote Clone Translation Dubbing docs for the current guided workflow, including Single-Speaker Clone, Multi-Speaker Clone, target-language basis voices, `SPEAKER1.wav` / `SPEAKER1.txt`, `.si.wav`, `.si.duck.wav`, `_SI.mp4`, `_DUB.mp4`, and DLNA `[SI]` live mixing.
+- Documentation: Clarified that Clone Translation Dubbing transcription/translation requires the shared translation API configuration, and documented related OmniVoice, ECAPA, ASR, pyannote, and Bandit-v2 model requirements.
+- Documentation: Reorganized the release-package readme files around independent tools instead of sequential "Step 1/2/3" instructions, matching the launcher model where mosaic removal, subtitles, clone dubbing, and utilities are separate tools.
+- Documentation: Updated README wording for the migrated 2D-to-3D/VR feature, pointing users to the VR Passthrough Server project instead of the removed local 2D-to-VR implementation.
+
+### 2026-07-05
+
+- New: Added Clone Translation Dubbing tempo-fit pacing. One-click, single-speaker, and multi-speaker clone synthesis can now use bounded OmniVoice `speed` control to better match each translated line to the source segment duration; `moderate` is the default.
+- Change: Refined tempo-fit natural-duration estimation by target language, using language-specific non-space character rates for Chinese, Japanese, Korean, Thai, English, German, French, Portuguese, Spanish, Italian, and Russian.
+- Change: Updated the dubbing translation prompt to target natural spoken length near the source segment duration instead of always forcing maximum brevity, and fixed the adult-content section delimiter so disabling adult content removes only that section.
+- Fix: Made candidate sample generation reproducible by deterministically seeding OmniVoice target-sample and translated-preview generation per candidate, preventing good candidates from disappearing across repeated runs.
+- Change: Candidate preselection now evaluates a 2x pool sorted by usable 3-10s duration before ECAPA ranking, and one-click automatic reference selection uses the same 3-10s duration pool with quality-score selection inside the pool.
+- New: Added sparse-speaker fallback reference stitching. When a speaker has no continuous 3-10s reference span, short same-speaker clips can be stitched with fades and small gaps into a usable basis reference.
+- New: Added one-click clone shared-directory modes: same-folder shared basis, independent per-file batch traversal, and per-subfolder shared-basis batch traversal. Shared modes use global diarization and shared references for the same people across a folder.
+- Change: Polished multi-speaker clone UX by making "Keep original" clearer, replacing speaker-list pseudo-buttons with row selection plus real action buttons, moving the candidate stop button, merging basis reuse into WAV import, renaming basis export, and making clonevoice remix volume defaults more conservative.
+
+### 2026-07-04
+
+- Fix: Made multi-speaker clone import lighter by lazily importing `gpu_engine.probe` only inside batch duration estimation, avoiding CUDA/GPU engine initialization during ordinary single-file imports and tests.
+- Change: Reduced the multi-speaker basis-candidate dialog height and candidate table height, making it easier to fit on screen.
+- Fix: Disabled the candidate generation button and candidate-count input while a multi-speaker candidate task is running, preventing duplicate candidate generation jobs.
+- Change: Moved "candidate sample count" from the multi-speaker Step 2 header into the basis-candidate dialog, where it directly controls that dialog's candidate generation.
+- Documentation/UI: Added the same 3-10s WAV duration and matching-text requirement note to multi-speaker basis import as the single-speaker `SPEAKER1` flow.
+
+### 2026-07-03
+
+- New: Added the Multi-Speaker Clone tab. It supports diarized transcription, speaker duration/segment summaries, per-speaker basis selection, skipped speakers that keep the original voice, and multi-speaker `.SI.WAV` generation.
+- New: Added per-speaker basis import and voice design in the multi-speaker flow, including WAV+TXT validation, OmniVoice design previews, per-speaker `.basis.wav/.basis.txt` storage, and stop controls inside modal candidate/design workflows.
+- New: Extracted the shared `CandidateBasisPanel` for source/translation/sample audition tables, then reused it in both single-speaker and multi-speaker candidate selection.
+- New: Added basis export and reuse for multi-speaker clone. A selected speaker basis can be exported as reusable WAV/TXT/meta files, and imported basis WAV files can auto-fill same-name TXT sidecars.
+- New: Added multi-speaker batch-directory support with global diarization. The tool can concatenate batch audio with offsets, split global turns back into per-video timelines, aggregate global speakers, collect candidates across videos, and apply one basis to every video containing that speaker.
+- Change: Clonevoice translation API validation now checks the full config, not only the key, and `skip_synthesis` speakers are excluded from synthesis units and duck-key spans.
+- New: DLNA SI live streaming can use a matching `.si.duck.wav` as a third sidechain input and switch to a dubbing-style live mix when enabled, with a launcher config toggle for DLNA SI dubbing mode.
+
+### 2026-07-02
+
+- Change: Renamed and simplified the Clonevoice "Mix / Dubbing" tab for user-facing dubbing workflows. Low-level SI channel/volume/delay controls are hidden behind sensible defaults, while the visible mode choice is now "lower original audio" versus "remove all original vocals".
+- New: Added a default-on leakage-prevention option in Clonevoice SI remixing that uses the matching `.si.duck.wav` file to duck original audio across all original subtitle/manifest speech spans.
+- Change: `tool_si.logic` now carries optional duck-key paths through single-file and batch SI mix tasks. When ducking is enabled and a `.si.duck.wav` exists, FFmpeg uses it as the sidechain key; if missing, it falls back to the audible SI waveform key.
+- Fix: SI delay now applies only to the actual SI audio mix, not to the duck key, so original-audio ducking stays aligned to the original speech timeline.
+- UI: Updated Chinese, English, and Japanese wording for Clonevoice mix/dubbing controls, including the original-audio ducking strength label and leak-prevention checkbox.
+
+### 2026-07-01
+
+- Fix: Added prompt-reference fade-out and tail silence for OmniVoice prompt audio, preventing source-reference tail audio from leaking into fixed samples, work references, `SPEAKER1` prompts, and final synthesis.
+- Change: Single-speaker candidate translated previews now use the same second-hop clone path as final `.SI.WAV` synthesis: source candidate -> fixed target-language sample -> translated preview from that fixed sample.
+- Change: Candidate ECAPA ranking now prefers translated-preview versus source-audio similarity, while retaining fixed-sample similarity as a separate score.
+- Change: Single-speaker clone requires a configured translation API before transcription/translation starts, and Step 1 status/buttons now reflect the full translation configuration state.
+- Change: Adjusted remix defaults to both channels, 100% SI volume, and 0s SI delay.
+- New: Added SI ducking strength presets across SI tools, Clonevoice remixing, DLNA configuration, and DLNA live SI streams.
+- New: Clonevoice synthesis now writes `<video>.si.duck.wav` beside `<video>.si.wav`; `tool_si.logic` gained helpers to build and write duck-key timelines from subtitle/manifest spans.
+- Change: Simplified SI and Clonevoice single-file remix naming by removing manual SI WAV/output MP4 fields and using same-name sidecar/default output paths automatically.
+- Fix: Single-speaker candidate generation now filters candidates without source transcript text, and Step 3 gained clearer `SPEAKER1` text/WAV requirements plus an inline play button.
+
+### 2026-06-30
+
+- New: Implemented the guided Single-Speaker Clone tab before the legacy one-click clone tab. The flow covers transcription/translation, candidate audition, `SPEAKER1` confirmation or import/design, and final `.SI.WAV` generation.
+- New: Added `tool_clonevoice/single_clone.py` to orchestrate single-speaker clone workflows without calling `run_full()` or automatic reference extraction, preserving the user-confirmed `SPEAKER1` basis.
+- New: Added reusable reference-candidate collection and OmniVoice target-language sample generation/ECAPA scoring helpers, including model-lifecycle handling that avoids keeping OmniVoice and ECAPA loaded at the same time.
+- Change: Defined `SPEAKER1.wav` / `SPEAKER1.txt` as target-language basis files, with visible single-file copies named `<video>.SPEAKER1.wav/txt`, shared batch-directory copies named `SPEAKER1.wav/txt`, and per-video clone-dir copies referenced by manifest `skip_work_ref=true`.
+- UI: Iterated the Single-Speaker Clone UX with target language and translation API moved to Step 1, candidate source/translation/sample audition columns, an OmniVoice voice-design dialog, ASR model status/download handling, and clearer final export controls.
+- Fix: Improved final clonevoice loudness matching by allowing lower gains when generated speech is much louder than the source, raising the upper gain guard, and logging matched output loudness.
+- Fix: Added NativeGPU 8K VRAM guards for large frames on 16GB/8GB-class GPUs, lowering clip length, detector batch size, and internal queue budgets, and surfacing FrameRestorer errors instead of reporting only a generic premature stop.
+
+### 2026-06-29
+
+- Change: Renamed the Chinese Clonevoice legacy tab label from "Clone speech and translate" wording to "One-Click Clone" to distinguish it from the new guided clone tabs.
+- Planning/Documentation: Added the single-speaker clone tab design plan, defining the new guided workflow as an explicit user-controlled version of the existing automatic source-reference selection, target-language work-reference generation, and ECAPA selection path.
+- Planning: Clarified that `SPEAKER1.wav` must be a target-language fixed-sample/work-reference file with matching text, not a raw source-language reference clip.
+
 ### 2026-06-28
 
 - New: GPU/native progress logs now show VRAM usage where practical, including GPU pipeline progress, pre-scan/fine-scan progress, NativeGPU FrameRestorer detect/restore/compose stages, and native VideoWriter fallback.
@@ -117,6 +190,79 @@
 - Major optimization: GPU-accelerated VR split/merge, fisheye/equirectangular conversion, VR-to-flat projection, and OneClick geometry stages.
 
 ## 中文
+
+### 2026-07-06
+
+- 文档：更新 GitHub 公开 README 和发布包用户说明，明确三个“鱼眼”入口的区别：一键模式内部鱼眼工作视角、拆分/合并工具的鱼眼输入输出、以及 Hequirect/半球 与 Fisheye/鱼眼的显式投影转换。
+- 文档：按当前引导式流程重写克隆翻译配音说明，覆盖单人语音克隆、多人语音克隆、目标语言参考音色、`SPEAKER1.wav` / `SPEAKER1.txt`、`.si.wav`、`.si.duck.wav`、`_SI.mp4`、`_DUB.mp4` 和 DLNA `[SI]` 直播混音。
+- 文档：补充克隆翻译配音的转录/翻译需要使用字幕翻译共用的翻译 API 配置，并同步说明 OmniVoice、ECAPA、ASR、pyannote、Bandit-v2 等相关模型要求。
+- 文档：将发布包 readme 从“第一步/第二步/第三步”式说明调整为按独立小工具组织，更符合主界面中去马赛克、字幕、克隆配音和辅助工具彼此独立的使用方式。
+- 文档：更新已迁移的 2D 转 3D/VR 说明，指向 VR Passthrough Server 项目，不再描述已移除的本地 2D 转 VR 实现。
+
+### 2026-07-05
+
+- 新功能：克隆翻译配音新增“语速贴合原片”。一键克隆、单人克隆、多人克隆生成语音时，可用有界的 OmniVoice `speed` 控制让翻译句更贴近原片每句时长，默认使用“适度”。
+- 变更：自然朗读时长估算改为按目标语言细分，分别覆盖中文、日文、韩文、泰文、英语、德语、法语、葡萄牙语、西班牙语、意大利语、俄语等语言的非空白字符速率。
+- 变更：配音翻译 prompt 从“一味压短”改为匹配原句自然口语时长，并修复 adult content 分隔符，使关闭成人内容时只删除成人背景段。
+- 修复：候选样句与翻译试听生成改为按候选确定性播种 OmniVoice，避免同一个候选每次生成不同音频、好候选下次消失。
+- 变更：候选预选改为先按 3-10 秒有效时长取 2 倍候选池，再生成样句并按 ECAPA 排序；一键克隆自动基准选择也改用 3-10 秒时长池并在池内按质量分选优。
+- 新功能：稀疏说话人参考音回退。某个说话人没有连续 3-10 秒片段时，可把多个短句按时间顺序拼接成带淡入淡出和短静音的参考音。
+- 新功能：一键克隆新增同目录共用、批量遍历单文件、批量遍历同目录共用等输入模式；共享模式使用全局说话人分离和跨视频共享参考音，让同一目录同一批人物保持同一组音色。
+- 变更：多人克隆体验优化，包括“保留原声”文案、说话人列表真实按钮、候选停止按钮位置、复用基准合并到导入 WAV、导出基准改名，以及混音配音音量默认值更保守。
+
+### 2026-07-04
+
+- 修复：多人语音克隆批量时长估算改为在函数内部惰性导入 `gpu_engine.probe`，避免普通导入、单文件多人克隆和单元测试无谓触发 CUDA/GPU engine 初始化。
+- 变更：多人选择基准语音对话框高度和候选表高度缩小，更适合普通屏幕显示。
+- 修复：多人候选生成任务运行期间禁用“抽取候选并生成样句”按钮和候选数量输入框，避免重复启动同一任务。
+- 变更：多人克隆 Step 2 顶部不再显示候选样本数量，该设置移动到选择基准语音对话框内，更贴近实际作用范围。
+- 文档/UI：多人导入基准语音备注补齐 3-10 秒 WAV、语音内容与文本匹配、语言与目标语言一致等约束，与单人 `SPEAKER1` 流程保持一致。
+
+### 2026-07-03
+
+- 新功能：新增“多人语音克隆”tab，支持多人转录/说话人分离、speaker 总时长和段数汇总、逐说话人选择基准、保留原声跳过，以及多人 `.SI.WAV` 生成。
+- 新功能：多人流程新增按说话人导入 WAV+TXT 和 OmniVoice 设计音色，支持试听、保存、停止，并固化为 `<speaker>.basis.wav/txt`。
+- 新功能：抽出共享候选表组件 `CandidateBasisPanel`，统一单人和多人候选列表中的原音、翻译试听、样句播放和候选选择行为。
+- 新功能：多人基准音支持导出和复用，可导出可复用的 WAV/TXT/meta，也可导入带同名 TXT 侧车的 WAV 并自动填文本。
+- 新功能：多人克隆支持批量目录全局说话人分离。工具会拼接整批音频、拆回每个视频时间线、跨视频聚合全局 speaker、跨视频收集候选，并把同一个 speaker basis 应用到所有包含该 speaker 的视频。
+- 变更：克隆翻译配音的翻译 API 预检从只检查 API Key 升级为检查完整配置；设置 `skip_synthesis` 的说话人会从合成单元和 duck key 时间段中排除。
+- 新功能：DLNA `[SI]` 直播流可在发现同名 `.si.duck.wav` 时使用第三路 sidechain key，并切换到配音风格直播混音；主界面 DLNA 配置新增对应开关。
+
+### 2026-07-02
+
+- 变更：克隆语音“混音配音”页面面向普通配音流程重命名和简化，隐藏声道/音量/延迟等低层 SI 控件，模式改为“压低原声”和“移除所有原始人声”。
+- 新功能：克隆语音 SI 回混新增默认开启的防漏音选项，使用同名 `.si.duck.wav` 覆盖所有原始字幕/manifest 语音时间段来压低原声。
+- 变更：`tool_si.logic` 的单文件和批量混音任务可携带 duck key 路径；开启 duck 且存在 `.si.duck.wav` 时，FFmpeg 使用该文件作为 sidechain key，缺失时回退到旧的 SI 波形 key。
+- 修复：SI 延迟只作用于实际混入的 SI 音频，不再移动 duck key，因此原声压低时间仍与原始语音时间线对齐。
+- UI：中/英/日同步更新克隆语音混音配音页文案，包括“原声压低强度”和防漏音 checkbox。
+
+### 2026-07-01
+
+- 修复：OmniVoice prompt 参考音新增尾部淡出和静音副本，避免源参考音尾部串入固定样句、work reference、`SPEAKER1` prompt 和最终合成开头。
+- 变更：单人克隆候选的翻译试听改为和最终 `.SI.WAV` 一致的二跳链路：源候选生成固定目标语言样句，再由固定样句克隆翻译句试听。
+- 变更：候选 ECAPA 排序优先使用“翻译试听 vs 原音”的相似度，同时保留固定样句相似度作为独立分数。
+- 变更：单人克隆 Step 1 启动前必须配置翻译 API，界面状态和按钮会反映完整翻译配置状态。
+- 变更：混音默认值调整为左右声道、SI 音量 100%、SI 延迟 0 秒。
+- 新功能：SI duck 强度预设贯穿同声传译工具、克隆语音混音、DLNA 配置和 DLNA `[SI]` 直播流。
+- 新功能：克隆语音生成 `<视频名>.si.wav` 时同步写出 `<视频名>.si.duck.wav`；`tool_si.logic` 新增根据字幕/manifest 时间段生成 duck key timeline 的 helper。
+- 变更：同声传译和克隆语音单文件回混移除手填 SI WAV/输出 MP4，统一使用同名 sidecar 和默认输出命名。
+- 修复：单人候选生成会过滤没有源转录文本的候选；Step 3 补充更明确的 `SPEAKER1` 文本/WAV 约束和内联播放按钮。
+
+### 2026-06-30
+
+- 新功能：实现单人语音克隆引导式 tab，位于旧一键克隆之前，覆盖转录翻译、候选试听、确认或导入/设计 `SPEAKER1`、最终生成 `.SI.WAV`。
+- 新功能：新增 `tool_clonevoice/single_clone.py` 编排单人流程，最终阶段不调用 `run_full()` 或自动参考音提取，避免覆盖用户确认的 `SPEAKER1`。
+- 新功能：新增可复用的参考候选收集、OmniVoice 目标语言样句生成、ECAPA 评分等 helper，并调整模型生命周期，避免 OmniVoice 与 ECAPA 同时驻留显存。
+- 变更：明确 `SPEAKER1.wav` / `SPEAKER1.txt` 是目标语言基准音色文件；单文件可见副本使用 `<视频名>.SPEAKER1.wav/txt`，批量目录共享副本使用 `SPEAKER1.wav/txt`，每个视频工作目录中仍写入固定 `SPEAKER1.wav/txt` 并在 manifest 中设置 `skip_work_ref=true`。
+- UI：单人克隆多轮调整，加入目标语言/API 前置、原音/翻译/样句试听列、OmniVoice 音色设计对话框、ASR 模型状态与下载、最终导出控件等。
+- 修复：克隆语音最终响度匹配允许更低增益并提高上限保护，解决生成语音明显大于源语音时仍降不下来的问题，同时日志输出匹配后的响度。
+- 修复：NativeGPU 8K 处理新增 16GB/8GB 级别显存保护，自动降低 clip 长度、检测 batch 和队列预算，并暴露 FrameRestorer 真实错误，避免只显示笼统的提前停止。
+
+### 2026-06-29
+
+- 变更：中文界面中克隆语音旧 tab 标签从“克隆语音并翻译”改为“一键克隆”，和后续新增的引导式克隆 tab 区分开。
+- 方案/文档：新增单人语音克隆 tab 设计方案，明确它不是新增克隆能力，而是把现有自动源参考选择、目标语言 work_ref 生成和 ECAPA 选优前移为用户可试听、可干预的显式流程。
+- 方案：明确 `SPEAKER1.wav` 必须是带匹配文本的目标语言固定样句/work reference，而不是直接保存源语言原音片段。
 
 ### 2026-06-28
 
