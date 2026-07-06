@@ -44,6 +44,7 @@ class AppConfigLanguageTests(unittest.TestCase):
             self.assertEqual(app_config.get("dlna_si_volume_percent"), 100)
             self.assertEqual(app_config.get("dlna_si_delay_seconds"), 1.0)
             self.assertTrue(app_config.get("dlna_si_duck_original"))
+            self.assertEqual(app_config.get("dlna_si_duck_preset"), "normal")
 
     def test_set_language_persists_global_language(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

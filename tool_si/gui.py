@@ -236,36 +236,24 @@ class SimultaneousInterpretationApp:
             row=0, column=2, sticky="ew", padx=(6, 0), pady=3
         )
 
-        ttk.Label(parent, text=get_text("lbl_si_wav_file")).grid(row=1, column=0, sticky="w", padx=(0, 6), pady=3)
-        self.mix_si_audio_var = tk.StringVar()
-        ttk.Entry(parent, textvariable=self.mix_si_audio_var).grid(row=1, column=1, sticky="ew", pady=3)
-        ttk.Button(parent, text=get_text("btn_browse"), command=self.browse_mix_si_audio).grid(
-            row=1, column=2, sticky="ew", padx=(6, 0), pady=3
-        )
-
-        ttk.Label(parent, text=get_text("lbl_mix_output_file")).grid(row=2, column=0, sticky="w", padx=(0, 6), pady=3)
-        self.mix_output_var = tk.StringVar()
-        ttk.Entry(parent, textvariable=self.mix_output_var).grid(row=2, column=1, sticky="ew", pady=3)
-        ttk.Button(parent, text=get_text("btn_browse"), command=self.browse_mix_output).grid(
-            row=2, column=2, sticky="ew", padx=(6, 0), pady=3
-        )
-
         options_frame = ttk.Frame(parent)
-        options_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(6, 2))
+        options_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 2))
         self.mix_add_independent_track_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             options_frame,
             text=get_text("chk_add_independent_track"),
             variable=self.mix_add_independent_track_var,
-        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=(0, 18), pady=2)
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=(0, 18), pady=2)
         self.mix_duck_original_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
+        self.mix_duck_check = ttk.Checkbutton(
             options_frame,
             text=get_text("chk_duck_original_when_si"),
             variable=self.mix_duck_original_var,
-        ).grid(row=0, column=2, columnspan=2, sticky="w", padx=(0, 18), pady=2)
+            command=self._update_mix_duck_preset_state,
+        )
+        self.mix_duck_check.grid(row=2, column=2, columnspan=2, sticky="w", padx=(0, 18), pady=2)
 
-        ttk.Label(options_frame, text=get_text("lbl_mix_channel")).grid(row=0, column=4, sticky="w", padx=(0, 6), pady=2)
+        ttk.Label(options_frame, text=get_text("lbl_mix_channel")).grid(row=0, column=0, sticky="w", padx=(0, 6), pady=2)
         self.mix_channel_var = tk.StringVar(value=get_text("opt_channel_left"))
         self.mix_channel_combo = ttk.Combobox(
             options_frame,
@@ -274,9 +262,9 @@ class SimultaneousInterpretationApp:
             width=16,
             state="readonly",
         )
-        self.mix_channel_combo.grid(row=0, column=5, sticky="w", pady=2)
+        self.mix_channel_combo.grid(row=0, column=1, sticky="w", pady=2)
 
-        ttk.Label(options_frame, text=get_text("lbl_original_volume")).grid(row=1, column=0, sticky="w", padx=(0, 6), pady=2)
+        ttk.Label(options_frame, text=get_text("lbl_original_volume")).grid(row=0, column=2, sticky="w", padx=(12, 6), pady=2)
         self.mix_original_volume_var = tk.StringVar(value="100%")
         ttk.Combobox(
             options_frame,
@@ -284,9 +272,9 @@ class SimultaneousInterpretationApp:
             values=list(self._original_volume_display_map().keys()),
             width=8,
             state="readonly",
-        ).grid(row=1, column=1, sticky="w", padx=(0, 18), pady=2)
+        ).grid(row=0, column=3, sticky="w", pady=2)
 
-        ttk.Label(options_frame, text=get_text("lbl_si_volume")).grid(row=1, column=2, sticky="w", padx=(0, 6), pady=2)
+        ttk.Label(options_frame, text=get_text("lbl_si_volume")).grid(row=1, column=0, sticky="w", padx=(0, 6), pady=2)
         self.mix_si_volume_var = tk.StringVar(value="50%")
         ttk.Combobox(
             options_frame,
@@ -294,9 +282,9 @@ class SimultaneousInterpretationApp:
             values=list(self._si_volume_display_map().keys()),
             width=8,
             state="readonly",
-        ).grid(row=1, column=3, sticky="w", padx=(0, 18), pady=2)
+        ).grid(row=1, column=1, sticky="w", pady=2)
 
-        ttk.Label(options_frame, text=get_text("lbl_si_delay")).grid(row=1, column=4, sticky="w", padx=(0, 6), pady=2)
+        ttk.Label(options_frame, text=get_text("lbl_si_delay")).grid(row=1, column=2, sticky="w", padx=(12, 6), pady=2)
         self.mix_si_delay_var = tk.StringVar(value="1s")
         ttk.Combobox(
             options_frame,
@@ -304,10 +292,22 @@ class SimultaneousInterpretationApp:
             values=list(self._si_delay_display_map().keys()),
             width=8,
             state="readonly",
-        ).grid(row=1, column=5, sticky="w", pady=2)
+        ).grid(row=1, column=3, sticky="w", pady=2)
+
+        ttk.Label(options_frame, text=get_text("lbl_duck_preset")).grid(row=2, column=4, sticky="w", padx=(12, 6), pady=2)
+        self.mix_duck_preset_var = tk.StringVar(value=get_text("opt_duck_preset_normal"))
+        self.mix_duck_preset_combo = ttk.Combobox(
+            options_frame,
+            textvariable=self.mix_duck_preset_var,
+            values=list(self._duck_preset_display_map().keys()),
+            width=8,
+            state="readonly",
+        )
+        self.mix_duck_preset_combo.grid(row=2, column=5, sticky="w", pady=2)
+        self._update_mix_duck_preset_state()
 
         button_frame = ttk.Frame(parent)
-        button_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        button_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         button_frame.columnconfigure(0, weight=1)
         button_frame.columnconfigure(1, weight=1)
         self.btn_mix_start = ttk.Button(button_frame, text=get_text("btn_start_mix"), command=self.run_mix)
@@ -344,15 +344,17 @@ class SimultaneousInterpretationApp:
             options_frame,
             text=get_text("chk_add_independent_track"),
             variable=self.batch_mix_add_independent_track_var,
-        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=(0, 18), pady=2)
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=(0, 18), pady=2)
         self.batch_mix_duck_original_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
+        self.batch_mix_duck_check = ttk.Checkbutton(
             options_frame,
             text=get_text("chk_duck_original_when_si"),
             variable=self.batch_mix_duck_original_var,
-        ).grid(row=0, column=2, columnspan=2, sticky="w", padx=(0, 18), pady=2)
+            command=self._update_batch_mix_duck_preset_state,
+        )
+        self.batch_mix_duck_check.grid(row=2, column=2, columnspan=2, sticky="w", padx=(0, 18), pady=2)
 
-        ttk.Label(options_frame, text=get_text("lbl_mix_channel")).grid(row=0, column=4, sticky="w", padx=(0, 6), pady=2)
+        ttk.Label(options_frame, text=get_text("lbl_mix_channel")).grid(row=0, column=0, sticky="w", padx=(0, 6), pady=2)
         self.batch_mix_channel_var = tk.StringVar(value=get_text("opt_channel_left"))
         ttk.Combobox(
             options_frame,
@@ -360,9 +362,9 @@ class SimultaneousInterpretationApp:
             values=list(self._mix_channel_display_map().keys()),
             width=16,
             state="readonly",
-        ).grid(row=0, column=5, sticky="w", pady=2)
+        ).grid(row=0, column=1, sticky="w", pady=2)
 
-        ttk.Label(options_frame, text=get_text("lbl_original_volume")).grid(row=1, column=0, sticky="w", padx=(0, 6), pady=2)
+        ttk.Label(options_frame, text=get_text("lbl_original_volume")).grid(row=0, column=2, sticky="w", padx=(12, 6), pady=2)
         self.batch_mix_original_volume_var = tk.StringVar(value="100%")
         ttk.Combobox(
             options_frame,
@@ -370,9 +372,9 @@ class SimultaneousInterpretationApp:
             values=list(self._original_volume_display_map().keys()),
             width=8,
             state="readonly",
-        ).grid(row=1, column=1, sticky="w", padx=(0, 18), pady=2)
+        ).grid(row=0, column=3, sticky="w", pady=2)
 
-        ttk.Label(options_frame, text=get_text("lbl_si_volume")).grid(row=1, column=2, sticky="w", padx=(0, 6), pady=2)
+        ttk.Label(options_frame, text=get_text("lbl_si_volume")).grid(row=1, column=0, sticky="w", padx=(0, 6), pady=2)
         self.batch_mix_si_volume_var = tk.StringVar(value="50%")
         ttk.Combobox(
             options_frame,
@@ -380,9 +382,9 @@ class SimultaneousInterpretationApp:
             values=list(self._si_volume_display_map().keys()),
             width=8,
             state="readonly",
-        ).grid(row=1, column=3, sticky="w", padx=(0, 18), pady=2)
+        ).grid(row=1, column=1, sticky="w", pady=2)
 
-        ttk.Label(options_frame, text=get_text("lbl_si_delay")).grid(row=1, column=4, sticky="w", padx=(0, 6), pady=2)
+        ttk.Label(options_frame, text=get_text("lbl_si_delay")).grid(row=1, column=2, sticky="w", padx=(12, 6), pady=2)
         self.batch_mix_si_delay_var = tk.StringVar(value="1s")
         ttk.Combobox(
             options_frame,
@@ -390,7 +392,19 @@ class SimultaneousInterpretationApp:
             values=list(self._si_delay_display_map().keys()),
             width=8,
             state="readonly",
-        ).grid(row=1, column=5, sticky="w", pady=2)
+        ).grid(row=1, column=3, sticky="w", pady=2)
+
+        ttk.Label(options_frame, text=get_text("lbl_duck_preset")).grid(row=2, column=4, sticky="w", padx=(12, 6), pady=2)
+        self.batch_mix_duck_preset_var = tk.StringVar(value=get_text("opt_duck_preset_normal"))
+        self.batch_mix_duck_preset_combo = ttk.Combobox(
+            options_frame,
+            textvariable=self.batch_mix_duck_preset_var,
+            values=list(self._duck_preset_display_map().keys()),
+            width=8,
+            state="readonly",
+        )
+        self.batch_mix_duck_preset_combo.grid(row=2, column=5, sticky="w", pady=2)
+        self._update_batch_mix_duck_preset_state()
 
         button_frame = ttk.Frame(parent)
         button_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
@@ -485,6 +499,23 @@ class SimultaneousInterpretationApp:
     def _si_delay_display_map(self) -> dict[str, float]:
         return {f"{value:g}s": value for value in logic.SI_DELAY_SECONDS_CHOICES}
 
+    def _duck_preset_display_map(self) -> dict[str, str]:
+        return {
+            get_text("opt_duck_preset_light"): "light",
+            get_text("opt_duck_preset_normal"): "normal",
+            get_text("opt_duck_preset_strong"): "strong",
+        }
+
+    def _update_mix_duck_preset_state(self) -> None:
+        if hasattr(self, "mix_duck_preset_combo"):
+            state = "readonly" if self.mix_duck_original_var.get() else "disabled"
+            self.mix_duck_preset_combo.config(state=state)
+
+    def _update_batch_mix_duck_preset_state(self) -> None:
+        if hasattr(self, "batch_mix_duck_preset_combo"):
+            state = "readonly" if self.batch_mix_duck_original_var.get() else "disabled"
+            self.batch_mix_duck_preset_combo.config(state=state)
+
     def _update_single_time_controls(self, _event=None):
         selected = self._duration_display_map().get(self.single_duration_var.get(), 30.0)
         if selected == "custom_minutes":
@@ -556,6 +587,9 @@ class SimultaneousInterpretationApp:
     def _selected_si_delay(self) -> float:
         return self._si_delay_display_map().get(self.mix_si_delay_var.get(), logic.DEFAULT_SI_DELAY_SECONDS)
 
+    def _selected_duck_preset(self) -> str:
+        return self._duck_preset_display_map().get(self.mix_duck_preset_var.get(), logic.DEFAULT_DUCK_PRESET)
+
     def _selected_batch_mix_channel(self) -> str:
         return self._mix_channel_display_map().get(self.batch_mix_channel_var.get(), "left")
 
@@ -572,6 +606,11 @@ class SimultaneousInterpretationApp:
     def _selected_batch_mix_si_delay(self) -> float:
         return self._si_delay_display_map().get(
             self.batch_mix_si_delay_var.get(), logic.DEFAULT_SI_DELAY_SECONDS
+        )
+
+    def _selected_batch_mix_duck_preset(self) -> str:
+        return self._duck_preset_display_map().get(
+            self.batch_mix_duck_preset_var.get(), logic.DEFAULT_DUCK_PRESET
         )
 
     def _speaker_note_text(self, speaker: str) -> str:
@@ -707,31 +746,6 @@ class SimultaneousInterpretationApp:
         )
         if path:
             self.mix_video_var.set(path)
-            self.mix_si_audio_var.set(logic.default_si_audio_path(path))
-            self.mix_output_var.set(logic.default_si_mix_output_path(path))
-
-    def browse_mix_si_audio(self):
-        initial = self.mix_si_audio_var.get().strip()
-        path = filedialog.askopenfilename(
-            initialfile=os.path.basename(initial) if initial else "",
-            initialdir=os.path.dirname(initial) if initial else "",
-            filetypes=[("WAV", "*.wav"), ("All Files", "*.*")],
-        )
-        if path:
-            self.mix_si_audio_var.set(path)
-
-    def browse_mix_output(self):
-        initial = self.mix_output_var.get().strip() or (
-            logic.default_si_mix_output_path(self.mix_video_var.get()) if self.mix_video_var.get() else ""
-        )
-        path = filedialog.asksaveasfilename(
-            initialfile=os.path.basename(initial) if initial else "",
-            initialdir=os.path.dirname(initial) if initial else "",
-            defaultextension=".mp4",
-            filetypes=[("MP4", "*.mp4"), ("All Files", "*.*")],
-        )
-        if path:
-            self.mix_output_var.set(path)
 
     def run_single(self):
         srt_path = self.single_srt_var.get().strip()
@@ -830,11 +844,11 @@ class SimultaneousInterpretationApp:
         if not video_path or not os.path.isfile(video_path):
             messagebox.showerror("Error", get_text("err_video_file"))
             return
-        si_audio_path = self.mix_si_audio_var.get().strip() or logic.default_si_audio_path(video_path)
+        si_audio_path = logic.default_si_audio_path(video_path)
         if not si_audio_path or not os.path.isfile(si_audio_path):
             messagebox.showerror("Error", get_text("err_si_wav_file"))
             return
-        output_path = self.mix_output_var.get().strip() or logic.default_si_mix_output_path(video_path)
+        output_path = logic.default_si_mix_output_path(video_path)
         if os.path.abspath(video_path) == os.path.abspath(output_path):
             messagebox.showerror("Error", get_text("err_mix_output_file"))
             return
@@ -849,6 +863,7 @@ class SimultaneousInterpretationApp:
         si_delay = self._selected_si_delay()
         add_independent_track = self.mix_add_independent_track_var.get()
         duck_original = self.mix_duck_original_var.get()
+        duck_preset = self._selected_duck_preset()
 
         def task():
             start_time = time.time()
@@ -865,6 +880,7 @@ class SimultaneousInterpretationApp:
                     si_delay_seconds=si_delay,
                     add_independent_track=add_independent_track,
                     duck_original=duck_original,
+                    duck_preset=duck_preset,
                     log_callback=self.log,
                     stop_event=self.stop_mix_event,
                     process_callback=self._set_mix_process,
@@ -905,6 +921,7 @@ class SimultaneousInterpretationApp:
         si_delay = self._selected_batch_mix_si_delay()
         add_independent_track = self.batch_mix_add_independent_track_var.get()
         duck_original = self.batch_mix_duck_original_var.get()
+        duck_preset = self._selected_batch_mix_duck_preset()
         recursive = self.batch_mix_recursive_var.get()
 
         def task():
@@ -920,6 +937,7 @@ class SimultaneousInterpretationApp:
                     si_delay_seconds=si_delay,
                     add_independent_track=add_independent_track,
                     duck_original=duck_original,
+                    duck_preset=duck_preset,
                     log_callback=self.log,
                     stop_event=self.stop_batch_mix_event,
                     recursive=recursive,

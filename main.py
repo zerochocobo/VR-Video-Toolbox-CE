@@ -38,7 +38,7 @@ import subprocess
 from tkinter import filedialog
 from tkinter import messagebox
 
-ver_name = "v1.3 Patch1 (build 2026-07-01)"
+ver_name = "v1.4 (build 2026-07-06)"
 DLNA_SERVER_EXE_NAME = "vr_dlna_server.exe"
 TWO_DVR_DOWNLOAD_URL = "https://wapok.com"
 
@@ -775,8 +775,26 @@ class VRVideoToolboxLauncher:
         )
         si_enabled_check.grid(row=0, column=0, columnspan=4, sticky='w', pady=(0, 3))
 
+        dub_mode_row = ttk.Frame(si_frame)
+        dub_mode_row.grid(row=1, column=0, columnspan=4, sticky='w', pady=(0, 3))
+        si_dub_mode_var = tk.BooleanVar(value=bool(_saved_si_value('dlna_si_dub_mode', True)))
+        ttk.Checkbutton(
+            dub_mode_row,
+            text=get_text('lbl_dlna_si_dub_mode'),
+            variable=si_dub_mode_var,
+        ).pack(side='left')
+
+        def show_dub_mode_help():
+            messagebox.showinfo(
+                get_text('lbl_dlna_si_dub_mode_help_title'),
+                get_text('lbl_dlna_si_dub_mode_help'),
+                parent=dialog,
+            )
+
+        ttk.Button(dub_mode_row, text='?', width=2, command=show_dub_mode_help).pack(side='left', padx=(6, 0))
+
         si_options_frame = ttk.Frame(si_frame)
-        si_options_frame.grid(row=1, column=0, columnspan=4, sticky='ew')
+        si_options_frame.grid(row=2, column=0, columnspan=4, sticky='ew')
         si_options_frame.columnconfigure(1, weight=1)
         si_options_frame.columnconfigure(3, weight=1)
 
@@ -808,6 +826,16 @@ class VRVideoToolboxLauncher:
         si_volume_var = tk.StringVar(value=f"{current_si_vol}%")
         si_delay_var = tk.StringVar(value=f"{current_si_delay:g}s")
         si_duck_var = tk.BooleanVar(value=bool(_saved_si_value('dlna_si_duck_original', True)))
+        duck_preset_map = {
+            get_text('opt_duck_preset_light'): 'light',
+            get_text('opt_duck_preset_normal'): 'normal',
+            get_text('opt_duck_preset_strong'): 'strong',
+        }
+        duck_preset_label_by_value = {value: label for label, value in duck_preset_map.items()}
+        current_duck_preset = str(_saved_si_value('dlna_si_duck_preset', 'normal')).strip().lower()
+        si_duck_preset_var = tk.StringVar(
+            value=duck_preset_label_by_value.get(current_duck_preset, duck_preset_label_by_value['normal'])
+        )
 
         ttk.Label(si_options_frame, text=get_text('lbl_dlna_si_channel')).grid(row=0, column=0, sticky='w', padx=(0, 6), pady=1)
         ttk.Combobox(
@@ -841,19 +869,36 @@ class VRVideoToolboxLauncher:
             width=10,
             state='readonly',
         ).grid(row=1, column=3, sticky='w', pady=1)
-        ttk.Checkbutton(
+        si_duck_check = ttk.Checkbutton(
             si_options_frame,
             text=get_text('lbl_dlna_si_duck_original'),
             variable=si_duck_var,
-        ).grid(row=2, column=0, columnspan=4, sticky='w', pady=(2, 0))
+        )
+        si_duck_check.grid(row=2, column=0, columnspan=2, sticky='w', pady=(2, 0))
+        ttk.Label(si_options_frame, text=get_text('lbl_duck_preset')).grid(row=2, column=2, sticky='w', padx=(14, 6), pady=(2, 0))
+        si_duck_preset_combo = ttk.Combobox(
+            si_options_frame,
+            textvariable=si_duck_preset_var,
+            values=list(duck_preset_map),
+            width=10,
+            state='readonly',
+        )
+        si_duck_preset_combo.grid(row=2, column=3, sticky='w', pady=(2, 0))
+
+        def refresh_duck_preset_state():
+            si_duck_preset_combo.config(state='readonly' if si_duck_var.get() else 'disabled')
 
         def refresh_si_options():
             if si_enabled_var.get():
+                dub_mode_row.grid()
                 si_options_frame.grid()
             else:
+                dub_mode_row.grid_remove()
                 si_options_frame.grid_remove()
+            refresh_duck_preset_state()
 
         si_enabled_check.config(command=refresh_si_options)
+        si_duck_check.config(command=refresh_duck_preset_state)
         refresh_si_options()
 
         # Path List
@@ -946,6 +991,8 @@ class VRVideoToolboxLauncher:
             app_config.set('dlna_si_volume_percent', int(si_volume_var.get().rstrip('%')))
             app_config.set('dlna_si_delay_seconds', float(si_delay_var.get().rstrip('s')))
             app_config.set('dlna_si_duck_original', bool(si_duck_var.get()))
+            app_config.set('dlna_si_duck_preset', duck_preset_map.get(si_duck_preset_var.get(), 'normal'))
+            app_config.set('dlna_si_dub_mode', bool(si_dub_mode_var.get()))
             app_config.set('dlna_video_dirs', dirs_str)
 
             saved['ok'] = True

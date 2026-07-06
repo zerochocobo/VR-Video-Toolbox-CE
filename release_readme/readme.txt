@@ -2,13 +2,19 @@
      VR Video Toolbox (CUDA EDITION)  —  User Guide
 ════════════════════════════════════════════════════════
 
-◆ Step 1: Download and Install Required Tools
+◆ External Tools Used by Different Features
 ════════════════════════════════════════════════════════
 
-This program requires two external tools to function. Please download them first:
+VR Video Toolbox is a collection of independent tools. Different tools require
+different external components:
+
+  - FFmpeg / ffprobe: common video and audio processing dependency.
+  - Lada or Jasna: needed only for AI mosaic removal.
+  - Speech recognition, OmniVoice, ECAPA, pyannote, or Bandit-v2 models:
+    needed only by subtitle, clone-voice, or dubbing tools when you use them.
 
 ┌─────────────────────────────────────────────────────┐
-│  Tool 1: FFmpeg  (Required for all features)         │
+│  FFmpeg  (common video/audio dependency)             │
 └─────────────────────────────────────────────────────┘
 
 1. Visit: https://www.gyan.dev/ffmpeg/builds/
@@ -21,7 +27,7 @@ This program requires two external tools to function. Please download them first
    Option 3: Add the "bin" folder path to Windows' PATH environment variable
 
 ┌─────────────────────────────────────────────────────┐
-│  Tool 2: Lada-CLI  (AI mosaic removal, requires GPU) │
+│  Lada-CLI  (AI mosaic removal, requires GPU)         │
 └─────────────────────────────────────────────────────┘
 
 1. Visit: https://codeberg.org/ladaapp/lada/releases
@@ -36,7 +42,7 @@ This program requires two external tools to function. Please download them first
          CPU-only processing is extremely slow and not recommended.
 
 ┌─────────────────────────────────────────────────────┐
-│  Tool 2b: Jasna-CLI  (Recommended Alternative)       │
+│  Jasna-CLI  (Recommended Alternative for Mosaic)     │
 └─────────────────────────────────────────────────────┘
 
 Jasna is a modern, actively maintained fork of the original Lada engine,
@@ -53,10 +59,11 @@ compatible with the same workflow.
 5. Note: Jasna requires an NVIDIA GPU, same as Lada.
 
 
-◆ Step 2: Choose a Mosaic Removal Mode
+◆ Mosaic Removal Tools
 ════════════════════════════════════════════════════════
 
-After launching the program, the main screen offers three modes. Use the guide below:
+Use these only when you want to remove mosaics. The main screen offers several
+mosaic-removal modes:
 
 ┌─────────────────────────────────────────────────────┐
 │  [Recommended] One-Click Mode                        │
@@ -67,8 +74,7 @@ After launching the program, the main screen offers three modes. Use the guide b
   ▶ How do I know if this mode applies?
     Put on your VR headset and look at the mosaic at the bottom of the video.
     If the mosaic looks like a [fan / arc shape]  → Use "One-Click Mode" directly.
-    If the mosaic looks like a [square/grid]      → Enable "Convert to fisheye first"
-                                                    in the settings before processing.
+    If the mosaic looks like a [square/grid]      → Enable "Convert to fisheye before processing".
 
 ┌─────────────────────────────────────────────────────┐
 │  Area Selection - Direct Crop Mode                   │
@@ -92,7 +98,35 @@ Not sure which mode fits your video?
 → Click the "Unsure about mosaic style? Check with Zoom Tool" button on the main screen.
 
 
-◆ Step 3: Batch Subtitle Generation (Optional)
+◆ What the Three Fisheye Options Mean
+════════════════════════════════════════════════════════
+
+The word "fisheye" appears in three different tools. Use the one that matches
+your task:
+
+1. One-Click Mode: "Convert to fisheye before processing"
+   Use this for mosaic removal when the mosaic looks square/grid-like in the
+   VR headset, especially center-axis or bottom-area mosaics from studios such
+   as SAVR/URVRSP. The program converts each eye to fisheye only as an internal
+   working view, removes the mosaic, then converts it back. The final result is
+   still a normal VR video.
+
+2. Split / Combine Tool: fisheye split or fisheye combine
+   Use this for manual workflows. Split with fisheye creates separate left/right
+   fisheye eye files. Combine with fisheye expects already-fisheye eye files and
+   converts them back before creating an SBS VR video.
+
+3. Projection Conversion Tool: Hequirect <-> Fisheye
+   Use this only when you deliberately want to change the projection format of a
+   video file. For SBS videos that contain both eyes in one file, enable the
+   dual-screen/SBS option so the two halves are converted separately and stacked
+   back correctly.
+
+For normal mosaic removal, start with One-Click Mode. Do not run the projection
+converter first unless you specifically need a standalone fisheye file.
+
+
+◆ Batch Subtitle Generation Tool
 ════════════════════════════════════════════════════════
 
 Click "Japanese Batch Subtitle Tools" on the main screen to access subtitle generation.
@@ -106,6 +140,45 @@ It does require:
      is detected — can be tens of times faster than CPU.
      Without a GPU, the program falls back to CPU mode, which is very slow
      but still functional.
+
+
+◆ Clone Translation Dubbing Tool
+════════════════════════════════════════════════════════
+
+Click "Clone Translation Dubbing" on the main screen if you want to translate
+dialogue and create a cloned-voice dub.
+
+The current clone tool is a guided workflow:
+
+Single-Speaker Clone
+   Use this when one video or one shared folder contains only one person's
+   voice. First transcribe and translate, then extract candidate voice clips.
+   You can listen to the source clip, translated preview, and fixed target-
+   language sample before confirming SPEAKER1.
+
+Multi-Speaker Clone
+   Use this for videos with several speakers. Select the speaker count first,
+   then choose, import, design, export, or reuse a target-language basis voice
+   for each speaker. Speakers that should not be cloned can be set to
+   "Keep original", so no cloned voice is generated for them.
+
+Basis voice requirements
+   Imported basis WAV files should be 3 to 10 seconds long. The TXT text must
+   match the spoken content, and the basis language must be the translation
+   target language.
+
+Output and remix
+   After confirming the basis voice, the tool generates a timeline-aligned
+   <video>.si.wav and a matching <video>.si.duck.wav. In "Mix / Dubbing",
+   lower-original mode outputs _SI.mp4; Bandit-v2 vocal-removal mode keeps
+   music/effects, mixes the cloned voice, and outputs _DUB.mp4. The DLNA server
+   can also live-mix a matching .SI.WAV through [SI], without making a new MP4.
+
+This feature requires FFmpeg, the speech-recognition model, OmniVoice, and the
+translation API configuration shared with subtitle translation. Multi-speaker
+and dubbing workflows may also need OmniVoice ECAPA, pyannote diarization, and
+Bandit-v2 models. Always listen to the generated .si.wav / _SI.mp4 / _DUB.mp4
+before treating it as final.
 
 
 ◆ Frequently Asked Questions

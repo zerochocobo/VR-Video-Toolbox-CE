@@ -36,6 +36,24 @@ class FakePackedWidget:
         self.config_calls.append(kwargs)
 
 
+class FakeProcessStdout:
+    def __iter__(self):
+        return iter(())
+
+    def close(self) -> None:
+        pass
+
+
+class FakeProcess:
+    def __init__(self) -> None:
+        self.stdout = FakeProcessStdout()
+        self.returncode = 0
+        self.pid = 1234
+
+    def wait(self, timeout=None) -> int:
+        return self.returncode
+
+
 class FakeTTSModel:
     def __init__(self, fail_batch: bool = False) -> None:
         self.fail_batch = fail_batch
@@ -216,6 +234,7 @@ class SimultaneousInterpretationLogicTests(unittest.TestCase):
             root = Path(tmp_dir)
             (root / "a.mp4").write_bytes(b"")
             (root / "a.si.wav").write_bytes(b"wav")
+            (root / "a.si.duck.wav").write_bytes(b"duck")
             nested = root / "nested"
             nested.mkdir()
             (nested / "b.mkv").write_bytes(b"")
@@ -227,6 +246,8 @@ class SimultaneousInterpretationLogicTests(unittest.TestCase):
         self.assertEqual([task.video_path.name for task in tasks], ["a.mp4", "b.mkv"])
         self.assertEqual([task.si_audio_path.name for task in tasks], ["a.si.wav", "b.si.wav"])
         self.assertEqual([task.output_path.name for task in tasks], ["a_SI.mp4", "b_SI.mp4"])
+        self.assertEqual(tasks[0].duck_key_path.name, "a.si.duck.wav")
+        self.assertIsNone(tasks[1].duck_key_path)
 
     def test_collect_paired_si_mix_tasks_ignores_generated_mp4_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -290,19 +311,43 @@ class SimultaneousInterpretationLogicTests(unittest.TestCase):
         self.assertEqual(kwargs["si_delay_seconds"], 1.2)
         self.assertEqual(kwargs["add_independent_track"], True)
         self.assertEqual(kwargs["duck_original"], True)
+        self.assertEqual(kwargs["use_duck_key"], True)
+        self.assertIsNone(kwargs["duck_key_path"])
 
     def test_default_si_audio_mix_paths_use_same_stem(self) -> None:
         video_path = Path("work") / "test.mp4"
 
         self.assertEqual(logic.default_si_audio_path(video_path), str(Path("work") / "test.si.wav"))
+        self.assertEqual(logic.default_si_duck_key_path(video_path), str(Path("work") / "test.si.duck.wav"))
+        self.assertEqual(
+            logic.default_si_duck_key_path(Path("work") / "test.si.wav"),
+            str(Path("work") / "test.si.duck.wav"),
+        )
         self.assertEqual(logic.default_si_mix_output_path(video_path), str(Path("work") / "test_SI.mp4"))
 
     def test_default_paths_preserve_source_separator_style(self) -> None:
         self.assertEqual(logic.default_output_path("C:/work/test.srt"), "C:/work/test.si.wav")
         self.assertEqual(logic.default_si_audio_path("C:/work/test.mp4"), "C:/work/test.si.wav")
+        self.assertEqual(logic.default_si_duck_key_path("C:/work/test.si.wav"), "C:/work/test.si.duck.wav")
         self.assertEqual(logic.default_si_mix_output_path("C:/work/test.mp4"), "C:/work/test_SI.mp4")
         self.assertEqual(logic.default_si_audio_path(r"C:\work\test.mp4"), r"C:\work\test.si.wav")
+        self.assertEqual(logic.default_si_duck_key_path(r"C:\work\test.mp4"), r"C:\work\test.si.duck.wav")
         self.assertEqual(logic.default_si_mix_output_path(r"C:\work\test.mp4"), r"C:\work\test_SI.mp4")
+
+    def test_build_duck_key_timeline_clamps_and_keeps_overlaps_at_level(self) -> None:
+        timeline = logic.build_duck_key_timeline(
+            [
+                {"start": -1.0, "end": 0.2},
+                {"start": 0.1, "end": 0.4},
+                {"start": 0.8, "end": 2.0},
+                {"start": 0.7, "end": 0.6},
+            ],
+            total_duration=1.0,
+            sample_rate=10,
+            level=0.25,
+        )
+
+        self.assertEqual(timeline.tolist(), [0.25, 0.25, 0.25, 0.25, 0.0, 0.0, 0.0, 0.0, 0.25, 0.25])
 
     def test_build_si_audio_mix_command_replaces_first_audio_by_default(self) -> None:
         cmd = logic.build_si_audio_mix_command(
@@ -415,6 +460,80 @@ class SimultaneousInterpretationLogicTests(unittest.TestCase):
         self.assertIn("adelay=0,volume=0.6,apad,asplit=2[si_key][si]", filter_arg)
         self.assertIn("[or][si]amix", filter_arg)
         self.assertIn("[ol][right_mix_raw]join", filter_arg)
+
+    def test_build_si_audio_mix_command_applies_duck_strength_preset(self) -> None:
+        cmd = logic.build_si_audio_mix_command(
+            video_path="test.mp4",
+            si_audio_path="test.si.wav",
+            output_path="test_SI.mp4",
+            mix_channel="both",
+            original_volume_percent=100,
+            si_volume_percent=70,
+            si_delay_seconds=1.0,
+            audio_stream_count=1,
+            duck_original=True,
+            duck_preset="strong",
+        )
+        filter_arg = cmd[cmd.index("-filter_complex") + 1]
+
+        self.assertIn(
+            "sidechaincompress=threshold=0.015:ratio=10:attack=30:release=800:makeup=1",
+            filter_arg,
+        )
+
+    def test_build_si_audio_mix_command_uses_duck_key_as_third_input(self) -> None:
+        cmd = logic.build_si_audio_mix_command(
+            video_path="test.mp4",
+            si_audio_path="test.si.wav",
+            output_path="test_SI.mp4",
+            mix_channel="both",
+            original_volume_percent=100,
+            si_volume_percent=70,
+            si_delay_seconds=1.2,
+            audio_stream_count=1,
+            duck_original=True,
+            duck_key_path="test.si.duck.wav",
+        )
+        filter_arg = cmd[cmd.index("-filter_complex") + 1]
+
+        self.assertEqual(cmd[cmd.index("-i") + 1], "test.mp4")
+        self.assertEqual(cmd[cmd.index("-i", cmd.index("-i") + 1) + 1], "test.si.wav")
+        self.assertEqual(cmd[cmd.index("-i", cmd.index("-i", cmd.index("-i") + 1) + 1) + 1], "test.si.duck.wav")
+        self.assertIn("[2:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=mono,apad[si_key]", filter_arg)
+        self.assertIn("adelay=1200,volume=0.7,apad[si_mono]", filter_arg)
+        self.assertNotIn("asplit=2[si_key]", filter_arg)
+
+    def test_mix_si_audio_track_uses_default_duck_key_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            video = root / "test.mp4"
+            si_audio = root / "test.si.wav"
+            duck_key = root / "test.si.duck.wav"
+            output = root / "test_SI.mp4"
+            video.write_bytes(b"video")
+            si_audio.write_bytes(b"si")
+            duck_key.write_bytes(b"duck")
+            messages: list[str] = []
+
+            with patch.object(logic.shutil, "which", return_value="ffmpeg"), patch.object(
+                logic,
+                "probe_audio_stream_count",
+                return_value=1,
+            ), patch.object(
+                logic,
+                "build_si_audio_mix_command",
+                return_value=["ffmpeg", "-version"],
+            ) as build_command, patch.object(logic.subprocess, "Popen", return_value=FakeProcess()):
+                logic.mix_si_audio_track(
+                    video_path=video,
+                    si_audio_path=si_audio,
+                    output_path=output,
+                    duck_original=True,
+                    log_callback=messages.append,
+                )
+
+        self.assertEqual(build_command.call_args.kwargs["duck_key_path"], duck_key)
+        self.assertTrue(any("Using subtitle duck key" in message for message in messages))
 
     def test_probe_audio_stream_count_times_out_cleanly(self) -> None:
         messages: list[str] = []

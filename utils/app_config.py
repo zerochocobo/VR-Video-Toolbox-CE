@@ -33,6 +33,7 @@ _DEFAULTS = {
     'dlna_si_volume_percent': 100,
     'dlna_si_delay_seconds': 1.0,
     'dlna_si_duck_original': True,
+    'dlna_si_duck_preset': 'normal',
     # GPU pipeline from the gpu_engine refactor.
     'transcode_backend': 'auto',  # auto | gpu | ffmpeg
     'mosaic_engine': 'lada',      # lada | jasna | native_gpu placeholder, not implemented.

@@ -164,6 +164,7 @@ def run_transcribe_diarize(
     models_root: str,
     keep_intermediate: bool = True,
     denoise: str = "none",
+    precomputed_turns: Optional[list] = None,
     log: LogCallback = print,
     stop_event: Optional[Event] = None,
     model_holder: Optional[list] = None,
@@ -211,10 +212,18 @@ def run_transcribe_diarize(
 
         _check_stop()
         resolved_backend = diar.resolve_backend(diarize_backend, models_root)
-        turns = diar.diarize(
-            str(audio_wav), backend=diarize_backend, num_speakers=num_speakers,
-            models_root=models_root, device=torch_device, log=log,
-        )
+        if precomputed_turns is not None:
+            turns = [
+                (float(ts), float(te), str(spk))
+                for ts, te, spk in precomputed_turns
+                if float(te) > float(ts)
+            ]
+            log(f"[diarize] using {len(turns)} precomputed global turn(s)")
+        else:
+            turns = diar.diarize(
+                str(audio_wav), backend=diarize_backend, num_speakers=num_speakers,
+                models_root=models_root, device=torch_device, log=log,
+            )
 
     segments = []
     sidx = 0
@@ -396,6 +405,7 @@ def run_synthesize(
     batch_size: int = 6,
     loudness_mode: str = "envelope",
     envelope_alpha: float = 0.6,
+    tempo_fit: str = "moderate",
     max_segments: Optional[int] = None,
     log: LogCallback = print,
     stop_event: Optional[Event] = None,
@@ -433,7 +443,7 @@ def run_synthesize(
         model, manifest, str(video), clone_dir(video),
         text_field=text_field, language=language, models_root=models_root,
         num_step=num_step, guidance_scale=guidance_scale, batch_size=batch_size,
-        loudness_mode=loudness_mode, envelope_alpha=envelope_alpha,
+        loudness_mode=loudness_mode, envelope_alpha=envelope_alpha, tempo_fit=tempo_fit,
         max_segments=max_segments, log=log, stop_event=stop_event,
     )
     _release_cuda_cache()
@@ -458,6 +468,7 @@ def run_full(
     guidance_scale: float = 2.0,
     loudness_mode: str = "envelope",
     envelope_alpha: float = 0.6,
+    tempo_fit: str = "moderate",
     log: LogCallback = print,
     stop_event: Optional[Event] = None,
     model_holder: Optional[list] = None,
@@ -492,7 +503,7 @@ def run_full(
     out = run_synthesize(
         video, models_root=models_root, text_field="tgt_text", language=target_language,
         num_step=num_step, guidance_scale=guidance_scale,
-        loudness_mode=loudness_mode, envelope_alpha=envelope_alpha,
+        loudness_mode=loudness_mode, envelope_alpha=envelope_alpha, tempo_fit=tempo_fit,
         log=log, stop_event=stop_event,
         model_holder=model_holder,
     )

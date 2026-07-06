@@ -116,15 +116,20 @@ UI_LANGUAGE_TO_TTS = {
 LogCallback = Callable[[str], None]
 SI_MIX_CHANNELS = ("left", "right", "both")
 ORIGINAL_VOLUME_CHOICES = (70, 80, 90, 100)
-SI_VOLUME_CHOICES = (50, 60, 70, 80, 90, 100)
+SI_VOLUME_CHOICES = (50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150)
 SI_DELAY_SECONDS_CHOICES = (0.0, 0.3, 0.5, 0.7, 1.0, 1.2, 1.5, 2.0)
 DEFAULT_ORIGINAL_VOLUME_PERCENT = 100
 DEFAULT_SI_VOLUME_PERCENT = 50
 DEFAULT_SI_DELAY_SECONDS = 1.0
-SI_DUCK_THRESHOLD = "0.025"
-SI_DUCK_RATIO = "5"
+DUCK_PRESET_CHOICES = ("light", "normal", "strong", "strongest")
+DEFAULT_DUCK_PRESET = "normal"
+SI_DUCK_PRESETS = {
+    "light": {"threshold": "0.03", "ratio": "2.5", "release": "400"},
+    "normal": {"threshold": "0.025", "ratio": "5", "release": "600"},
+    "strong": {"threshold": "0.015", "ratio": "10", "release": "800"},
+    "strongest": {"threshold": "0.005", "ratio": "20", "release": "1000"},
+}
 SI_DUCK_ATTACK_MS = "30"
-SI_DUCK_RELEASE_MS = "600"
 SI_DUCK_MAKEUP = "1"
 MAX_SUBTITLE_ENTRY_DURATION = 300.0
 MAX_SUBTITLE_TIMECODE_SECONDS = 6 * 60 * 60
@@ -147,6 +152,7 @@ class SITrackMixTask:
     video_path: Path
     si_audio_path: Path
     output_path: Path
+    duck_key_path: Path | None = None
 
 
 def get_model_dir(models_root: str | os.PathLike[str]) -> str:
@@ -405,6 +411,15 @@ def default_si_audio_path(video_path: str | os.PathLike[str]) -> str:
     return _format_path_like_source(path.with_suffix(".si.wav"), video_path)
 
 
+def default_si_duck_key_path(path: str | os.PathLike[str]) -> str:
+    source = Path(path)
+    if source.name.lower().endswith(".si.wav"):
+        duck_key = source.with_suffix(".duck.wav")
+    else:
+        duck_key = source.with_suffix(".si.duck.wav")
+    return _format_path_like_source(duck_key, path)
+
+
 def default_si_mix_output_path(video_path: str | os.PathLike[str]) -> str:
     path = Path(video_path)
     return _format_path_like_source(path.with_name(f"{path.stem}_SI.mp4"), video_path)
@@ -438,12 +453,14 @@ def collect_paired_si_mix_tasks(base_dir: str | os.PathLike[str], recursive: boo
         si_audio = Path(default_si_audio_path(video))
         if not si_audio.is_file():
             continue
+        duck_key = Path(default_si_duck_key_path(si_audio))
         seen.add(resolved)
         tasks.append(
             SITrackMixTask(
                 video_path=video,
                 si_audio_path=si_audio,
                 output_path=Path(default_si_mix_output_path(video)),
+                duck_key_path=duck_key if duck_key.is_file() else None,
             )
         )
     return sorted(tasks, key=lambda task: str(task.video_path).lower())
@@ -486,8 +503,26 @@ def _validate_si_delay_seconds(seconds: int | float) -> float:
     return value
 
 
+def _validate_duck_preset(preset: str) -> str:
+    normalized = (preset or "").strip().lower()
+    if normalized not in DUCK_PRESET_CHOICES:
+        raise ValueError(f"Unsupported duck preset: {preset}")
+    return normalized
+
+
 def _filter_number(value: int | float) -> str:
     return f"{float(value):.6f}".rstrip("0").rstrip(".")
+
+
+def _duck_compressor(preset: str = DEFAULT_DUCK_PRESET) -> str:
+    duck = SI_DUCK_PRESETS[_validate_duck_preset(preset)]
+    return (
+        f"threshold={duck['threshold']}:"
+        f"ratio={duck['ratio']}:"
+        f"attack={SI_DUCK_ATTACK_MS}:"
+        f"release={duck['release']}:"
+        f"makeup={SI_DUCK_MAKEUP}"
+    )
 
 
 def build_si_mix_filter(
@@ -496,6 +531,8 @@ def build_si_mix_filter(
     si_volume_percent: int | float,
     si_delay_seconds: int | float = DEFAULT_SI_DELAY_SECONDS,
     duck_original: bool = False,
+    duck_preset: str = DEFAULT_DUCK_PRESET,
+    duck_key_input: bool = False,
 ) -> str:
     channel = _validate_si_mix_channel(mix_channel)
     original_volume = _filter_number(_validate_original_volume(original_volume_percent) / 100.0)
@@ -505,13 +542,19 @@ def build_si_mix_filter(
     if channel == "both":
         # SI overlaid equally on BOTH channels (no channel split).
         if duck_original:
-            compressor = (
-                f"threshold={SI_DUCK_THRESHOLD}:"
-                f"ratio={SI_DUCK_RATIO}:"
-                f"attack={SI_DUCK_ATTACK_MS}:"
-                f"release={SI_DUCK_RELEASE_MS}:"
-                f"makeup={SI_DUCK_MAKEUP}"
-            )
+            compressor = _duck_compressor(duck_preset)
+            if duck_key_input:
+                return (
+                    "[0:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                    f"volume={original_volume}[orig_base];"
+                    "[2:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=mono,apad[si_key];"
+                    "[1:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=mono,"
+                    f"adelay={si_delay_ms},volume={si_volume},apad[si_mono];"
+                    f"[orig_base][si_key]sidechaincompress={compressor}[orig];"
+                    "[si_mono]aformat=channel_layouts=stereo[si];"
+                    "[orig][si]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+                    "alimiter=limit=0.95[si_track]"
+                )
             return (
                 "[0:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
                 f"volume={original_volume}[orig_base];"
@@ -544,13 +587,18 @@ def build_si_mix_filter(
         )
 
     if duck_original:
-        compressor = (
-            f"threshold={SI_DUCK_THRESHOLD}:"
-            f"ratio={SI_DUCK_RATIO}:"
-            f"attack={SI_DUCK_ATTACK_MS}:"
-            f"release={SI_DUCK_RELEASE_MS}:"
-            f"makeup={SI_DUCK_MAKEUP}"
-        )
+        compressor = _duck_compressor(duck_preset)
+        if duck_key_input:
+            return (
+                "[0:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                f"volume={original_volume}[orig_base];"
+                "[2:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=mono,apad[si_key];"
+                "[1:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=mono,"
+                f"adelay={si_delay_ms},volume={si_volume},apad[si];"
+                f"[orig_base][si_key]sidechaincompress={compressor}[orig];"
+                "[orig]channelsplit=channel_layout=stereo[ol][or];"
+                f"{mix_part}"
+            )
         return (
             "[0:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
             f"volume={original_volume}[orig_base];"
@@ -629,6 +677,8 @@ def build_si_audio_mix_command(
     audio_stream_count: int | None = 1,
     add_independent_track: bool = False,
     duck_original: bool = False,
+    duck_preset: str = DEFAULT_DUCK_PRESET,
+    duck_key_path: str | os.PathLike[str] | None = None,
 ) -> list[str]:
     if audio_stream_count is not None and audio_stream_count < 1:
         raise ValueError("Input video must contain at least one audio stream.")
@@ -639,6 +689,8 @@ def build_si_audio_mix_command(
         si_volume_percent,
         si_delay_seconds,
         duck_original=duck_original,
+        duck_preset=duck_preset,
+        duck_key_input=duck_original and duck_key_path is not None,
     )
     cmd = [
         "ffmpeg",
@@ -651,11 +703,17 @@ def build_si_audio_mix_command(
         str(video_path),
         "-i",
         str(si_audio_path),
-        "-filter_complex",
-        filter_arg,
-        "-map",
-        "0:v?",
     ]
+    if duck_original and duck_key_path is not None:
+        cmd.extend(["-i", str(duck_key_path)])
+    cmd.extend(
+        [
+            "-filter_complex",
+            filter_arg,
+            "-map",
+            "0:v?",
+        ]
+    )
     if add_independent_track:
         si_audio_index = audio_stream_count if audio_stream_count is not None else 1
         cmd.extend(["-map", "0:a?" if audio_stream_count is not None else "0:a:0", "-map", "[si_track]"])
@@ -751,6 +809,9 @@ def mix_si_audio_track(
     si_delay_seconds: int | float = DEFAULT_SI_DELAY_SECONDS,
     add_independent_track: bool = False,
     duck_original: bool = False,
+    duck_preset: str = DEFAULT_DUCK_PRESET,
+    use_duck_key: bool = True,
+    duck_key_path: str | os.PathLike[str] | None = None,
     log_callback: LogCallback = print,
     stop_event: Event | None = None,
     process_callback: Callable[[subprocess.Popen | None], None] | None = None,
@@ -768,6 +829,15 @@ def mix_si_audio_track(
     if video.resolve() == output.resolve():
         raise ValueError("Output file must be different from the input video.")
     output.parent.mkdir(parents=True, exist_ok=True)
+
+    effective_duck_key: Path | None = None
+    if duck_original and use_duck_key:
+        candidate = Path(duck_key_path) if duck_key_path is not None else Path(default_si_duck_key_path(si_audio))
+        if candidate.is_file():
+            effective_duck_key = candidate
+            log_callback(f"Using subtitle duck key: {candidate}")
+        else:
+            log_callback("Duck key not found; falling back to SI waveform sidechain.")
 
     audio_stream_count = probe_audio_stream_count(video, log_callback)
     if audio_stream_count is None:
@@ -789,6 +859,8 @@ def mix_si_audio_track(
         audio_stream_count=audio_stream_count,
         add_independent_track=add_independent_track,
         duck_original=duck_original,
+        duck_preset=duck_preset,
+        duck_key_path=effective_duck_key,
     )
     log_callback(f"Executing: {_format_command_for_log(cmd)}")
 
@@ -848,6 +920,8 @@ def batch_mix_si_audio_tracks(
     si_delay_seconds: int | float = DEFAULT_SI_DELAY_SECONDS,
     add_independent_track: bool = False,
     duck_original: bool = False,
+    duck_preset: str = DEFAULT_DUCK_PRESET,
+    use_duck_key: bool = True,
     log_callback: LogCallback = print,
     stop_event: Event | None = None,
     recursive: bool = True,
@@ -872,6 +946,9 @@ def batch_mix_si_audio_tracks(
             si_delay_seconds=si_delay_seconds,
             add_independent_track=add_independent_track,
             duck_original=duck_original,
+            duck_preset=duck_preset,
+            use_duck_key=use_duck_key,
+            duck_key_path=task.duck_key_path,
             log_callback=log_callback,
             stop_event=stop_event,
             process_callback=process_callback,
@@ -937,6 +1014,40 @@ def write_wav_mono(path: str | os.PathLike[str], audio: np.ndarray, sample_rate:
         wav.setsampwidth(2)
         wav.setframerate(int(sample_rate))
         wav.writeframes(pcm_i16.tobytes())
+
+
+def build_duck_key_timeline(
+    spans: list[dict] | tuple[dict, ...],
+    total_duration: int | float,
+    sample_rate: int,
+    level: float = 0.25,
+) -> np.ndarray:
+    duration = max(0.0, float(total_duration or 0.0))
+    sr = max(1, int(sample_rate))
+    timeline = np.zeros(max(1, int(round(duration * sr))), dtype=np.float32)
+    key_level = float(level)
+    for span in spans:
+        try:
+            start = max(0.0, float(span.get("start", 0.0)))
+            end = min(duration, float(span.get("end", 0.0)))
+        except (TypeError, ValueError):
+            continue
+        if end <= start:
+            continue
+        start_sample = max(0, min(timeline.size, int(round(start * sr))))
+        end_sample = max(start_sample, min(timeline.size, int(round(end * sr))))
+        timeline[start_sample:end_sample] = key_level
+    return timeline
+
+
+def write_duck_key_wav(
+    path: str | os.PathLike[str],
+    spans: list[dict] | tuple[dict, ...],
+    total_duration: int | float,
+    sample_rate: int,
+    level: float = 0.25,
+) -> None:
+    write_wav_mono(path, build_duck_key_timeline(spans, total_duration, sample_rate, level), sample_rate)
 
 
 def read_wav_mono(path: str | os.PathLike[str]) -> tuple[np.ndarray, int]:

@@ -66,6 +66,8 @@ class SIMixConfig:
     si_volume_percent: int = 100
     si_delay_seconds: float = si_logic.DEFAULT_SI_DELAY_SECONDS
     duck_original: bool = True
+    duck_preset: str = si_logic.DEFAULT_DUCK_PRESET
+    dub_mode_enabled: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "enabled", _coerce_bool(self.enabled, False))
@@ -98,6 +100,16 @@ class SIMixConfig:
             ),
         )
         object.__setattr__(self, "duck_original", _coerce_bool(self.duck_original, True))
+        object.__setattr__(
+            self,
+            "duck_preset",
+            _coerce_choice(
+                str(self.duck_preset).strip().lower(),
+                si_logic.DUCK_PRESET_CHOICES,
+                si_logic.DEFAULT_DUCK_PRESET,
+            ),
+        )
+        object.__setattr__(self, "dub_mode_enabled", _coerce_bool(self.dub_mode_enabled, True))
 
     @classmethod
     def from_app_config(cls, getter: Callable[..., Any]) -> "SIMixConfig":
@@ -115,6 +127,8 @@ class SIMixConfig:
             si_volume_percent=read("dlna_si_volume_percent", 100),
             si_delay_seconds=read("dlna_si_delay_seconds", si_logic.DEFAULT_SI_DELAY_SECONDS),
             duck_original=read("dlna_si_duck_original", True),
+            duck_preset=read("dlna_si_duck_preset", si_logic.DEFAULT_DUCK_PRESET),
+            dub_mode_enabled=read("dlna_si_dub_mode", True),
         )
 
     @classmethod
@@ -136,6 +150,14 @@ class SIMixConfig:
                 source.get("dlna_si_delay_seconds", si_logic.DEFAULT_SI_DELAY_SECONDS),
             ),
             duck_original=source.get("duck_original", source.get("dlna_si_duck_original", True)),
+            duck_preset=source.get(
+                "duck_preset",
+                source.get("dlna_si_duck_preset", si_logic.DEFAULT_DUCK_PRESET),
+            ),
+            dub_mode_enabled=source.get(
+                "dub_mode_enabled",
+                source.get("dlna_si_dub_mode", True),
+            ),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -146,15 +168,35 @@ class SIMixConfig:
             "si_volume_percent": self.si_volume_percent,
             "si_delay_seconds": self.si_delay_seconds,
             "duck_original": self.duck_original,
+            "duck_preset": self.duck_preset,
+            "dub_mode_enabled": self.dub_mode_enabled,
         }
 
-    def filter_string(self) -> str:
+    def dubbing_variant(self) -> "SIMixConfig":
+        """Config used when a ``.si.duck.wav`` key drives dubbing playback. It is
+        fully fixed and ignores the user's SI settings: both channels, original
+        at 100%, dub voice at 120%, no delay, original ducked with the "strong"
+        preset across every subtitle span via the duck key."""
+        return SIMixConfig(
+            enabled=self.enabled,
+            mix_channel="both",
+            original_volume_percent=100,
+            si_volume_percent=120,
+            si_delay_seconds=0.0,
+            duck_original=True,
+            duck_preset="strong",
+            dub_mode_enabled=self.dub_mode_enabled,
+        )
+
+    def filter_string(self, duck_key_input: bool = False) -> str:
         return si_logic.build_si_mix_filter(
             self.mix_channel,
             self.original_volume_percent,
             self.si_volume_percent,
             self.si_delay_seconds,
             duck_original=self.duck_original,
+            duck_preset=self.duck_preset,
+            duck_key_input=bool(duck_key_input) and self.duck_original,
         )
 
 
@@ -202,10 +244,12 @@ class LiveStreamSession:
         start_time: float,
         estimated_total: int,
         start_byte: int = 0,
+        duck_key: Path | None = None,
     ) -> None:
         self.video = video
         self.si_wav = si_wav
         self.config = config
+        self.duck_key = Path(duck_key) if duck_key is not None else None
         self.estimated_total = max(1, int(estimated_total))
         self.start_time = max(0.0, float(start_time))
         self.byte_cursor = max(0, int(start_byte))
@@ -217,6 +261,7 @@ class LiveStreamSession:
 
     def _start_ffmpeg(self, start_time: float) -> None:
         seek = f"{max(0.0, start_time):.3f}"
+        use_duck_key = self.duck_key is not None
         cmd = [
             "ffmpeg",
             "-hide_banner",
@@ -230,8 +275,12 @@ class LiveStreamSession:
             seek,
             "-i",
             str(self.si_wav),
+        ]
+        if use_duck_key:
+            cmd += ["-ss", seek, "-i", str(self.duck_key)]
+        cmd += [
             "-filter_complex",
-            self.config.filter_string(),
+            self.config.filter_string(duck_key_input=use_duck_key),
             "-map",
             "0:v",
             "-c:v",
@@ -350,6 +399,33 @@ class SIStreamService:
             pass
         return None
 
+    def has_duck_key(self, video: Path) -> Path | None:
+        """Locate the sibling ``<video>.si.duck.wav`` duck-key file, if any."""
+        video = Path(video)
+        sibling = video.with_suffix(".si.duck.wav")
+        if sibling.is_file():
+            return sibling
+        target_name = f"{video.stem}.si.duck.wav".casefold()
+        try:
+            for child in video.parent.iterdir():
+                if child.name.casefold() == target_name and child.is_file():
+                    return child
+        except OSError:
+            pass
+        return None
+
+    def resolve_stream(self, video: Path) -> tuple[SIMixConfig, Path | None]:
+        """Return the effective ``(config, duck_key)`` for a video, switching to
+        the dubbing variant when dubbing mode is on and a ``.si.duck.wav`` key
+        exists next to it."""
+        config = self.current_config()
+        if not config.dub_mode_enabled:
+            return config, None
+        duck_key = self.has_duck_key(video)
+        if duck_key is None:
+            return config, None
+        return config.dubbing_variant(), duck_key
+
     def estimate_output_size(self, video: Path) -> int:
         video = safe_resolve_path(Path(video))
         try:
@@ -394,10 +470,14 @@ class SIStreamService:
         normalized_client = str(client_id or "").strip()
         return f"{base}\0{normalized_client}" if normalized_client else base
 
-    def _can_reuse(self, session: Any, config: SIMixConfig, si_wav: Path, range_start: int) -> bool:
+    def _can_reuse(
+        self, session: Any, config: SIMixConfig, si_wav: Path, duck_key: Path | None, range_start: int
+    ) -> bool:
         if getattr(session, "config", None) != config:
             return False
         if Path(getattr(session, "si_wav", "")) != si_wav:
+            return False
+        if getattr(session, "duck_key", None) != duck_key:
             return False
         if hasattr(session, "is_usable") and not session.is_usable():
             return False
@@ -418,11 +498,12 @@ class SIStreamService:
         range_start: int,
         total_size: int,
         client_id: str | None,
+        duck_key: Path | None = None,
     ) -> Any:
         key = self._session_key(video, client_id)
         with self._sessions_lock:
             session = self._sessions.get(key)
-            if session is not None and self._can_reuse(session, config, si_wav, range_start):
+            if session is not None and self._can_reuse(session, config, si_wav, duck_key, range_start):
                 return session
             if session is not None:
                 self._close_session(session)
@@ -441,6 +522,7 @@ class SIStreamService:
                 start_time=start_time,
                 estimated_total=total_size,
                 start_byte=range_start,
+                duck_key=duck_key,
             )
             self._sessions[key] = session
             self._last_start_at[key] = time.monotonic()
@@ -472,7 +554,7 @@ class SIStreamService:
         chunk_size: int = DEFAULT_CHUNK_SIZE,
     ) -> tuple[Iterator[bytes], int, int, int]:
         video = safe_resolve_path(Path(video))
-        config = self.current_config()
+        config, duck_key = self.resolve_stream(video)
         if not config.enabled:
             raise FileNotFoundError("SI streaming is disabled")
         si_wav = self.has_si_source(video)
@@ -486,7 +568,9 @@ class SIStreamService:
             safe_end = total_size - 1
         content_length = max(0, safe_end - safe_start + 1)
         status_code = 206 if safe_start > 0 or range_end is not None else 200
-        session = self._get_or_start_session(video, si_wav, config, safe_start, total_size, client_id)
+        session = self._get_or_start_session(
+            video, si_wav, config, safe_start, total_size, client_id, duck_key=duck_key
+        )
 
         def chunks() -> Iterator[bytes]:
             remaining = content_length
@@ -538,10 +622,12 @@ def iter_si_mpegts(
     config: SIMixConfig,
     start_time: float,
     *,
+    duck_key: Path | None = None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
 ) -> Iterator[bytes]:
     """Yield a realtime MPEG-TS SI mix stream from ``start_time`` seconds."""
     seek = f"{max(0.0, float(start_time or 0.0)):.3f}"
+    use_duck_key = duck_key is not None
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -555,8 +641,12 @@ def iter_si_mpegts(
         seek,
         "-i",
         str(si_wav),
+    ]
+    if use_duck_key:
+        cmd += ["-ss", seek, "-i", str(duck_key)]
+    cmd += [
         "-filter_complex",
-        config.filter_string(),
+        config.filter_string(duck_key_input=use_duck_key),
         "-map",
         "0:v",
         "-c:v",

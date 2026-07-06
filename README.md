@@ -14,7 +14,7 @@ Current main features:
 - Subtitle generation, translation, and embedding
 - Simultaneous interpretation (SI) voice generation and SI video audio-track mixing
 - Clone translation dubbing with per-speaker voice cloning and original-vocal removal
-- 2D video to depth-based VR180 SBS conversion
+- 2D to 3D/VR migration notice and download link for the VR Passthrough Server project
 - **Lightweight LAN VR Video DLNA Server** (supports 180° SBS format auto-inducing, external subtitle auto-association, and multi-root mapping)
 - VR split/combine, projection conversion, and other helper tools
 
@@ -28,7 +28,7 @@ The goal is to make complex video workflows usable through a GUI and batch scrip
 - Users who generate, translate, or embed subtitles for VR videos
 - Users who want to turn subtitles into simultaneous-interpretation audio and mix it into videos as an SI track
 - Users who want to translate dialogue and create voice-cloned dubbing that replaces the original vocals while keeping music and effects
-- Users who want to convert ordinary 2D videos into depth-based VR180 SBS videos
+- Users looking for the migrated 2D-to-3D/VR workflow and its current download link
 - Users who want to play local PC videos wirelessly on VR headsets (e.g. Oculus Quest, Pico) with player apps like Skybox and load subtitles automatically
 - Users who want to try AI-assisted mosaic removal
 - Users who need left/right eye splitting, merging, projection conversion, screenshots, or preview helpers
@@ -44,6 +44,19 @@ Several workflows are available for different video types:
 - One-click mode: the simplest choice for most common VR videos.
 - Area selection direct crop mode: useful for local rectangular areas.
 - Area selection VR-to-flat mode: useful when the mosaic looks square in VR view but distorted near the edges of the original frame.
+
+#### Fisheye Options in Plain Words
+
+The word "fisheye" appears in three places, and they are for different jobs:
+
+- **One-Click Mode: "Convert to fisheye before processing"**
+  Use this when the mosaic looks like a square/grid in the VR headset, especially with center-axis or bottom-area mosaics from studios such as SAVR/URVRSP. The tool converts each eye to a fisheye working view, runs mosaic removal, then converts the result back into the original VR projection. The final output is still a normal VR video; you do not need to run the projection converter separately.
+- **Split/Combine Tool: fisheye split or fisheye combine**
+  Use this only for manual workflows where you want separate left/right fisheye eye files, or where you already have restored fisheye eye files and need to combine them back into SBS VR.
+- **Projection Conversion Tool: Hequirect <-> Fisheye**
+  Use this when you deliberately want to convert a file's projection format. If the source is an SBS file with both eyes in one video, enable the dual-screen/SBS option so the left and right halves are converted separately and stacked back correctly.
+
+If you are only removing mosaics, start with One-Click Mode. Enable the fisheye checkbox only when the mosaic shape calls for it; otherwise leave it off.
 
 The final result depends heavily on the AI mosaic removal engine (`lada-cli` or `jasna-cli`) detection and restoration quality. Complex distortion, heavy compression, or low-quality source video may produce unstable results.
 
@@ -92,19 +105,19 @@ SI timing and loudness still need human review. Generated TTS may already contai
 
 ### 4. Clone Translation Dubbing
 
-The clone translation dubbing tool is designed for translated dubbing workflows, not preset-speaker SI narration:
+Clone Translation Dubbing is now a guided workflow for building a target-language voice basis, instead of only the old fully automatic pipeline:
 
-- Transcribe the source video and split dialogue by speaker
-- Extract reference voice samples for each detected speaker
-- Translate recognized dialogue into the target language
-- Use OmniVoice to synthesize translated speech with the corresponding speaker's cloned voice
-- Assemble the cloned speech into a timeline-aligned `<video>.si.wav`
-- Remix the result in two modes:
-  - Simultaneous interpretation mode: keep the original audio and overlay the cloned/translated track, producing `_SI.mp4`
-  - Dubbing mode: remove original vocals with Bandit-v2, keep music/effects as a background bed, then add the cloned track, producing `_DUB.mp4`
-- Support single-file and batch-directory processing, skip-existing output, intermediate-file retention, local ECAPA clustering, optional pyannote diarization, and output loudness modes such as flat narration, sentence match, and intonation follow
+- **Single-Speaker Clone**: for one video or a shared folder with one speaker. Transcribe and translate first, collect candidate clips, then compare the source voice, translated preview, and fixed target-language sample before confirming `SPEAKER1`.
+- **Multi-Speaker Clone**: for dialogue with several speakers. Transcribe with an explicit speaker count, select/import/design a target-language basis for each speaker, export/reuse basis WAV+TXT files, or mark a speaker as `Keep original` when no cloned line should be generated for that speaker.
+- **Basis voice rules**: imported basis WAV files should be 3 to 10 seconds long, the TXT must match the spoken content, and the language must be the same as the translation target. The single-speaker flow writes visible `SPEAKER1.wav` and `SPEAKER1.txt` files for review and reuse.
+- **`.SI.WAV` generation**: after the basis voices are confirmed, OmniVoice synthesizes the translated dialogue into a timeline-aligned `<video>.si.wav`. A matching `<video>.si.duck.wav` is also written so remixing can lower the original audio only while cloned speech is active.
+- **Legacy one-click tab**: still available for bulk automation. It can process a single file, a same-people shared folder, independent batch files, or subfolders where each subfolder shares one voice basis.
+- **Mix / Dubbing tab**:
+  - SI/lower-original mode keeps the original track, overlays the cloned/translated `.si.wav`, can use `.si.duck.wav` for ducking, and outputs `_SI.mp4`.
+  - Dubbing mode uses Bandit-v2 to remove original vocals/dialogue, keeps the music/effects bed, mixes in the cloned voice, and outputs `_DUB.mp4`. It can also add the dub as an independent audio track.
+  - The DLNA server can live-mix `[SI]` with a matching `.SI.WAV`, so a separate mixed MP4 is not always required.
 
-Voice cloning quality depends on source audio quality, diarization accuracy, reference sample selection, and model behavior on short translated sentences. Review the generated `.si.wav`, `_SI.mp4`, or `_DUB.mp4` before using them as final output.
+The guided clone tabs require the translation API configuration used by subtitle translation. Voice cloning quality still depends on source audio quality, diarization accuracy, basis selection, and model behavior on short translated lines, so review the generated `.si.wav`, `_SI.mp4`, or `_DUB.mp4` before using them as final output.
 
 ### 5. 2D to 3D/VR
 
@@ -114,9 +127,9 @@ Voice cloning quality depends on source audio quality, diarization accuracy, ref
 
 The toolkit also includes common VR helpers:
 
-- Split and combine left/right eye video
+- Split and combine left/right eye video, including optional fisheye eye output/input
 - Convert VR video to flat preview/output
-- Convert VR projection formats
+- Convert VR projection formats between hequirectangular VR and fisheye
 - Take screenshots and inspect local areas
 - Run batch processing scripts
 
@@ -144,7 +157,7 @@ From the launcher, choose the tool you need:
 - **VR Video DLNA Server**: One-click startup/shutdown for LAN DLNA sharing, providing an independent config window for directories, port, and subtitles.
 - `Japanese Batch Subtitle Tools`: subtitle generation, translation, and batch tools
 - `Simultaneous Interpretation Voice`: generate `.si.wav` from subtitles and mix SI audio into MP4/MKV videos
-- `Clone Translation Dubbing`: transcribe and translate a video, clone per-speaker voices, generate `<video>.si.wav`, and remix it as `_SI.mp4` or `_DUB.mp4`
+- `Clone Translation Dubbing`: use the guided single-speaker or multi-speaker clone tabs to choose target-language basis voices, generate `<video>.si.wav`, then remix it as `_SI.mp4` or `_DUB.mp4`
 - `2D to 3D/VR`: opens the migration notice for the VR Passthrough Server download
 - `VR Hard Subtitle Embed Tool`: hard subtitle embedding for VR video
 - Other buttons: split/combine, projection conversion, flat conversion, and small utilities
@@ -169,6 +182,7 @@ Required executables and packages:
 - Base Python packages: `Pillow`, `pyinstaller`, `ffmpy3`, `faster-whisper`, `numpy>=1.26,<2.1`, `auditok`, `onnxruntime-gpu`, `huggingface-hub`, `keyring`, `requests`, `transformers`, `accelerate`, `librosa`, `soundfile`, `av`, `fastapi`, `uvicorn`
 - CUDA/video Python packages: `pynvvideocodec>=2.1.0`, `cupy-cuda12x>=14.0`, `nvidia-cuda-nvrtc-cu12==12.8.93`, `nvidia-cuda-runtime-cu12==12.8.90`, `nvidia-cuda-cccl-cu12>=12.9.27`
 - Native AI/GPU packages: `torch==2.8.0`, `torchvision==0.23.0`, and `torchaudio==2.8.0` from the PyTorch `cu128` wheel index, plus `ultralytics==8.4.4`, `mmengine==0.10.7`, `omegaconf`, `einops`, `safetensors`, and `opencv-python`
+- Translation API configuration is required for Clone Translation Dubbing transcription/translation workflows and is shared with subtitle translation settings.
 - Optional/local models:
   - Qwen3-TTS 12Hz CustomVoice under `models/Qwen3-TTS-12Hz-0.6B-CustomVoice` for SI voice generation
   - OmniVoice under `models/OmniVoice` for clone translation dubbing
@@ -222,7 +236,8 @@ Processed files are usually written next to the input video or to the output dir
 - `_L` / `_R`: left-eye or right-eye video
 - Subtitle tools may generate `.srt`, translated subtitle files, or videos with embedded subtitles
 - SI voice tools generate `.si.wav`; SI video audio mixing outputs `_SI.mp4`
-- Clone translation dubbing generates `<video>.si.wav`; remix outputs `_SI.mp4` for SI mode or `_DUB.mp4` for dubbing mode
+- Clone translation dubbing generates `<video>.si.wav` and `<video>.si.duck.wav`; single-speaker basis files may appear as `SPEAKER1.wav` / `SPEAKER1.txt`, and multi-speaker reusable basis files may appear as `.basis.wav` / `.basis.txt`
+- Remix outputs `_SI.mp4` for SI/lower-original mode or `_DUB.mp4` for Bandit-v2 dubbing mode
 
 Exact names depend on the selected tool and settings.
 
@@ -242,7 +257,7 @@ Usually no. Speech recognition and machine translation can make mistakes, so man
 
 ### Which mosaic removal mode should I choose?
 
-Start with one-click mode on a short clip. If the result is poor, try an area selection workflow. The zoom/inspection tool in the launcher can help identify the mosaic style.
+Start with one-click mode on a short clip. If the mosaic looks square/grid-like in the headset, try the fisheye checkbox in One-Click Mode. If the mosaic looks normal in VR but strongly slanted or trapezoid-shaped in the raw PC frame, try the VR-to-flat area workflow. The zoom/inspection tool in the launcher can help identify the mosaic style.
 
 ### What should I do if the LAN DLNA server is not found or cannot be opened?
 

@@ -13,6 +13,8 @@
   "dlna_si_volume_percent": 100,
   "dlna_si_delay_seconds": 1.0,
   "dlna_si_duck_original": true,
+  "dlna_si_duck_preset": "normal",
   "gpu_encode_profile": "balanced_high_quality",
-  "dlna_auto_subnotes": true
+  "dlna_auto_subnotes": true,
+  "dlna_si_dub_mode": true
 }

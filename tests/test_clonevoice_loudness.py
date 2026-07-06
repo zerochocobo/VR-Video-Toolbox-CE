@@ -9,11 +9,22 @@ def test_match_sentence_loudness_raises_quiet_clip_toward_source():
     clip = np.full(1600, 0.02, dtype=np.float32)
     source = np.full(1600, 0.08, dtype=np.float32)
 
-    out, gain, source_db, synth_db = ov._match_sentence_loudness(clip, source, max_gain=10.0)
+    out, gain, source_db, synth_db = ov._match_sentence_loudness(clip, source)
 
     assert np.isclose(gain, 4.0)
     assert np.isclose(ov._rms(out), ov._rms(source), rtol=1e-5)
     assert source_db > synth_db
+
+
+def test_match_sentence_loudness_lowers_loud_clip_to_quiet_source():
+    clip = np.full(1600, 0.2, dtype=np.float32)
+    source = np.full(1600, 0.02, dtype=np.float32)
+
+    out, gain, source_db, synth_db = ov._match_sentence_loudness(clip, source)
+
+    assert np.isclose(gain, 0.1, rtol=1e-5)
+    assert np.isclose(ov._rms(out), ov._rms(source), rtol=1e-5)
+    assert source_db < synth_db
 
 
 def test_match_sentence_loudness_limits_gain_by_peak():

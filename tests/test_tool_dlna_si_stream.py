@@ -13,10 +13,11 @@ from tool_si import logic as si_logic
 class _FakeSession:
     created: list["_FakeSession"] = []
 
-    def __init__(self, video, si_wav, config, start_time, estimated_total, start_byte=0):
+    def __init__(self, video, si_wav, config, start_time, estimated_total, start_byte=0, duck_key=None):
         self.video = Path(video)
         self.si_wav = Path(si_wav)
         self.config = config
+        self.duck_key = Path(duck_key) if duck_key is not None else None
         self.start_time = start_time
         self.estimated_total = estimated_total
         self.byte_cursor = start_byte
@@ -75,17 +76,21 @@ class SIStreamTests(unittest.TestCase):
         self.assertEqual(config.si_volume_percent, 100)
         self.assertEqual(config.si_delay_seconds, 1.0)
         self.assertTrue(config.duck_original)
+        self.assertEqual(config.duck_preset, "normal")
+        self.assertTrue(config.dub_mode_enabled)
 
     def test_si_mix_config_invalid_values_fall_back_to_dlna_defaults(self) -> None:
         config = si_stream.SIMixConfig.from_mapping(
             {
                 "dlna_si_mix_channel": "invalid",
                 "dlna_si_volume_percent": 999,
+                "dlna_si_duck_preset": "invalid",
             }
         )
 
         self.assertEqual(config.mix_channel, "both")
         self.assertEqual(config.si_volume_percent, 100)
+        self.assertEqual(config.duck_preset, "normal")
 
     def test_si_mix_config_filter_string_matches_tool_si(self) -> None:
         config = si_stream.SIMixConfig(
@@ -95,11 +100,12 @@ class SIStreamTests(unittest.TestCase):
             si_volume_percent=60,
             si_delay_seconds=0.7,
             duck_original=True,
+            duck_preset="light",
         )
 
         self.assertEqual(
             config.filter_string(),
-            si_logic.build_si_mix_filter("right", 90, 60, 0.7, duck_original=True),
+            si_logic.build_si_mix_filter("right", 90, 60, 0.7, duck_original=True, duck_preset="light"),
         )
 
     def test_parse_range_header_handles_open_ended_and_malformed(self) -> None:
@@ -129,6 +135,110 @@ class SIStreamTests(unittest.TestCase):
             service = si_stream.SIStreamService(config_holder=si_stream.ConfigHolder(si_stream.SIMixConfig(True)))
 
             self.assertEqual(service.has_si_source(video), si_wav)
+
+    def test_has_duck_key_detects_sibling_duck_wav(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            video = root / "movie.mp4"
+            duck = root / "movie.si.duck.wav"
+            video.write_bytes(b"video")
+            duck.write_bytes(b"duck")
+            service = si_stream.SIStreamService(config_holder=si_stream.ConfigHolder(si_stream.SIMixConfig(True)))
+
+            self.assertEqual(service.has_duck_key(video), duck)
+            missing = root / "other.mp4"
+            missing.write_bytes(b"video")
+            self.assertIsNone(service.has_duck_key(missing))
+
+    def test_dubbing_variant_forces_dub_levels(self) -> None:
+        base = si_stream.SIMixConfig(
+            enabled=True, mix_channel="left", original_volume_percent=80,
+            si_volume_percent=100, si_delay_seconds=1.5, duck_original=True, duck_preset="strong",
+        )
+        dub = base.dubbing_variant()
+
+        self.assertEqual(dub.original_volume_percent, 100)
+        self.assertEqual(dub.si_volume_percent, 120)
+        self.assertEqual(dub.si_delay_seconds, 0.0)
+        self.assertTrue(dub.duck_original)
+        self.assertEqual(dub.mix_channel, "both")    # fixed, ignores user channel
+        self.assertEqual(dub.duck_preset, "strong")  # fixed, ignores user preset
+
+    def test_resolve_stream_switches_to_dubbing_when_duck_key_present(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            video = root / "movie.mp4"
+            video.write_bytes(b"video")
+            (root / "movie.si.duck.wav").write_bytes(b"duck")
+            holder = si_stream.ConfigHolder(si_stream.SIMixConfig(enabled=True, dub_mode_enabled=True))
+            service = si_stream.SIStreamService(config_holder=holder)
+
+            config, duck_key = service.resolve_stream(video)
+            self.assertEqual(config.si_volume_percent, 120)
+            self.assertEqual(duck_key, root / "movie.si.duck.wav")
+
+    def test_resolve_stream_stays_base_without_duck_key_or_when_dub_off(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            video = root / "movie.mp4"
+            video.write_bytes(b"video")
+            # no duck key -> base config
+            holder = si_stream.ConfigHolder(si_stream.SIMixConfig(enabled=True, dub_mode_enabled=True))
+            service = si_stream.SIStreamService(config_holder=holder)
+            config, duck_key = service.resolve_stream(video)
+            self.assertIsNone(duck_key)
+            self.assertEqual(config.si_volume_percent, 100)
+
+            # duck key present but dub mode off -> base config
+            (root / "movie.si.duck.wav").write_bytes(b"duck")
+            holder.set(si_stream.SIMixConfig(enabled=True, dub_mode_enabled=False))
+            config, duck_key = service.resolve_stream(video)
+            self.assertIsNone(duck_key)
+            self.assertEqual(config.si_volume_percent, 100)
+
+    def test_live_stream_session_adds_duck_key_third_input(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            video = root / "movie.mp4"
+            wav = root / "movie.si.wav"
+            duck = root / "movie.si.duck.wav"
+            for p in (video, wav, duck):
+                p.write_bytes(b"x")
+            fake_proc = _FakePopen()
+
+            with patch("tool_dlna.si_stream.subprocess.Popen", return_value=fake_proc) as popen:
+                session = si_stream.LiveStreamSession(
+                    video, wav, si_stream.SIMixConfig(enabled=True).dubbing_variant(),
+                    start_time=0.0, estimated_total=1000, duck_key=duck,
+                )
+                cmd = popen.call_args[0][0]
+                session.close()
+
+        self.assertEqual(cmd.count("-i"), 3)
+        self.assertEqual(cmd[cmd.index("-i", cmd.index("-i", cmd.index("-i") + 1) + 1) + 1], str(duck))
+        filter_arg = cmd[cmd.index("-filter_complex") + 1]
+        self.assertIn("[2:a:0]", filter_arg)
+
+    def test_iter_si_mpegts_adds_duck_key_third_input(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            video = root / "movie.mp4"
+            wav = root / "movie.si.wav"
+            duck = root / "movie.si.duck.wav"
+            for p in (video, wav, duck):
+                p.write_bytes(b"x")
+            fake_proc = _FakePopen()
+            fake_proc.stdout = io.BytesIO(b"abc")
+
+            with patch("tool_dlna.si_stream.subprocess.Popen", return_value=fake_proc) as popen:
+                b"".join(si_stream.iter_si_mpegts(
+                    video, wav, si_stream.SIMixConfig(enabled=True).dubbing_variant(),
+                    start_time=0.0, duck_key=duck, chunk_size=2,
+                ))
+                cmd = popen.call_args[0][0]
+
+        self.assertEqual(cmd.count("-i"), 3)
+        self.assertIn("[2:a:0]", cmd[cmd.index("-filter_complex") + 1])
 
     def test_estimate_output_size_uses_video_size_and_audio_bitrate(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

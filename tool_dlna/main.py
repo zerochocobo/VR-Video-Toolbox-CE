@@ -60,6 +60,8 @@ def main() -> int:
         "dlna_si_volume_percent": 100,
         "dlna_si_delay_seconds": 1.0,
         "dlna_si_duck_original": True,
+        "dlna_si_duck_preset": "normal",
+        "dlna_si_dub_mode": True,
     }
 
     # 3. Read persists config

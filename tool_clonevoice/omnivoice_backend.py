@@ -44,6 +44,46 @@ def load_model(models_root: str, device: str, log: LogCallback = print):
     return model
 
 
+def resolve_device() -> str:
+    try:
+        import torch
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
+def _stable_seed(*parts: object) -> int:
+    """Deterministic 31-bit seed from arbitrary parts (stable across processes)."""
+    import hashlib
+
+    digest = hashlib.sha1("|".join(str(p) for p in parts).encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) & 0x7FFFFFFF
+
+
+def _seed_generation(seed: int) -> None:
+    """Seed torch/numpy RNG so OmniVoice generation is reproducible.
+
+    OmniVoice samples token positions with Gumbel noise (position_temperature>0),
+    which reads the global torch RNG. Without a fixed seed, the same reference clip
+    produces a different take every run, so a good candidate can vanish next time.
+    Seeding per candidate keeps takes diverse but reproducible.
+    """
+    seed = int(seed) & 0x7FFFFFFF
+    try:
+        import torch
+
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    except Exception:
+        pass
+    try:
+        np.random.seed(seed)
+    except Exception:
+        pass
+
+
 # Generic, clear, ~5 s, phonetically rich target-language sentences. For these
 # target languages we build a SAME-LANGUAGE working reference (see below); other
 # languages fall back to the cross-lingual video reference.
@@ -98,7 +138,93 @@ _GENERIC_REF_TEXTS = {
 _GENERIC_REF_DURATION = {
     "chinese": 13.0,
     "english": 13.5,
+    "korean": 12.5,
+    "thai": 13.5,
+    "german": 13.5,
+    "french": 12.5,
+    "spanish": 12.5,
+    "portuguese": 12.5,
+    "italian": 12.0,
+    "russian": 12.5,
 }
+
+
+_LANG_ALIASES = {
+    "zh": "chinese",
+    "zho": "chinese",
+    "cn": "chinese",
+    "chinese": "chinese",
+    "中文": "chinese",
+    "中国語": "chinese",
+    "en": "english",
+    "eng": "english",
+    "english": "english",
+    "英语": "english",
+    "英語": "english",
+    "ja": "japanese",
+    "jpn": "japanese",
+    "japanese": "japanese",
+    "日语": "japanese",
+    "日本語": "japanese",
+    "ko": "korean",
+    "kor": "korean",
+    "korean": "korean",
+    "韩语": "korean",
+    "韓国語": "korean",
+    "th": "thai",
+    "tha": "thai",
+    "thai": "thai",
+    "泰语": "thai",
+    "タイ語": "thai",
+    "de": "german",
+    "deu": "german",
+    "ger": "german",
+    "german": "german",
+    "德语": "german",
+    "ドイツ語": "german",
+    "fr": "french",
+    "fra": "french",
+    "fre": "french",
+    "french": "french",
+    "法语": "french",
+    "フランス語": "french",
+    "es": "spanish",
+    "spa": "spanish",
+    "spanish": "spanish",
+    "西班牙语": "spanish",
+    "スペイン語": "spanish",
+    "pt": "portuguese",
+    "por": "portuguese",
+    "portuguese": "portuguese",
+    "葡萄牙语": "portuguese",
+    "ポルトガル語": "portuguese",
+    "it": "italian",
+    "ita": "italian",
+    "italian": "italian",
+    "意大利语": "italian",
+    "イタリア語": "italian",
+    "ru": "russian",
+    "rus": "russian",
+    "russian": "russian",
+    "俄语": "russian",
+    "ロシア語": "russian",
+}
+
+
+def normalize_language_name(language: Optional[str]) -> str:
+    key = (language or "").strip().lower().replace("_", "-")
+    if key in _LANG_ALIASES:
+        return _LANG_ALIASES[key]
+    if "-" in key:
+        primary = key.split("-", 1)[0]
+        return _LANG_ALIASES.get(primary, primary)
+    return key
+
+
+def same_language(a: Optional[str], b: Optional[str]) -> bool:
+    na = normalize_language_name(a)
+    nb = normalize_language_name(b)
+    return bool(na and nb and na == nb)
 
 
 def _estimate_ref_duration(text: str) -> float:
@@ -113,7 +239,7 @@ def _estimate_ref_duration(text: str) -> float:
 
 
 def _resolve_generic_ref(language: Optional[str]) -> tuple[Optional[str], float]:
-    key = (language or "").strip().lower()
+    key = normalize_language_name(language)
     generic = _GENERIC_REF_TEXTS.get(key)
     duration = _GENERIC_REF_DURATION.get(key)
     if duration is None and generic:
@@ -121,11 +247,18 @@ def _resolve_generic_ref(language: Optional[str]) -> tuple[Optional[str], float]
     return generic, duration or 9.5
 
 
+def generic_ref_text(language: Optional[str]) -> tuple[Optional[str], float]:
+    """Return the built-in target-language fixed reference sentence and duration."""
+    return _resolve_generic_ref(language)
+
+
 def _rms(clip: np.ndarray) -> float:
     return float(np.sqrt(np.mean(clip * clip))) if clip.size else 0.0
 
 
 WORK_REF_TAKES = 3  # work_ref candidates per speaker; best picked by ECAPA similarity
+PROMPT_TAIL_FADE_S = 0.08
+PROMPT_TAIL_SILENCE_S = 0.32
 
 
 def _read_wav_mono_f32(path: str) -> tuple[np.ndarray, int]:
@@ -133,6 +266,84 @@ def _read_wav_mono_f32(path: str) -> tuple[np.ndarray, int]:
 
     wav, sr = sf.read(path, dtype="float32", always_2d=True)
     return wav.mean(axis=1), int(sr)
+
+
+def _read_pcm_wav_mono_f32(path: str | Path) -> tuple[np.ndarray, int]:
+    import wave
+
+    with wave.open(str(path), "rb") as wav_file:
+        sr = int(wav_file.getframerate())
+        channels = int(wav_file.getnchannels())
+        sampwidth = int(wav_file.getsampwidth())
+        raw = wav_file.readframes(wav_file.getnframes())
+    if sampwidth != 2:
+        raise ValueError(f"Only 16-bit PCM WAV fallback is supported, got sample width {sampwidth}.")
+    wav = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    if channels > 1:
+        wav = wav.reshape(-1, channels).mean(axis=1)
+    return wav, sr
+
+
+def _write_pcm_wav_mono_f32(path: str | Path, wav: np.ndarray, sr: int) -> None:
+    import wave
+
+    arr = np.asarray(wav, dtype=np.float32).reshape(-1)
+    pcm = (np.clip(arr, -1.0, 1.0) * 32767.0).astype("<i2")
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(int(sr))
+        wav_file.writeframes(pcm.tobytes())
+
+
+def prepare_prompt_reference_audio(
+    ref_audio: str | Path,
+    *,
+    fade_out_s: float = PROMPT_TAIL_FADE_S,
+    tail_silence_s: float = PROMPT_TAIL_SILENCE_S,
+    log: Optional[LogCallback] = None,
+) -> str:
+    """Create a prompt-only copy whose tail fades into silence.
+
+    OmniVoice conditions generated tokens immediately after the prompt audio
+    tokens. When a reference clip ends mid-breath or with no pause, the model can
+    leak the reference tail into the beginning of the generated sentence. The
+    original reference is still used for playback and ECAPA; this copy is only
+    for prompt construction.
+    """
+    path = Path(ref_audio)
+    if not path.is_file() or path.stem.endswith("_prompt"):
+        return str(path)
+    out = path.with_name(f"{path.stem}_prompt.wav")
+    try:
+        if out.is_file() and out.stat().st_mtime >= path.stat().st_mtime:
+            return str(out)
+        try:
+            wav, sr = _read_wav_mono_f32(str(path))
+        except Exception:
+            wav, sr = _read_pcm_wav_mono_f32(path)
+        if wav.size == 0:
+            return str(path)
+        prepared = wav.astype(np.float32, copy=True)
+        fade_n = min(prepared.size, max(0, int(round(float(fade_out_s) * sr))))
+        if fade_n > 1:
+            prepared[-fade_n:] *= np.linspace(1.0, 0.0, fade_n, dtype=np.float32)
+        pad_n = max(0, int(round(float(tail_silence_s) * sr)))
+        if pad_n:
+            prepared = np.concatenate([prepared, np.zeros(pad_n, dtype=np.float32)])
+        try:
+            import soundfile as sf
+
+            sf.write(str(out), prepared, sr)
+        except Exception:
+            _write_pcm_wav_mono_f32(out, prepared, sr)
+        if log is not None:
+            log(f"[synth] prompt tail separator -> {out.name} (+{tail_silence_s:.2f}s silence)")
+        return str(out)
+    except Exception as exc:
+        if log is not None:
+            log(f"[synth] prompt tail separator skipped for {path.name} ({exc})")
+        return str(path)
 
 
 def _resample_f32(wav: np.ndarray, sr_from: int, sr_to: int) -> np.ndarray:
@@ -175,6 +386,410 @@ def _ecapa_cosine(emb_a, emb_b) -> float:
     import torch
 
     return float(torch.dot(emb_a, emb_b))
+
+
+def score_audio_similarity(
+    audio_a: str,
+    audio_b: str,
+    *,
+    models_root: str,
+    device: Optional[str] = None,
+    log: LogCallback = print,
+) -> float:
+    """Score two audios with OmniVoice's ECAPA-WavLM speaker similarity model."""
+    if device is None:
+        device = resolve_device()
+    _job_results, pair_results = process_target_reference_batch(
+        [],
+        score_pairs=[(audio_a, audio_b)],
+        models_root=models_root,
+        device=device,
+        log=log,
+    )
+    return pair_results[0]
+
+
+def score_audio_similarity_pairs(
+    pairs: list[tuple[str, str]],
+    *,
+    models_root: str,
+    device: Optional[str] = None,
+    log: LogCallback = print,
+) -> list[float]:
+    """Score audio pairs with one ECAPA model load."""
+    if device is None:
+        device = resolve_device()
+    _job_results, pair_results = process_target_reference_batch(
+        [],
+        score_pairs=pairs,
+        models_root=models_root,
+        device=device,
+        log=log,
+    )
+    return pair_results
+
+
+def _pick_best_take_against_ref(
+    takes: list[np.ndarray],
+    *,
+    ref_audio: Path,
+    take_sr: int,
+    models_root: str,
+    device: str,
+    log: LogCallback,
+) -> tuple[np.ndarray, Optional[float]]:
+    audible = [t for t in takes if _rms(t) > 0.02]
+    candidates = audible or takes
+    if not candidates:
+        return np.zeros(1, dtype=np.float32), None
+
+    ecapa = _load_speaker_sim_model(models_root, device, log)
+    try:
+        if ecapa is not None and audible:
+            ref_wav, ref_sr = _read_wav_mono_f32(str(ref_audio))
+            ref_emb = _ecapa_embed(ecapa, ref_wav, ref_sr, device)
+            best_wav = None
+            best_sim = None
+            sims = []
+            for cand in audible:
+                sim = _ecapa_cosine(ref_emb, _ecapa_embed(ecapa, cand, take_sr, device))
+                sims.append(sim)
+                if best_sim is None or sim > best_sim:
+                    best_sim = sim
+                    best_wav = cand
+            log("[synth] target-ref sims " + ", ".join(f"{s:.3f}" for s in sims) + f" -> best {best_sim:.3f}")
+            return best_wav, best_sim  # type: ignore[return-value]
+
+        best = max(candidates, key=_rms)
+        return best, None
+    finally:
+        if ecapa is not None:
+            del ecapa
+        _release_cuda_cache()
+
+
+def _generate_target_reference_takes_with_model(
+    model,
+    *,
+    source_ref_audio: str,
+    source_ref_text: str,
+    target_language: str,
+    num_step: int = DEFAULT_NUM_STEP,
+    guidance_scale: float = DEFAULT_GUIDANCE,
+    take_count: int = WORK_REF_TAKES,
+    instruct: Optional[str] = None,
+    log_label: str = "target sample",
+    log: LogCallback = print,
+    stop_event=None,
+) -> tuple[list[np.ndarray], str, int, str]:
+    """Generate target-language work_ref takes without loading ECAPA."""
+    generic, duration = _resolve_generic_ref(target_language)
+    if not generic:
+        raise ValueError(f"No built-in target-language reference sentence for: {target_language}")
+    sr = int(getattr(model, "sampling_rate", None) or 24000)
+    device = "cuda" if str(getattr(model, "device", "")).startswith("cuda") else "cpu"
+    ref_audio = Path(prepare_prompt_reference_audio(source_ref_audio, log=log))
+    ref_text = (source_ref_text or "").strip()
+    if not ref_text:
+        raise ValueError("Source reference text is empty; cannot build a reliable OmniVoice prompt.")
+
+    # Reproducible per-candidate: the same source clip yields the same takes every
+    # run (still diverse across takes for ECAPA to pick from), so a good candidate
+    # does not randomly disappear on the next "collect + generate" pass.
+    _seed_generation(_stable_seed(source_ref_audio, target_language, instruct or "", take_count))
+
+    takes: list[np.ndarray] = []
+    for take in range(1, max(1, int(take_count)) + 1):
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError("Stopped by user.")
+        kwargs = {
+            "text": generic,
+            "ref_audio": str(ref_audio),
+            "ref_text": ref_text,
+            "language": target_language,
+            "duration": duration,
+            "num_step": num_step,
+            "guidance_scale": guidance_scale,
+        }
+        if instruct:
+            kwargs["instruct"] = instruct
+        cand = _normalize_peak(
+            np.asarray(model.generate(**kwargs)[0], dtype=np.float32).reshape(-1),
+            0.85,
+        )
+        takes.append(cand)
+        log(f"[synth] {log_label}: fixed sample take {take}/{max(1, int(take_count))} generated")
+        _release_cuda_cache()
+    return takes, generic, sr, device
+
+
+def _write_best_target_reference_sample(
+    takes: list[np.ndarray],
+    *,
+    generic: str,
+    source_ref_audio: str,
+    take_sr: int,
+    models_root: str,
+    device: str,
+    output_wav: str,
+    log: LogCallback,
+) -> tuple[str, str, Optional[float]]:
+    results, _pair_results = process_target_reference_batch(
+        [{
+            "takes": takes,
+            "generic": generic,
+            "source_ref_audio": source_ref_audio,
+            "take_sr": take_sr,
+            "output_wav": output_wav,
+        }],
+        models_root=models_root,
+        device=device,
+        log=log,
+    )
+    return results[0]
+
+
+def process_target_reference_batch(
+    jobs: list[dict],
+    *,
+    score_pairs: Optional[list[tuple[str, str]]] = None,
+    models_root: str,
+    device: Optional[str] = None,
+    log: LogCallback = print,
+) -> tuple[list[tuple[str, str, Optional[float]]], list[float]]:
+    """Finalize target-language reference jobs and/or score pairs with one ECAPA load.
+
+    ``jobs`` contain generated takes from ``_generate_target_reference_takes_with_model``.
+    Each job must include ``takes``, ``generic``, ``source_ref_audio``, ``take_sr`` and
+    ``output_wav``. Generated jobs fall back to loudness if ECAPA is unavailable;
+    explicit ``score_pairs`` still raise because they have no useful fallback score.
+    """
+    import soundfile as sf
+
+    jobs = list(jobs)
+    pairs = list(score_pairs or [])
+    if not jobs and not pairs:
+        return [], []
+    if device is None:
+        device = str(jobs[0].get("device") or "") if jobs else ""
+    if not device:
+        device = resolve_device()
+
+    ecapa = _load_speaker_sim_model(models_root, device, log)
+    embed_cache = {}
+
+    def _file_emb(path: str):
+        if ecapa is None:
+            raise RuntimeError("ECAPA speaker-similarity model is unavailable.")
+        key = str(Path(path))
+        if key not in embed_cache:
+            wav, sr = _read_wav_mono_f32(key)
+            embed_cache[key] = _ecapa_embed(ecapa, wav, sr, device)
+        return embed_cache[key]
+
+    job_results: list[tuple[str, str, Optional[float]]] = []
+    pair_results: list[float] = []
+    try:
+        for job in jobs:
+            label = job.get("label") or "target-ref"
+            takes = list(job.get("takes") or [])
+            audible = [t for t in takes if _rms(t) > 0.02]
+            candidates = audible or takes
+            if not candidates:
+                candidates = [np.zeros(1, dtype=np.float32)]
+
+            best_wav = None
+            best_sim = None
+            if ecapa is not None and audible:
+                ref_emb = _file_emb(str(job["source_ref_audio"]))
+                sims = []
+                for cand in audible:
+                    sim = _ecapa_cosine(ref_emb, _ecapa_embed(ecapa, cand, int(job["take_sr"]), device))
+                    sims.append(sim)
+                    if best_sim is None or sim > best_sim:
+                        best_sim = sim
+                        best_wav = cand
+                log("[synth] " + str(label) + " sims " +
+                    ", ".join(f"{s:.3f}" for s in sims) + f" -> best {best_sim:.3f}")
+            if best_wav is None:
+                best_wav = max(candidates, key=_rms)
+
+            out = Path(job["output_wav"])
+            out.parent.mkdir(parents=True, exist_ok=True)
+            sf.write(str(out), best_wav, int(job["take_sr"]))
+            sim_note = f" sim={best_sim:.3f}" if best_sim is not None else ""
+            log(f"[synth] {label}: fixed target-language sample -> {out.name}{sim_note}")
+            job_results.append((str(out), str(job["generic"]), best_sim))
+
+        if pairs:
+            if ecapa is None:
+                raise RuntimeError("ECAPA speaker-similarity model is unavailable.")
+            for audio_a, audio_b in pairs:
+                pair_results.append(_ecapa_cosine(_file_emb(audio_a), _file_emb(audio_b)))
+        return job_results, pair_results
+    finally:
+        if ecapa is not None:
+            del ecapa
+        _release_cuda_cache()
+
+
+def generate_target_reference_sample_with_model(
+    model,
+    *,
+    models_root: str,
+    source_ref_audio: str,
+    source_ref_text: str,
+    target_language: str,
+    output_wav: str,
+    num_step: int = DEFAULT_NUM_STEP,
+    guidance_scale: float = DEFAULT_GUIDANCE,
+    take_count: int = WORK_REF_TAKES,
+    instruct: Optional[str] = None,
+    log: LogCallback = print,
+    stop_event=None,
+) -> tuple[str, str, Optional[float]]:
+    """Generate one frozen target-language work_ref from a source-language ref.
+
+    The text is one built-in fixed sentence; internally several takes are sampled
+    and ECAPA-pick the one closest to the source reference.
+    """
+    takes, generic, sr, device = _generate_target_reference_takes_with_model(
+        model,
+        source_ref_audio=source_ref_audio,
+        source_ref_text=source_ref_text,
+        target_language=target_language,
+        num_step=num_step,
+        guidance_scale=guidance_scale,
+        take_count=take_count,
+        instruct=instruct,
+        log=log,
+        stop_event=stop_event,
+    )
+    return _write_best_target_reference_sample(
+        takes,
+        generic=generic,
+        source_ref_audio=source_ref_audio,
+        take_sr=sr,
+        models_root=models_root,
+        device=device,
+        output_wav=output_wav,
+        log=log,
+    )
+
+
+def generate_target_reference_sample(
+    *,
+    models_root: str,
+    source_ref_audio: str,
+    source_ref_text: str,
+    target_language: str,
+    output_wav: str,
+    num_step: int = DEFAULT_NUM_STEP,
+    guidance_scale: float = DEFAULT_GUIDANCE,
+    take_count: int = WORK_REF_TAKES,
+    instruct: Optional[str] = None,
+    log: LogCallback = print,
+    stop_event=None,
+) -> tuple[str, str, Optional[float]]:
+    device = resolve_device()
+    model = load_model(models_root, device, log)
+    try:
+        takes, generic, sr, model_device = _generate_target_reference_takes_with_model(
+            model,
+            source_ref_audio=source_ref_audio,
+            source_ref_text=source_ref_text,
+            target_language=target_language,
+            num_step=num_step,
+            guidance_scale=guidance_scale,
+            take_count=take_count,
+            instruct=instruct,
+            log=log,
+            stop_event=stop_event,
+        )
+    finally:
+        del model
+        _release_cuda_cache()
+    return _write_best_target_reference_sample(
+        takes,
+        generic=generic,
+        source_ref_audio=source_ref_audio,
+        take_sr=sr,
+        models_root=models_root,
+        device=model_device,
+        output_wav=output_wav,
+        log=log,
+    )
+
+
+def generate_voice_design_sample(
+    *,
+    models_root: str,
+    target_language: str,
+    instruct: str,
+    output_wav: str,
+    num_step: int = DEFAULT_NUM_STEP,
+    guidance_scale: float = DEFAULT_GUIDANCE,
+    log: LogCallback = print,
+    stop_event=None,
+) -> tuple[str, str]:
+    """Generate a target-language SPEAKER1 sample from OmniVoice voice design."""
+    device = resolve_device()
+    model = load_model(models_root, device, log)
+    try:
+        return generate_voice_design_sample_with_model(
+            model,
+            target_language=target_language,
+            instruct=instruct,
+            output_wav=output_wav,
+            num_step=num_step,
+            guidance_scale=guidance_scale,
+            log=log,
+            stop_event=stop_event,
+        )
+    finally:
+        del model
+        _release_cuda_cache()
+
+
+def generate_voice_design_sample_with_model(
+    model,
+    *,
+    target_language: str,
+    instruct: str,
+    output_wav: str,
+    num_step: int = DEFAULT_NUM_STEP,
+    guidance_scale: float = DEFAULT_GUIDANCE,
+    log: LogCallback = print,
+    stop_event=None,
+) -> tuple[str, str]:
+    """Generate a target-language SPEAKER1 sample from an already-loaded model."""
+    import soundfile as sf
+
+    generic, duration = _resolve_generic_ref(target_language)
+    if not generic:
+        raise ValueError(f"No built-in target-language reference sentence for: {target_language}")
+    if stop_event is not None and stop_event.is_set():
+        raise RuntimeError("Stopped by user.")
+    sr = int(getattr(model, "sampling_rate", None) or 24000)
+    wav = _normalize_peak(
+        np.asarray(
+            model.generate(
+                text=generic,
+                language=target_language,
+                instruct=instruct,
+                duration=duration,
+                num_step=num_step,
+                guidance_scale=guidance_scale,
+            )[0],
+            dtype=np.float32,
+        ).reshape(-1),
+        0.85,
+    )
+    out = Path(output_wav)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(str(out), wav, sr)
+    log(f"[synth] voice-design SPEAKER1 sample -> {out.name}")
+    return str(out), generic
 
 
 def _fill_missing_ref_texts(manifest: dict, clone_dir: Path, models_root: str,
@@ -221,8 +836,8 @@ def _fill_missing_ref_texts(manifest: dict, clone_dir: Path, models_root: str,
 
 
 def _build_speaker_prompts(model, manifest: dict, clone_dir: Path, language, sr,
-                           num_step, guidance_scale, models_root: str,
-                           log: LogCallback):
+                            num_step, guidance_scale, models_root: str,
+                            log: LogCallback, text_field: str = "tgt_text"):
     """One reusable voice-clone prompt per speaker.
 
     OmniVoice clones reliably (down to very short lines) only when the reference
@@ -236,8 +851,6 @@ def _build_speaker_prompts(model, manifest: dict, clone_dir: Path, language, sr,
     speaker embedding is closest to the ORIGINAL video reference wins, so the
     second cloning hop drifts as little as possible from the real voice.
     """
-    import soundfile as sf
-
     device = "cuda" if str(model.device).startswith("cuda") else "cpu"
     # Empty ref_text + ref audio = untranscribed prompt: out-of-distribution for
     # OmniVoice and the root cause of "both speakers sound the same generic voice".
@@ -252,6 +865,9 @@ def _build_speaker_prompts(model, manifest: dict, clone_dir: Path, language, sr,
     # scores everything, and frees it before any further generation.
     takes_by_spk: dict = {}  # spk -> (ref_audio path, [takes])
     for spk, info in manifest.get("speakers", {}).items():
+        if (info or {}).get("skip_synthesis"):
+            log(f"[synth] {spk}: marked skipped, prompt not built.")
+            continue
         ref_rel = info.get("ref_audio") or ""
         ref_audio = clone_dir / ref_rel
         if not ref_rel or not ref_audio.is_file():
@@ -261,12 +877,21 @@ def _build_speaker_prompts(model, manifest: dict, clone_dir: Path, language, sr,
         # ref_text is None, which downloads openai/whisper-large-v3-turbo.
         ref_text = (info.get("ref_text") or "").strip()
         try:
+            prompt_ref_audio = prepare_prompt_reference_audio(ref_audio, log=log)
+            if (
+                text_field == "tgt_text"
+                and info.get("skip_work_ref")
+                and same_language(info.get("ref_language"), language)
+            ):
+                prompts[spk] = model.create_voice_clone_prompt(prompt_ref_audio, ref_text, preprocess_prompt=True)
+                log(f"[synth] {spk}: target-language SPEAKER1 basis -> {ref_audio.name}")
+                continue
             if generic:
                 takes = []
                 for take in range(1, WORK_REF_TAKES + 1):
                     cand = _normalize_peak(
                         np.asarray(model.generate(
-                            text=generic, ref_audio=str(ref_audio), ref_text=ref_text,
+                            text=generic, ref_audio=prompt_ref_audio, ref_text=ref_text,
                             language=language, duration=work_dur,
                             num_step=num_step, guidance_scale=guidance_scale,
                         )[0], dtype=np.float32).reshape(-1),
@@ -276,7 +901,7 @@ def _build_speaker_prompts(model, manifest: dict, clone_dir: Path, language, sr,
                     log(f"[synth] {spk}: work_ref take {take}/{WORK_REF_TAKES} generated")
                 takes_by_spk[spk] = (ref_audio, takes)
             else:
-                prompts[spk] = model.create_voice_clone_prompt(str(ref_audio), ref_text, preprocess_prompt=True)
+                prompts[spk] = model.create_voice_clone_prompt(prompt_ref_audio, ref_text, preprocess_prompt=True)
                 log(f"[synth] {spk}: cross-lingual video ref {ref_audio.name} (no generic ref for {language})")
         except Exception as exc:
             log(f"[synth] {spk}: failed to build prompt ({exc}).")
@@ -315,9 +940,12 @@ def _build_speaker_prompts(model, manifest: dict, clone_dir: Path, language, sr,
 
     for spk, (wav, best_sim) in best_by_spk.items():
         try:
+            import soundfile as sf
+
             work_path = clone_dir / f"work_ref_{spk}.wav"
             sf.write(str(work_path), wav, sr)
-            prompts[spk] = model.create_voice_clone_prompt(str(work_path), generic, preprocess_prompt=True)
+            prompt_work_path = prepare_prompt_reference_audio(work_path, log=log)
+            prompts[spk] = model.create_voice_clone_prompt(prompt_work_path, generic, preprocess_prompt=True)
             sim_note = f", sim={best_sim:.3f}" if best_sim is not None else ""
             log(f"[synth] {spk}: same-language working ref ({language}) -> {work_path.name}{sim_note}")
         except Exception as exc:
@@ -416,8 +1044,8 @@ def _match_sentence_loudness(
     source_clip: Optional[np.ndarray],
     *,
     target_peak_limit: float = 0.88,
-    min_gain: float = 0.35,
-    max_gain: float = 2.8,
+    min_gain: float = 0.0,
+    max_gain: float = 25.0,
 ) -> tuple[np.ndarray, float, float, float]:
     """Match a synthesized sentence to the original sentence's RMS loudness.
 
@@ -623,6 +1251,61 @@ def _load_trim_asr(models_root: str, device: str, log: LogCallback):
         return None
 
 
+# Tempo-fit: make each dubbed line roughly track its source segment's pace so a
+# slow original does not leave big silent gaps and a fast one is not rushed. We
+# clamp OmniVoice's speed factor to a band so pacing stays natural (extreme
+# slow-downs sound unnatural); anything beyond the band leaves a residual pause
+# rather than distorting speech.
+_TEMPO_FIT_SPEED_BANDS = {
+    "off": None,
+    "moderate": (0.85, 1.15),
+    "strong": (0.72, 1.30),
+}
+
+# Approximate natural speaking rate in non-space characters per second, keyed by
+# (normalized) TARGET language. Alphabetic/Cyrillic scripts pack ~12-14 chars/s;
+# CJK and Korean ~5-7 chars/s because each glyph is roughly a syllable. Only the
+# TARGET language matters here — the SOURCE side uses the measured segment slot
+# (real timing), not an estimate. These need only be good enough to decide how
+# far to stretch within the clamped speed band.
+_LANG_CHARS_PER_SEC = {
+    "chinese": 5.5,
+    "japanese": 6.5,
+    "korean": 6.5,
+    "thai": 8.0,
+    "english": 13.0,
+    "german": 13.0,
+    "french": 13.0,
+    "spanish": 13.5,
+    "italian": 13.5,
+    "portuguese": 13.0,
+    "russian": 12.0,
+}
+_DEFAULT_CHARS_PER_SEC = 12.0
+
+
+def _estimate_natural_duration(text: str, language: Optional[str] = None) -> float:
+    """Rough natural spoken length (seconds) of ``text`` in its TARGET language."""
+    visible = len(re.sub(r"\s+", "", text or ""))
+    if visible == 0:
+        return 0.3
+    cps = _LANG_CHARS_PER_SEC.get(normalize_language_name(language), _DEFAULT_CHARS_PER_SEC)
+    return float(max(0.3, visible / cps))
+
+
+def _tempo_fit_speed(text: str, start: float, end: float, language: Optional[str],
+                     tempo_fit: str) -> Optional[float]:
+    """Speed factor to pace ``text`` toward the source slot, clamped to the band."""
+    band = _TEMPO_FIT_SPEED_BANDS.get(tempo_fit or "off")
+    if not band:
+        return None
+    src = float(end) - float(start)
+    natural = _estimate_natural_duration(text, language)
+    if src <= 0.2 or natural <= 0.05:
+        return None
+    return float(np.clip(natural / src, band[0], band[1]))
+
+
 def synthesize(
     model,
     manifest: dict,
@@ -636,6 +1319,7 @@ def synthesize(
     guidance_scale: float = DEFAULT_GUIDANCE,
     batch_size: int = DEFAULT_BATCH_SIZE,
     duration_mode: str = "natural",
+    tempo_fit: str = "off",
     min_clone_chars: int = 7,
     merge_gap: float = 0.35,
     loudness_mode: str = "envelope",
@@ -672,13 +1356,25 @@ def synthesize(
     segments = manifest.get("segments", [])
     if max_segments is not None:
         segments = segments[:max_segments]
+    speakers_info = manifest.get("speakers", {}) or {}
+    skipped_speakers = {
+        str(spk)
+        for spk, info in speakers_info.items()
+        if (info or {}).get("skip_synthesis")
+    }
+    if skipped_speakers:
+        log(f"[synth] skipped speakers: {', '.join(sorted(skipped_speakers))}")
 
     prompts = _build_speaker_prompts(
         model, manifest, clone_dir, language, sr, num_step, guidance_scale,
-        models_root, log
+        models_root, log, text_field=text_field
     )
 
     units = _merge_units(segments, text_field, merge_gap)
+    if skipped_speakers:
+        before = len(units)
+        units = [u for u in units if str(u.get("speaker") or "") not in skipped_speakers]
+        log(f"[synth] skipped {before - len(units)} synthesis units for skipped speakers")
     log(f"[synth] {len(segments)} segments -> {len(units)} synthesis units")
 
     total_dur = max((float(s["end"]) for s in segments), default=0.0)
@@ -693,6 +1389,12 @@ def synthesize(
         text = unit["text"]
         prompt = prompts.get(unit["speaker"])
         duration = float(unit["end"] - unit["start"]) if duration_mode == "fit" else None
+        # Tempo-fit paces the line toward its source slot (bounded); it overrides
+        # the hard "fit" duration when enabled. duration takes priority over speed
+        # in OmniVoice, so pass only one.
+        speed = _tempo_fit_speed(text, unit["start"], unit["end"], language, tempo_fit)
+        if speed is not None:
+            duration = None
 
         # Same-language working ref clones reliably even for short lines. Short
         # lines are still the riskiest; retry a few times and keep the least-silent
@@ -702,7 +1404,8 @@ def synthesize(
         for _ in range(tries):
             cand = np.asarray(
                 model.generate(text=text, voice_clone_prompt=prompt, language=language,
-                               duration=duration, num_step=num_step, guidance_scale=guidance_scale)[0],
+                               duration=duration, speed=speed,
+                               num_step=num_step, guidance_scale=guidance_scale)[0],
                 dtype=np.float32,
             ).reshape(-1)
             if clip is None or _rms(cand) > _rms(clip):
@@ -721,7 +1424,8 @@ def synthesize(
             if loudness_mode == "envelope":
                 clip = _follow_energy_envelope(clip, source_clip, sr, source_sr, envelope_alpha)
             clip, gain, src_db, synth_db = _match_sentence_loudness(clip, source_clip)
-            loudness_note = f" gain={gain:.2f} src={src_db:.1f}dB gen={synth_db:.1f}dB"
+            out_db = _rms_db(clip)
+            loudness_note = f" gain={gain:.2f} src={src_db:.1f}dB gen={synth_db:.1f}dB out={out_db:.1f}dB"
             if loudness_mode == "envelope":
                 loudness_note += f" env(a={envelope_alpha:g})"
         n_noref += int(prompt is None)
@@ -729,9 +1433,10 @@ def synthesize(
         start_sample = max(0, int(round(unit["start"] * sr)))
         si._mix_timeline_segment(timeline, start_sample, clip)
         max_end_sample = max(max_end_sample, start_sample + clip.size)
+        tempo_note = f" speed={speed:.2f}" if speed is not None else ""
         log(
             f"[synth] {idx}/{len(units)} {unit['speaker']} "
-            f"{unit['start']:.1f}-{unit['end']:.1f}s{loudness_note}"
+            f"{unit['start']:.1f}-{unit['end']:.1f}s{loudness_note}{tempo_note}"
         )
         _release_cuda_cache()
 
@@ -739,6 +1444,16 @@ def synthesize(
     out_path = si.default_si_audio_path(video_path)
     si.write_wav_mono(out_path, timeline, sr)
     log(f"[synth] wrote {out_path} ({timeline.size / sr:.1f}s; {n_clone} cloned, {n_noref} no-ref)")
+    duck_spans = [
+        {"start": float(s["start"]), "end": float(s["end"])}
+        for s in segments
+        if (s.get(text_field) or "").strip()
+        and str(s.get("speaker") or "") not in skipped_speakers
+    ]
+    duck_duration = max(total_dur, timeline.size / float(sr))
+    duck_path = si.default_si_duck_key_path(out_path)
+    si.write_duck_key_wav(duck_path, duck_spans, duck_duration, sr)
+    log(f"[synth] wrote duck key {duck_path} ({duck_duration:.1f}s; {len(duck_spans)} spans)")
     return str(out_path)
 
 

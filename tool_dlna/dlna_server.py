@@ -645,7 +645,7 @@ def create_app(
                 name = name[: -len(suffix)]
                 break
         path = _safe_video_path(name)
-        config = si_service.current_config()
+        config, duck_key = si_service.resolve_stream(path)
         si_wav = si_service.has_si_source(path)
         if not config.enabled or si_wav is None:
             raise HTTPException(404, "SI stream not available")
@@ -665,7 +665,7 @@ def create_app(
             "contentFeatures.dlna.org": si_live_content_features(request.headers.get("user-agent", "")),
         }
         return StreamingResponse(
-            si_stream.iter_si_mpegts(path, si_wav, config, start_time),
+            si_stream.iter_si_mpegts(path, si_wav, config, start_time, duck_key=duck_key),
             status_code=200,
             headers=headers,
             media_type="video/MP2T",

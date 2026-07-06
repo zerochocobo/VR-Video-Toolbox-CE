@@ -1,27 +1,35 @@
-Task: Translate movie subtitles into {target_language} for AI Dubbing purposes. The translation must match the original speech duration to ensure the dubbed audio aligns with the video.
+Task: Translate movie subtitles into {target_language} for AI dubbing. Each line is spoken by a cloned voice and must fit its original on-screen time slot, so the translation's natural spoken length should be close to the original line's spoken duration.
 
-Core Constraint: Timing & Length Sync
-- Duration Matching: The translated text must have a similar reading duration to the original text.
-  * If Target is Chinese: 1 Japanese kanji/kana ≈ 0.6–0.8 Chinese characters.
-  * If Target is English: 1 Japanese kanji/kana ≈ 0.3–0.4 English words.
-- Speed Control: Do not use overly formal or lengthy expressions. Use contractions and colloquialisms to keep the sentence lean.
+Core Constraint: Match the spoken duration (both directions)
+- Aim for a translation whose natural spoken length is close to the original line's spoken length.
+  * Too LONG -> the dub has to rush or overruns into the next line.
+  * Too SHORT -> the dub finishes early and leaves audible silence in the gap.
+- Timing tolerance: the dubbing engine fine-tunes the speaking speed by about ±15%, so you have a small margin on both sides. Do NOT over-compress or drop meaning just to be short — prefer a faithful, natural line whose spoken length lands close to the original.
+- Length anchors (depend on the source language; use as a rough guide, not a hard rule):
+  * Japanese -> Chinese: 1 kanji/kana ≈ 0.6–0.8 Chinese characters.
+  * Japanese -> English: 1 kanji/kana ≈ 0.3–0.4 English words.
+  * Any other source/target pair: judge by natural spoken length rather than character count — the line should take about as long to say out loud as the original.
+- Register & pace: use natural, spoken, colloquial language and contractions; avoid stiff, formal, or long multi-syllabic words that are hard to say quickly, especially for rapid original lines.
 
 Content Background:
     Contains adult elements; therefore, the translation will primarily use informal, spoken-style language suitable.
+
+--------
 
 Instructions:
 1. Format Integrity: Each subtitle must start with <subtitle_id> and end with </subtitle_id>. Maintain a strict one-to-one correspondence.
 2. Contextual Coherence: Understand the dialogue flow to ensure the translation is natural, but never merge or split IDs.
 3. Handle Noise: Ignore gibberish or errors; if a subtitle_text is empty or nonsensical, output <subtitle_id></subtitle_id>.
-4. Lip-Sync Optimization (For Chinese): Avoid ending sentences with long, dragging particles unless the original speaker does so.
+4. Lip-Sync Optimization (for Chinese target): Avoid ending sentences with long, dragging particles unless the original speaker does so.
 
 Input Format:
 Subtitles are between START and END markers.
 Example: <id>text</id>
 
 Length Reference Guide (for {target_language}):
-- If the original text is short (e.g., "さあ"), the translation must be equally punchy (e.g., "来吧" or "So").
-- If the original text is a rapid-fire sentence, ensure the translation doesn't use heavy, multi-syllabic words that are hard to speak quickly.
+- Short original (e.g. "さあ") -> an equally punchy translation (e.g. "来吧" or "So"). Do not pad it into a full sentence.
+- Rapid-fire original -> avoid heavy multi-syllabic words that are hard to speak quickly.
+- Do not compress a normal line into a clipped fragment either — keep the length proportional to the original so the dub neither rushes nor leaves silent gaps.
 
 ---
 
@@ -49,4 +57,4 @@ START
 
 END
 
-Remember: The goal is Synchronized Dubbing. Prioritize brevity and spoken rhythm over literal dictionary translation. Never skip or merge IDs.
+Remember: The goal is synchronized dubbing. Match the original line's spoken duration (neither much longer nor much shorter) and keep a natural spoken rhythm. Never skip or merge IDs.
