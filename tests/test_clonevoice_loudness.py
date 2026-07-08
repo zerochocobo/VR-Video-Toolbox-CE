@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 
 from tool_clonevoice import omnivoice_backend as ov
@@ -86,14 +88,66 @@ def test_follow_envelope_respects_db_clamp():
     assert gain.max() <= 2.0 + 1e-3
 
 
-def test_builtin_generic_ref_texts_are_long_enough():
+def test_builtin_generic_ref_texts_fit_reference_duration_window():
     chinese = ov._GENERIC_REF_TEXTS["chinese"]
     english = ov._GENERIC_REF_TEXTS["english"]
+    korean = ov._GENERIC_REF_TEXTS["korean"]
     thai = ov._GENERIC_REF_TEXTS["thai"]
 
-    assert len(ov._CJK_RE.findall(chinese)) >= 40
+    for language, text in ov._GENERIC_REF_TEXTS.items():
+        assert 45 <= len("".join(text.split())) <= 130, language
+    assert 35 <= len(ov._CJK_RE.findall(chinese)) <= 55
+    assert 45 <= len(ov._CJK_RE.findall(korean)) <= 65
     assert len(ov._LATIN_WORD_RE.findall(english)) >= 18
-    assert len([ch for ch in thai if not ch.isspace()]) >= 40
-    assert 6.0 <= ov._GENERIC_REF_DURATION["chinese"] <= 14.0
-    assert 6.0 <= ov._GENERIC_REF_DURATION["english"] <= 14.0
-    assert 6.0 <= ov._resolve_generic_ref("Thai")[1] <= 14.0
+    assert len("".join(english.split())) <= 115
+    assert 80 <= len([ch for ch in thai if not ch.isspace()]) <= 125
+    for language in ("english", "german", "french", "spanish", "portuguese", "italian"):
+        assert 18 <= len(ov._LATIN_WORD_RE.findall(ov._GENERIC_REF_TEXTS[language])) <= 28
+    for duration in ov._GENERIC_REF_DURATION.values():
+        assert 7.0 <= duration <= 8.5
+    assert 7.0 <= ov._resolve_generic_ref("Thai")[1] <= 8.5
+
+
+class _RetryGenerateModel:
+    sampling_rate = 24000
+    device = "cpu"
+
+    def __init__(self):
+        self.generate_kwargs = []
+
+    def generate(self, **kwargs):
+        self.generate_kwargs.append(kwargs)
+        if kwargs.get("postprocess_output") is False:
+            return [np.full(2400, 0.05, dtype=np.float32)]
+        raise ValueError("zero-size array to reduction operation maximum which has no identity")
+
+
+def test_synthesize_retries_empty_omnivoice_postprocess(tmp_path: Path):
+    video = tmp_path / "movie.mp4"
+    video.write_bytes(b"video")
+    manifest = {
+        "speakers": {},
+        "segments": [
+            {
+                "speaker": "SPEAKER_00",
+                "start": 0.0,
+                "end": 1.0,
+                "tgt_text": "你好",
+            }
+        ],
+    }
+    model = _RetryGenerateModel()
+
+    out = ov.synthesize(
+        model,
+        manifest,
+        str(video),
+        tmp_path,
+        text_field="tgt_text",
+        language="Chinese",
+        loudness_mode="flat",
+        log=lambda _m: None,
+    )
+
+    assert Path(out).is_file()
+    assert any(kwargs.get("postprocess_output") is False for kwargs in model.generate_kwargs)

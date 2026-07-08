@@ -133,6 +133,161 @@ def collect_candidates_for_videos(
     return selected
 
 
+def _candidate_audio_file(candidate: dict, key: str) -> str:
+    path = candidate.get(key) or ""
+    return path if path and Path(path).is_file() else ""
+
+
+def load_candidate_json(path: str | os.PathLike[str], *, log: LogCallback = print) -> list[dict]:
+    json_path = Path(path)
+    if not json_path.is_file():
+        return []
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8-sig"))
+    except Exception as exc:
+        log(f"[single-ref] could not load existing candidates: {json_path} ({exc})")
+        return []
+    if not isinstance(data, list):
+        return []
+
+    loaded: list[dict] = []
+    for raw in data:
+        if not isinstance(raw, dict):
+            continue
+        cand = dict(raw)
+        source_audio = _candidate_audio_file(cand, "source_audio")
+        if not source_audio or not (cand.get("src_text") or "").strip():
+            continue
+        cand["source_audio"] = source_audio
+        cand["target_sample_audio"] = _candidate_audio_file(cand, "target_sample_audio")
+        cand["translated_audio"] = _candidate_audio_file(cand, "translated_audio")
+        if not cand["target_sample_audio"]:
+            cand["target_sample_similarity"] = None
+            if cand.get("ecapa_similarity_basis") == "target_sample_audio":
+                cand["ecapa_similarity"] = None
+        if not cand["translated_audio"] and cand.get("ecapa_similarity_basis") == "translated_audio":
+            cand["ecapa_similarity"] = None
+        loaded.append(cand)
+    return loaded
+
+
+def rank_loaded_candidates(candidates: list[dict], *, total: int = 12) -> list[dict]:
+    def sort_key(cand: dict) -> tuple:
+        sim = cand.get("ecapa_similarity")
+        has_sim = sim is not None
+        try:
+            sim_value = float(sim)
+        except Exception:
+            sim_value = -999.0
+        return (
+            1 if has_sim else 0,
+            sim_value,
+            float(cand.get("dur") or 0.0),
+            -float(cand.get("start") or 0.0),
+        )
+
+    selected = sorted(candidates, key=sort_key, reverse=True)[: max(1, int(total))]
+    for idx, cand in enumerate(selected, 1):
+        cand["global_rank"] = idx
+    return selected
+
+
+def load_existing_candidates_for_videos(
+    videos: list[str | os.PathLike[str]],
+    *,
+    total: int = 12,
+    log: LogCallback = print,
+) -> list[dict]:
+    loaded = load_all_existing_candidates_for_videos(videos, log=log)
+    return rank_loaded_candidates(loaded, total=total) if loaded else []
+
+
+def load_all_existing_candidates_for_videos(
+    videos: list[str | os.PathLike[str]],
+    *,
+    log: LogCallback = print,
+) -> list[dict]:
+    loaded: list[dict] = []
+    for video_arg in videos:
+        path = logic.clone_dir(video_arg) / "single_candidates" / "candidates.json"
+        loaded.extend(load_candidate_json(path, log=log))
+    return loaded
+
+
+def _video_key(path: str | os.PathLike[str]) -> str:
+    return os.path.normcase(str(Path(path).resolve(strict=False)))
+
+
+def _candidate_video_key(candidate: dict, videos: list[str | os.PathLike[str]]) -> Optional[str]:
+    video = (candidate.get("video") or "").strip()
+    if video:
+        return _video_key(video)
+    source_audio = candidate.get("source_audio") or ""
+    if not source_audio:
+        return None
+    source_path = Path(source_audio).resolve(strict=False)
+    for video_arg in videos:
+        clone = logic.clone_dir(video_arg).resolve(strict=False)
+        try:
+            source_path.relative_to(clone)
+        except ValueError:
+            continue
+        return _video_key(video_arg)
+    return None
+
+
+def missing_candidate_videos(
+    videos: list[str | os.PathLike[str]],
+    candidates: list[dict],
+) -> list[str | os.PathLike[str]]:
+    requested = {_video_key(video) for video in videos}
+    covered = {
+        key
+        for key in (_candidate_video_key(cand, videos) for cand in candidates)
+        if key in requested
+    }
+    return [video for video in videos if _video_key(video) not in covered]
+
+
+def collect_candidates_with_existing_for_videos(
+    videos: list[str | os.PathLike[str]],
+    existing_candidates: list[dict],
+    *,
+    per_video: int = 6,
+    total: int = 12,
+    log: LogCallback = print,
+) -> list[dict]:
+    existing = list(existing_candidates or [])
+    if not existing:
+        return collect_candidates_for_videos(
+            [str(video) for video in videos],
+            per_video=per_video,
+            total=total,
+            log=log,
+        )
+
+    missing = missing_candidate_videos(videos, existing)
+    covered_count = max(0, len(videos) - len(missing))
+    if missing:
+        log(
+            f"[single-ref] existing candidate cache covers {covered_count}/{len(videos)} video(s); "
+            f"collecting {len(missing)} missing video(s)."
+        )
+        fresh = collect_candidates_for_videos(
+            [str(video) for video in missing],
+            per_video=per_video,
+            total=total,
+            log=log,
+        )
+        candidates = existing + fresh
+        for idx, cand in enumerate(candidates, 1):
+            cand["global_rank"] = idx
+        return candidates
+
+    log(f"[single-ref] existing candidate cache covers all {len(videos)} video(s); reusing cache.")
+    return rank_loaded_candidates(existing, total=total)
+
+
 def _candidate_json_path(candidate: dict) -> Optional[Path]:
     source = candidate.get("source_audio") or ""
     if not source:
@@ -325,6 +480,15 @@ def generate_candidate_translated_previews_with_model(
             continue
 
         translated_out = _candidate_translated_output_path(candidate)
+        existing_translated = candidate.get("translated_audio") or ""
+        if existing_translated and Path(existing_translated).is_file():
+            log(f"[synth] {label}: existing final-chain preview reused")
+            continue
+        if translated_out.is_file():
+            candidate["translated_audio"] = str(translated_out)
+            _persist_candidate_update(candidate)
+            log(f"[synth] {label}: existing final-chain preview reused")
+            continue
         prompt_audio = ov.prepare_prompt_reference_audio(target_audio, log=log)
         prompt = model.create_voice_clone_prompt(prompt_audio, target_text, preprocess_prompt=True)
         # Reproducible preview: same fixed sample + text -> same preview every run,
@@ -381,13 +545,27 @@ def score_candidate_similarities(
 
 
 def manifest_has_target_translation(video: str | os.PathLike[str], target_language: str) -> bool:
+    from tool_clonevoice import proofread
+
     manifest = logic.load_manifest(video)
     if not manifest:
         return False
     if (manifest.get("target_language") or "") != target_language:
         return False
+    # Lines the user deliberately emptied while proofreading count as done;
+    # re-translating here would overwrite every proofread edit.
+    cleared = proofread.cleared_segment_ids(manifest)
+
+    def _done(seg: dict) -> bool:
+        if (seg.get("tgt_text") or "").strip():
+            return True
+        try:
+            return int(seg.get("id")) in cleared
+        except Exception:
+            return False
+
     segments = [s for s in manifest.get("segments", []) if (s.get("src_text") or "").strip()]
-    return bool(segments) and all((s.get("tgt_text") or "").strip() for s in segments)
+    return bool(segments) and all(_done(s) for s in segments)
 
 
 def ensure_translated(
@@ -455,6 +633,17 @@ def generate_voice_design_basis_with_model(
     )
 
 
+def _copy_file_if_different(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+    src_path = Path(src)
+    dst_path = Path(dst)
+    try:
+        if src_path.resolve() == dst_path.resolve():
+            return
+    except OSError:
+        pass
+    shutil.copyfile(str(src_path), str(dst_path))
+
+
 def _copy_basis_to_clone_dir(
     video: Path,
     *,
@@ -466,7 +655,7 @@ def _copy_basis_to_clone_dir(
 ) -> None:
     cdir = logic.clone_dir(video)
     cdir.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(str(basis_wav), str(cdir / SPEAKER1_WAV))
+    _copy_file_if_different(basis_wav, cdir / SPEAKER1_WAV)
     (cdir / SPEAKER1_TXT).write_text(basis_text, encoding="utf-8")
     meta_data = dict(meta or {})
     meta_data.update({
@@ -521,7 +710,7 @@ def save_speaker1_basis(
 
     visible_wav, visible_txt = user_visible_speaker1_paths(visible_target, batch=batch)
     visible_wav.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(str(basis_wav), str(visible_wav))
+    _copy_file_if_different(basis_wav, visible_wav)
     visible_txt.write_text(text, encoding="utf-8")
     log(f"[single] visible SPEAKER1 -> {visible_wav}")
 

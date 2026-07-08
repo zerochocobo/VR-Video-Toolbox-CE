@@ -10,6 +10,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from utils import i18n
 from tool_clonevoice.gui_candidate_panel import CandidateBasisPanel
+from tool_clonevoice.gui_proofread import build_proofread_panel
 from tool_clonevoice.log_redirect import redirect_stdio
 
 
@@ -222,7 +223,16 @@ class ClonevoiceToolsApp:
         self.diar_var = tk.StringVar(value=get_text("opt_diar_auto"))
         ttk.Combobox(row2, textvariable=self.diar_var, values=list(self._diar_map.keys()), state="readonly", width=16).pack(side="left", padx=(0, 16))
         ttk.Label(row2, text=get_text("lbl_num_speakers"), width=10).pack(side="left")
-        self._num_map = {get_text("opt_num_auto"): None, "1": 1, "2": 2, "3": 3, "4": 4, "5": 5}
+        self._num_map = {
+            get_text("opt_num_auto"): None,
+            "1": 1,
+            "2": 2,
+            "3": 3,
+            "4": 4,
+            "5": 5,
+            "6": 6,
+            "7": 7,
+        }
         self.num_spk_var = tk.StringVar(value=get_text("opt_num_auto"))
         ttk.Combobox(row2, textvariable=self.num_spk_var, values=list(self._num_map.keys()), state="readonly", width=14).pack(side="left", padx=(0, 16))
         ttk.Label(row2, text=get_text("lbl_denoise"), width=10).pack(side="left")
@@ -623,7 +633,7 @@ class ClonevoiceToolsApp:
         step4.columnconfigure(0, weight=1)
         self.single_clone_step_frames.append(step4)
         step4_synthesis_options = ttk.Frame(step4)
-        step4_synthesis_options.grid(row=0, column=0, sticky="ew", pady=(4, 6))
+        step4_synthesis_options.grid(row=1, column=0, sticky="ew", pady=(4, 6))
         ttk.Label(step4_synthesis_options, text=get_text("lbl_loudness_mode")).pack(side="left", padx=(0, 6))
         self.single_clone_loudness_mode_var = tk.StringVar(value=get_text("opt_loudness_envelope"))
         ttk.Combobox(
@@ -658,19 +668,34 @@ class ClonevoiceToolsApp:
         ).pack(side="left")
 
         step4_options = ttk.Frame(step4)
-        step4_options.grid(row=1, column=0, sticky="ew", pady=(8, 6))
+        step4_options.grid(row=2, column=0, sticky="ew", pady=(8, 6))
         self.single_clone_skip_existing_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             step4_options,
             text=get_text("chk_single_skip_existing_si"),
             variable=self.single_clone_skip_existing_var,
         ).pack(side="left")
+        (
+            self.single_clone_proofread_panel,
+            self._refresh_single_clone_proofread_panel,
+            self.single_clone_proofread_buttons,
+        ) = build_proofread_panel(
+            step4,
+            app=self,
+            get_videos=self._single_clone_scan_videos_silent,
+            run_async=self._single_clone_run_async,
+            log_widget=lambda: self.single_clone_log,
+            show_speaker=False,
+            get_target_language=self._selected_single_target_language,
+            get_stop_event=lambda: self.single_clone_stop_event,
+        )
+        self.single_clone_proofread_panel.grid(row=0, column=0, sticky="ew", pady=(4, 8))
         self.single_clone_btn_translate_clone = ttk.Button(
             step4,
             text=get_text("btn_start_single_clone"),
             command=self._single_clone_translate_clone,
         )
-        self.single_clone_btn_translate_clone.grid(row=2, column=0, sticky="ew")
+        self.single_clone_btn_translate_clone.grid(row=3, column=0, sticky="ew")
 
         log_frame = ttk.LabelFrame(frame, text=get_text("lbl_log"), padding=6)
         log_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
@@ -691,6 +716,7 @@ class ClonevoiceToolsApp:
             self.single_clone_btn_voice_design,
             self.single_clone_btn_apply_basis,
             self.single_clone_btn_trans_config,
+            *self.single_clone_proofread_buttons,
             self.single_clone_btn_translate_clone,
         ]
         self._refresh_single_clone_target_label()
@@ -726,7 +752,16 @@ class ClonevoiceToolsApp:
             get_text("opt_denoise_balanced"): "balanced",
             get_text("opt_denoise_strong"): "strong",
         }
-        self.multi_clone_num_map = {"2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7}
+        self.multi_clone_num_map = {
+            get_text("opt_num_auto"): None,
+            "1": 1,
+            "2": 2,
+            "3": 3,
+            "4": 4,
+            "5": 5,
+            "6": 6,
+            "7": 7,
+        }
         self.multi_clone_tgt_map = {
             get_text("opt_lang_zh"): "Chinese",
             get_text("opt_lang_en"): "English",
@@ -872,7 +907,7 @@ class ClonevoiceToolsApp:
         self.btn_download_multi_asr_model.pack(side="left", padx=(6, 16))
         self.multi_clone_num_label = ttk.Label(model_row, text=get_text("lbl_num_speakers"), width=secondary_width)
         self.multi_clone_num_label.pack(side="left", padx=(0, 6))
-        self.multi_clone_num_var = tk.StringVar(value="2")
+        self.multi_clone_num_var = tk.StringVar(value=get_text("opt_num_auto"))
         self.multi_clone_num_combo = ttk.Combobox(
             model_row,
             textvariable=self.multi_clone_num_var,
@@ -991,7 +1026,7 @@ class ClonevoiceToolsApp:
         step3.columnconfigure(0, weight=1)
         self.multi_clone_step_frames.append(step3)
         synthesis_options = ttk.Frame(step3)
-        synthesis_options.grid(row=0, column=0, sticky="ew", pady=(4, 6))
+        synthesis_options.grid(row=1, column=0, sticky="ew", pady=(4, 6))
         ttk.Label(synthesis_options, text=get_text("lbl_loudness_mode")).pack(side="left", padx=(0, 6))
         self.multi_clone_loudness_mode_var = tk.StringVar(value=get_text("opt_loudness_envelope"))
         ttk.Combobox(
@@ -1026,19 +1061,34 @@ class ClonevoiceToolsApp:
         ).pack(side="left")
 
         step3_options = ttk.Frame(step3)
-        step3_options.grid(row=1, column=0, sticky="ew", pady=(8, 6))
+        step3_options.grid(row=2, column=0, sticky="ew", pady=(8, 6))
         self.multi_clone_skip_existing_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             step3_options,
             text=get_text("chk_single_skip_existing_si"),
             variable=self.multi_clone_skip_existing_var,
         ).pack(side="left")
+        (
+            self.multi_clone_proofread_panel,
+            self._refresh_multi_clone_proofread_panel,
+            self.multi_clone_proofread_buttons,
+        ) = build_proofread_panel(
+            step3,
+            app=self,
+            get_videos=self._multi_clone_current_or_scanned_videos_silent,
+            run_async=self._multi_clone_run_async,
+            log_widget=lambda: self.multi_clone_log,
+            show_speaker=True,
+            get_target_language=self._selected_multi_target_language,
+            get_stop_event=lambda: self.multi_clone_stop_event,
+        )
+        self.multi_clone_proofread_panel.grid(row=0, column=0, sticky="ew", pady=(4, 8))
         self.multi_clone_btn_start_export = ttk.Button(
             step3,
             text=get_text("btn_start_multi_clone"),
             command=self._multi_clone_translate_clone,
         )
-        self.multi_clone_btn_start_export.grid(row=2, column=0, sticky="ew")
+        self.multi_clone_btn_start_export.grid(row=3, column=0, sticky="ew")
 
         log_frame = ttk.LabelFrame(frame, text=get_text("lbl_log"), padding=6)
         log_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
@@ -1053,6 +1103,7 @@ class ClonevoiceToolsApp:
             self.multi_clone_btn_trans_config,
             self.multi_clone_btn_transcribe,
             self.multi_clone_btn_export_basis,
+            *self.multi_clone_proofread_buttons,
             self.multi_clone_btn_start_export,
         ]
         self._refresh_multi_asr_model_status()
@@ -1200,6 +1251,10 @@ class ClonevoiceToolsApp:
 
     def _show_single_clone_step(self, index: int):
         index = max(0, min(index, len(self.single_clone_step_frames) - 1))
+        if index == 1 and not self.single_clone_candidates:
+            self._single_clone_load_existing_candidates()
+        if index >= 2:
+            self._single_clone_restore_basis_state()
         if self.single_clone_step_index == 2 and index > 2 and not self._single_clone_basis_text_value():
             messagebox.showerror("Error", get_text("err_speaker1_text_required"))
             return
@@ -1208,6 +1263,8 @@ class ClonevoiceToolsApp:
             frame.grid_remove()
         self.single_clone_step_frames[index].grid(row=0, column=0, sticky="nsew")
         self.single_clone_step_title_var.set(f"{index + 1}/{len(self.single_clone_step_frames)} {self.single_clone_step_names[index]}")
+        if index == len(self.single_clone_step_frames) - 1 and hasattr(self, "_refresh_single_clone_proofread_panel"):
+            self._refresh_single_clone_proofread_panel()
         if getattr(self, "single_clone_busy", False):
             return
         self.single_clone_btn_prev.config(state="normal" if index > 0 else "disabled")
@@ -1347,6 +1404,60 @@ class ClonevoiceToolsApp:
         self.single_clone_videos = videos
         return videos
 
+    def _single_clone_scan_videos_silent(self) -> list[str]:
+        if self.single_clone_videos:
+            return list(self.single_clone_videos)
+        from tool_clonevoice import single_clone as sc
+
+        input_path = self.single_clone_input_var.get().strip()
+        batch_mode = self.single_clone_input_mode_var.get() == "batch"
+        if batch_mode:
+            if not input_path or not os.path.isdir(input_path):
+                return []
+        elif not input_path or not os.path.isfile(input_path):
+            return []
+        videos = sc.scan_videos(input_path, batch=batch_mode)
+        self.single_clone_videos = videos
+        return videos
+
+    def _single_clone_restore_basis_state(self, videos: list[str] | None = None) -> bool:
+        if getattr(self, "single_clone_basis_applied", False):
+            return True
+        if (
+            (self.single_clone_basis_wav_var.get() or "").strip()
+            and self._single_clone_basis_text_value()
+        ):
+            return False
+        videos = list(videos or self._single_clone_scan_videos_silent())
+        if not videos:
+            return False
+        from tool_clonevoice import logic
+        from tool_clonevoice import single_clone as sc
+
+        first_wav = ""
+        first_text = ""
+        for video in videos:
+            manifest = logic.load_manifest(video) or {}
+            info = (manifest.get("speakers") or {}).get(sc.SPEAKER_ID) or {}
+            ref_audio = info.get("ref_audio") or ""
+            ref_text = (info.get("ref_text") or "").strip()
+            if not ref_audio or not ref_text:
+                return False
+            ref_path = logic.clone_dir(video) / ref_audio
+            if not ref_path.is_file():
+                return False
+            if not first_wav:
+                first_wav = str(ref_path)
+                first_text = ref_text
+        self.single_clone_basis_wav_var.set(first_wav)
+        self.single_clone_basis_txt_path_var.set("")
+        self._single_clone_set_basis_text(first_text)
+        self.single_clone_basis_source_kind = "existing_manifest"
+        self.single_clone_basis_meta = {}
+        self.single_clone_basis_applied = True
+        self.single_clone_basis_status_var.set(get_text("msg_single_basis_applied").format(len(videos)))
+        return True
+
     def _selected_single_candidate(self) -> dict | None:
         return self.single_clone_candidate_panel.selected_candidate()
 
@@ -1354,6 +1465,25 @@ class ClonevoiceToolsApp:
         if not hasattr(self, "single_clone_candidate_panel"):
             return
         self.single_clone_candidate_panel.set_candidates(self.single_clone_candidates)
+
+    def _single_clone_load_existing_candidates(self) -> bool:
+        from tool_clonevoice import single_clone as sc
+
+        videos = self._single_clone_scan_videos_silent()
+        if not videos:
+            return False
+        loaded = sc.load_existing_candidates_for_videos(
+            videos,
+            total=self._single_clone_candidate_limit(),
+            log=lambda m: self.log(self.single_clone_log, m),
+        )
+        if not loaded:
+            return False
+        self.single_clone_candidates = loaded
+        self._refresh_single_clone_candidates()
+        self._set_single_clone_candidate_actions_visible(True)
+        self.log(self.single_clone_log, get_text("msg_single_candidates_done").format(len(loaded)))
+        return True
 
     def _set_single_clone_candidate_actions_visible(self, visible: bool):
         if not hasattr(self, "single_clone_btn_use_candidate"):
@@ -1554,12 +1684,18 @@ class ClonevoiceToolsApp:
         pool = max(1, display * sc.CANDIDATE_POOL_FACTOR)
         per_video = pool if len(videos) == 1 else max(1, min(pool, (pool + len(videos) - 1) // len(videos) + 2))
         target_language = self._selected_single_target_language()
+        existing_candidates = list(self.single_clone_candidates or [])
 
         def worker(holder, release_holder):
             from tool_clonevoice import single_clone as sc
 
-            candidates = sc.collect_candidates_for_videos(
+            disk_existing = sc.load_all_existing_candidates_for_videos(
                 videos,
+                log=lambda m: self.log(self.single_clone_log, m),
+            )
+            candidates = sc.collect_candidates_with_existing_for_videos(
+                videos,
+                disk_existing or existing_candidates,
                 per_video=per_video,
                 total=pool,
                 log=lambda m: self.log(self.single_clone_log, m),
@@ -1569,47 +1705,77 @@ class ClonevoiceToolsApp:
                 return candidates
             self.log(self.single_clone_log, get_text("msg_single_prepare_samples"))
             jobs = []
-            model = self._load_single_clone_omnivoice_model(holder)
-            try:
-                for idx, cand in enumerate(candidates, 1):
-                    if self.single_clone_stop_event.is_set():
-                        raise RuntimeError("Stopped by user.")
-                    label = get_text("msg_single_candidate_label").format(idx, len(candidates), cand.get("id") or "")
-                    self.log(self.single_clone_log, get_text("msg_single_candidate_generating").format(label))
-                    jobs.append(sc.build_candidate_target_sample_job(
-                        cand,
+            missing_target = [
+                cand for cand in candidates
+                if not (
+                    cand.get("target_sample_audio")
+                    and os.path.isfile(cand.get("target_sample_audio"))
+                    and (cand.get("target_sample_text") or "").strip()
+                )
+            ]
+            if missing_target:
+                model = self._load_single_clone_omnivoice_model(holder)
+                try:
+                    for idx, cand in enumerate(candidates, 1):
+                        if cand not in missing_target:
+                            continue
+                        if self.single_clone_stop_event.is_set():
+                            raise RuntimeError("Stopped by user.")
+                        label = get_text("msg_single_candidate_label").format(idx, len(candidates), cand.get("id") or "")
+                        self.log(self.single_clone_log, get_text("msg_single_candidate_generating").format(label))
+                        jobs.append(sc.build_candidate_target_sample_job(
+                            cand,
+                            model=model,
+                            target_language=target_language,
+                            log_label=label,
+                            log=lambda m: self.log(self.single_clone_log, m),
+                            stop_event=self.single_clone_stop_event,
+                        ))
+                finally:
+                    del model
+                    release_holder()
+            if jobs:
+                sc.finish_candidate_target_sample_jobs(
+                    jobs,
+                    models_root=self.models_root,
+                    log=lambda m: self.log(self.single_clone_log, m),
+                )
+            preview_missing = [
+                cand for cand in candidates
+                if (cand.get("tgt_text") or "").strip()
+                and cand.get("target_sample_audio")
+                and os.path.isfile(cand.get("target_sample_audio"))
+                and not (cand.get("translated_audio") and os.path.isfile(cand.get("translated_audio")))
+            ]
+            if preview_missing:
+                model = self._load_single_clone_omnivoice_model(holder)
+                try:
+                    sc.generate_candidate_translated_previews_with_model(
+                        candidates,
                         model=model,
                         target_language=target_language,
-                        log_label=label,
+                        label_func=lambda i, n, c: get_text("msg_single_candidate_label").format(i, n, c.get("id") or ""),
                         log=lambda m: self.log(self.single_clone_log, m),
                         stop_event=self.single_clone_stop_event,
-                    ))
-            finally:
-                del model
-                release_holder()
-            sc.finish_candidate_target_sample_jobs(
-                jobs,
-                models_root=self.models_root,
-                log=lambda m: self.log(self.single_clone_log, m),
-            )
-            model = self._load_single_clone_omnivoice_model(holder)
-            try:
-                sc.generate_candidate_translated_previews_with_model(
-                    candidates,
-                    model=model,
-                    target_language=target_language,
-                    label_func=lambda i, n, c: get_text("msg_single_candidate_label").format(i, n, c.get("id") or ""),
-                    log=lambda m: self.log(self.single_clone_log, m),
-                    stop_event=self.single_clone_stop_event,
+                    )
+                finally:
+                    del model
+                    release_holder()
+            score_missing = [
+                cand for cand in candidates
+                if cand.get("ecapa_similarity") is None
+                and cand.get("source_audio")
+                and (
+                    (cand.get("translated_audio") and os.path.isfile(cand.get("translated_audio")))
+                    or (cand.get("target_sample_audio") and os.path.isfile(cand.get("target_sample_audio")))
                 )
-            finally:
-                del model
-                release_holder()
-            sc.score_candidate_similarities(
-                candidates,
-                models_root=self.models_root,
-                log=lambda m: self.log(self.single_clone_log, m),
-            )
+            ]
+            if score_missing:
+                sc.score_candidate_similarities(
+                    score_missing,
+                    models_root=self.models_root,
+                    log=lambda m: self.log(self.single_clone_log, m),
+                )
             candidates.sort(
                 key=lambda c: float(c.get("ecapa_similarity") if c.get("ecapa_similarity") is not None else -999.0),
                 reverse=True,
@@ -1971,6 +2137,7 @@ class ClonevoiceToolsApp:
         videos = self.single_clone_videos or self._single_clone_scan_videos()
         if not videos:
             return
+        self._single_clone_restore_basis_state(videos)
         if not getattr(self, "single_clone_basis_applied", False):
             messagebox.showerror("Error", get_text("err_no_speaker1"))
             return
@@ -2041,6 +2208,8 @@ class ClonevoiceToolsApp:
 
     def _show_multi_clone_step(self, index: int):
         index = max(0, min(index, len(self.multi_clone_step_frames) - 1))
+        if index >= 1:
+            self._multi_clone_restore_manifest_state()
         if index > 1 and not self._multi_clone_ready_for_export():
             messagebox.showerror("Error", get_text("err_not_all_speakers_ready"))
             return
@@ -2049,6 +2218,8 @@ class ClonevoiceToolsApp:
             frame.grid_remove()
         self.multi_clone_step_frames[index].grid(row=0, column=0, sticky="nsew")
         self.multi_clone_step_title_var.set(f"{index + 1}/{len(self.multi_clone_step_frames)} {self.multi_clone_step_names[index]}")
+        if index == len(self.multi_clone_step_frames) - 1 and hasattr(self, "_refresh_multi_clone_proofread_panel"):
+            self._refresh_multi_clone_proofread_panel()
         if getattr(self, "multi_clone_busy", False):
             return
         self.multi_clone_btn_prev.config(state="normal" if index > 0 else "disabled")
@@ -2207,6 +2378,39 @@ class ClonevoiceToolsApp:
             return [self.multi_clone_video]
         return []
 
+    def _multi_clone_current_or_scanned_videos_silent(self) -> list[str]:
+        videos = self._multi_clone_current_videos()
+        if videos:
+            return videos
+        from tool_clonevoice import single_clone as sc
+
+        input_path = self.multi_clone_input_var.get().strip()
+        batch_mode = self.multi_clone_input_mode_var.get() == "batch"
+        if batch_mode:
+            if not input_path or not os.path.isdir(input_path):
+                return []
+        elif not input_path or not os.path.isfile(input_path):
+            return []
+        videos = sc.scan_videos(input_path, batch=batch_mode)
+        self.multi_clone_videos = videos
+        self.multi_clone_video = videos[0] if videos else ""
+        return videos
+
+    def _multi_clone_restore_manifest_state(self) -> bool:
+        videos = self._multi_clone_current_or_scanned_videos_silent()
+        if not videos:
+            return False
+        from tool_clonevoice import multi_clone as mc
+
+        speakers = mc.list_global_speakers(videos)
+        if not speakers:
+            return False
+        if not self.multi_clone_speakers:
+            self.multi_clone_speakers = speakers
+        self._multi_clone_load_manifest_state()
+        self._refresh_multi_clone_speakers()
+        return True
+
     def _multi_clone_basis_source_video(self, speaker: str) -> str:
         videos = self._multi_clone_current_videos()
         if not videos:
@@ -2313,10 +2517,11 @@ class ClonevoiceToolsApp:
             self._refresh_multi_translate_config_status()
             messagebox.showerror("Error", get_text("err_no_translation_api_key"))
             return
-        num_speakers = self.multi_clone_num_map.get(self.multi_clone_num_var.get())
-        if num_speakers is None:
+        num_speaker_label = self.multi_clone_num_var.get()
+        if num_speaker_label not in self.multi_clone_num_map:
             messagebox.showerror("Error", get_text("err_multi_num_speakers_required"))
             return
+        num_speakers = self.multi_clone_num_map.get(num_speaker_label)
         if not self._multi_asr_model_available():
             self._download_multi_asr_model(after_success=self._multi_clone_run_transcribe)
             return
@@ -2350,7 +2555,8 @@ class ClonevoiceToolsApp:
 
             turns_by_video = {}
             if batch_mode:
-                self.log(self.multi_clone_log, get_text("msg_multi_global_prescan_start").format(len(videos), num_speakers))
+                speaker_note = num_speakers if num_speakers is not None else get_text("opt_num_auto")
+                self.log(self.multi_clone_log, get_text("msg_multi_global_prescan_start").format(len(videos), speaker_note))
                 turns_by_video = mc.prescan_global_diarize(
                     videos,
                     models_root=self.models_root,
@@ -2920,15 +3126,22 @@ class ClonevoiceToolsApp:
             display = self._multi_clone_candidate_limit()
             pool = max(1, display * mc.CANDIDATE_POOL_FACTOR)
             target_language = self._selected_multi_target_language()
+            existing_candidates = list(candidates or [])
 
             def worker(holder, release_holder):
                 from tool_clonevoice import multi_clone as mc
                 from tool_clonevoice import single_clone as sc
 
                 per_video = pool if len(videos) == 1 else max(1, min(pool, (pool + len(videos) - 1) // len(videos) + 2))
-                collected = mc.collect_speaker_candidates_for_videos(
+                disk_existing = mc.load_all_existing_speaker_candidates_for_videos(
                     videos,
                     speaker,
+                    log=lambda m: self.log(self.multi_clone_log, m),
+                )
+                collected = mc.collect_speaker_candidates_with_existing_for_videos(
+                    videos,
+                    speaker,
+                    disk_existing or existing_candidates,
                     per_video=per_video,
                     total=pool,
                     log=lambda m: self.log(self.multi_clone_log, m),
@@ -2938,49 +3151,79 @@ class ClonevoiceToolsApp:
                     return collected
                 self.log(self.multi_clone_log, get_text("msg_single_prepare_samples"))
                 jobs = []
-                model = self._load_multi_clone_omnivoice_model(holder)
-                try:
-                    for idx, cand in enumerate(collected, 1):
-                        if self.multi_clone_stop_event.is_set():
-                            raise RuntimeError("Stopped by user.")
-                        label = get_text("msg_multi_candidate_label").format(speaker, idx, len(collected), cand.get("id") or "")
-                        self.log(self.multi_clone_log, get_text("msg_single_candidate_generating").format(label))
-                        jobs.append(
-                            sc.build_candidate_target_sample_job(
-                                cand,
-                                model=model,
-                                target_language=target_language,
-                                log_label=label,
-                                log=lambda m: self.log(self.multi_clone_log, m),
-                                stop_event=self.multi_clone_stop_event,
-                            )
-                        )
-                finally:
-                    del model
-                    release_holder()
-                sc.finish_candidate_target_sample_jobs(
-                    jobs,
-                    models_root=self.models_root,
-                    log=lambda m: self.log(self.multi_clone_log, m),
-                )
-                model = self._load_multi_clone_omnivoice_model(holder)
-                try:
-                    sc.generate_candidate_translated_previews_with_model(
-                        collected,
-                        model=model,
-                        target_language=target_language,
-                        label_func=lambda i, n, c: get_text("msg_multi_candidate_label").format(speaker, i, n, c.get("id") or ""),
-                        log=lambda m: self.log(self.multi_clone_log, m),
-                        stop_event=self.multi_clone_stop_event,
+                missing_target = [
+                    cand for cand in collected
+                    if not (
+                        cand.get("target_sample_audio")
+                        and os.path.isfile(cand.get("target_sample_audio"))
+                        and (cand.get("target_sample_text") or "").strip()
                     )
-                finally:
-                    del model
-                    release_holder()
-                sc.score_candidate_similarities(
-                    collected,
-                    models_root=self.models_root,
-                    log=lambda m: self.log(self.multi_clone_log, m),
-                )
+                ]
+                if missing_target:
+                    model = self._load_multi_clone_omnivoice_model(holder)
+                    try:
+                        for idx, cand in enumerate(collected, 1):
+                            if cand not in missing_target:
+                                continue
+                            if self.multi_clone_stop_event.is_set():
+                                raise RuntimeError("Stopped by user.")
+                            label = get_text("msg_multi_candidate_label").format(speaker, idx, len(collected), cand.get("id") or "")
+                            self.log(self.multi_clone_log, get_text("msg_single_candidate_generating").format(label))
+                            jobs.append(
+                                sc.build_candidate_target_sample_job(
+                                    cand,
+                                    model=model,
+                                    target_language=target_language,
+                                    log_label=label,
+                                    log=lambda m: self.log(self.multi_clone_log, m),
+                                    stop_event=self.multi_clone_stop_event,
+                                )
+                            )
+                    finally:
+                        del model
+                        release_holder()
+                if jobs:
+                    sc.finish_candidate_target_sample_jobs(
+                        jobs,
+                        models_root=self.models_root,
+                        log=lambda m: self.log(self.multi_clone_log, m),
+                    )
+                preview_missing = [
+                    cand for cand in collected
+                    if (cand.get("tgt_text") or "").strip()
+                    and cand.get("target_sample_audio")
+                    and os.path.isfile(cand.get("target_sample_audio"))
+                    and not (cand.get("translated_audio") and os.path.isfile(cand.get("translated_audio")))
+                ]
+                if preview_missing:
+                    model = self._load_multi_clone_omnivoice_model(holder)
+                    try:
+                        sc.generate_candidate_translated_previews_with_model(
+                            collected,
+                            model=model,
+                            target_language=target_language,
+                            label_func=lambda i, n, c: get_text("msg_multi_candidate_label").format(speaker, i, n, c.get("id") or ""),
+                            log=lambda m: self.log(self.multi_clone_log, m),
+                            stop_event=self.multi_clone_stop_event,
+                        )
+                    finally:
+                        del model
+                        release_holder()
+                score_missing = [
+                    cand for cand in collected
+                    if cand.get("ecapa_similarity") is None
+                    and cand.get("source_audio")
+                    and (
+                        (cand.get("translated_audio") and os.path.isfile(cand.get("translated_audio")))
+                        or (cand.get("target_sample_audio") and os.path.isfile(cand.get("target_sample_audio")))
+                    )
+                ]
+                if score_missing:
+                    sc.score_candidate_similarities(
+                        score_missing,
+                        models_root=self.models_root,
+                        log=lambda m: self.log(self.multi_clone_log, m),
+                    )
                 collected.sort(
                     key=lambda c: float(c.get("ecapa_similarity") if c.get("ecapa_similarity") is not None else -999.0),
                     reverse=True,
@@ -3053,12 +3296,27 @@ class ClonevoiceToolsApp:
             row=0, column=1, sticky="e", padx=(8, 4)
         )
         ttk.Button(buttons, text=get_text("btn_cancel"), command=dlg.destroy).grid(row=0, column=2, sticky="e")
+        try:
+            from tool_clonevoice import multi_clone as mc
+
+            loaded = mc.load_existing_speaker_candidates_for_videos(
+                videos,
+                speaker,
+                total=self._multi_clone_candidate_limit(),
+                log=lambda m: self.log(self.multi_clone_log, m),
+            )
+            if loaded:
+                candidates[:] = loaded
+                refresh_tree()
+        except Exception as exc:
+            self.log(self.multi_clone_log, f"[multi] existing candidates load skipped: {exc}")
         dlg.grab_set()
 
     def _multi_clone_translate_clone(self):
         videos = self._multi_clone_current_videos() or self._multi_clone_scan_videos()
         if not videos:
             return
+        self._multi_clone_restore_manifest_state()
         if not self._multi_clone_ready_for_export():
             messagebox.showerror("Error", get_text("err_not_all_speakers_ready"))
             return
@@ -3626,12 +3884,6 @@ class ClonevoiceToolsApp:
         if not target_language:
             messagebox.showerror("Error", get_text("err_no_target_lang"))
             return
-        # Shared-folder mode global-diarizes the whole folder at once, so it needs
-        # an explicit total speaker count (auto cross-video detection is unreliable).
-        if shared_mode and self._num_map.get(self.num_spk_var.get()) is None:
-            messagebox.showerror("Error", get_text("err_shared_needs_speakers"))
-            return
-
         from tool_clonevoice import logic
 
         self.stop_event.clear()

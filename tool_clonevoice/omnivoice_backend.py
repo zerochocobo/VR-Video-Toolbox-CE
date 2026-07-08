@@ -84,49 +84,49 @@ def _seed_generation(seed: int) -> None:
         pass
 
 
-# Generic, clear, ~5 s, phonetically rich target-language sentences. For these
+# Generic, clear, ~7-8 s target-language sentences. For these
 # target languages we build a SAME-LANGUAGE working reference (see below); other
 # languages fall back to the cross-lingual video reference.
 _GENERIC_REF_TEXTS = {
     "chinese": (
-        "你好，很高兴认识你。今天的天气很舒服，我们可以慢慢聊聊最近的计划、"
-        "喜欢的音乐、遇到的事情，也可以轻松地分享一些温暖又有趣的想法。"
+        "你好，很高兴认识你。今天天气很舒服，我们可以聊聊最近的计划、"
+        "喜欢的音乐，也分享一些温暖有趣的想法。"
     ),
     "english": (
-        "Hello, it is really nice to meet you today. The weather feels calm and pleasant, "
-        "so let us speak clearly, share a few simple thoughts, and talk about anything on your mind."
+        "Hello, it is nice to meet you today. The weather is calm, "
+        "so we can speak clearly, share a few ideas, and talk about what matters."
     ),
     "korean": (
-        "안녕하세요, 오늘 만나서 정말 반갑습니다. 날씨가 편안해서 우리는 천천히 이야기하고, "
-        "최근의 계획과 좋아하는 음악, 기억에 남는 일들을 자연스럽게 나눌 수 있습니다."
+        "안녕하세요, 오늘 만나서 반갑습니다. 날씨가 편안해서 천천히 이야기하고, "
+        "최근 계획과 좋아하는 음악, 따뜻한 생각을 나눌 수 있습니다."
     ),
     "thai": (
-        "สวัสดีครับ วันนี้ยินดีมากที่ได้พบกัน อากาศสงบและน่าพอใจ "
-        "เราจึงคุยกันช้าๆ ได้อย่างชัดเจน แบ่งปันความคิดง่ายๆ และพูดถึงเรื่องที่อยู่ในใจได้อย่างเป็นธรรมชาติ"
+        "สวัสดีครับ วันนี้ยินดีที่ได้พบกัน อากาศสงบและน่าพอใจ "
+        "เราคุยกันช้าๆ ได้ชัดเจน แบ่งปันความคิดง่ายๆ และเรื่องที่อยู่ในใจ"
     ),
     "german": (
-        "Hallo, es freut mich sehr, dich heute kennenzulernen. Das Wetter ist ruhig und angenehm, "
-        "deshalb können wir klar sprechen, ein paar einfache Gedanken teilen und über alles reden, was dir gerade wichtig ist."
+        "Hallo, es freut mich, dich heute kennenzulernen. Das Wetter ist ruhig, "
+        "wir können klar sprechen, einfache Gedanken teilen und über Wichtiges reden."
     ),
     "french": (
-        "Bonjour, je suis vraiment ravi de vous rencontrer aujourd'hui. Le temps est calme et agréable, "
-        "alors parlons clairement, partageons quelques idées simples et évoquons ce qui vous tient à coeur."
+        "Bonjour, je suis ravi de vous rencontrer aujourd'hui. Le temps est calme, "
+        "parlons clairement, partageons des idées simples et évoquons ce qui compte."
     ),
     "spanish": (
-        "Hola, me alegra mucho conocerte hoy. El clima se siente tranquilo y agradable, "
-        "así que podemos hablar con claridad, compartir algunas ideas sencillas y conversar sobre lo que tengas en mente."
+        "Hola, me alegra conocerte hoy. El clima está tranquilo, "
+        "podemos hablar con claridad, compartir ideas sencillas y conversar sobre lo importante."
     ),
     "portuguese": (
-        "Olá, é muito bom conhecer você hoje. O tempo está calmo e agradável, "
-        "então podemos falar com clareza, compartilhar algumas ideias simples e conversar sobre o que estiver em sua mente."
+        "Olá, é bom conhecer você hoje. O tempo está calmo, "
+        "podemos falar com clareza, compartilhar ideias simples e conversar sobre o que importa."
     ),
     "italian": (
-        "Ciao, sono davvero felice di incontrarti oggi. Il tempo è calmo e piacevole, "
-        "quindi possiamo parlare con chiarezza, condividere alcuni pensieri semplici e discutere di ciò che hai in mente."
+        "Ciao, sono felice di incontrarti oggi. Il tempo è calmo, "
+        "possiamo parlare con chiarezza, condividere idee semplici e discutere ciò che conta."
     ),
     "russian": (
-        "Здравствуйте, очень приятно встретиться с вами сегодня. Погода спокойная и приятная, "
-        "поэтому мы можем говорить ясно, делиться простыми мыслями и обсуждать то, что для вас сейчас важно."
+        "Здравствуйте, приятно встретиться с вами сегодня. Погода спокойная, "
+        "мы можем говорить ясно, делиться простыми мыслями и обсуждать важное."
     ),
 }
 
@@ -136,16 +136,16 @@ _GENERIC_REF_TEXTS = {
 # makes the working reference wildly slow for one speaker and fast for another.
 # Pinning it keeps every speaker's work_ref at the same sane speaking rate.
 _GENERIC_REF_DURATION = {
-    "chinese": 13.0,
-    "english": 13.5,
-    "korean": 12.5,
-    "thai": 13.5,
-    "german": 13.5,
-    "french": 12.5,
-    "spanish": 12.5,
-    "portuguese": 12.5,
-    "italian": 12.0,
-    "russian": 12.5,
+    "chinese": 8.0,
+    "english": 8.0,
+    "korean": 8.0,
+    "thai": 8.0,
+    "german": 8.0,
+    "french": 8.0,
+    "spanish": 8.0,
+    "portuguese": 8.0,
+    "italian": 8.0,
+    "russian": 8.0,
 }
 
 
@@ -1306,6 +1306,49 @@ def _tempo_fit_speed(text: str, start: float, end: float, language: Optional[str
     return float(np.clip(natural / src, band[0], band[1]))
 
 
+def _is_fatal_generation_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    fatal_markers = (
+        "out of memory",
+        "cuda error",
+        "cublas",
+        "cudnn",
+        "device-side assert",
+    )
+    return any(marker in text for marker in fatal_markers)
+
+
+def _synthesize_take(
+    model,
+    *,
+    text: str,
+    prompt,
+    language: Optional[str],
+    duration: Optional[float],
+    speed: Optional[float],
+    num_step: int,
+    guidance_scale: float,
+    postprocess_output: bool = True,
+) -> np.ndarray:
+    kwargs = {
+        "text": text,
+        "voice_clone_prompt": prompt,
+        "language": language,
+        "duration": duration,
+        "speed": speed,
+        "num_step": num_step,
+        "guidance_scale": guidance_scale,
+    }
+    if not postprocess_output:
+        kwargs["postprocess_output"] = False
+    return np.asarray(model.generate(**kwargs)[0], dtype=np.float32).reshape(-1)
+
+
+def _silence_fallback(unit: dict, sr: int) -> np.ndarray:
+    dur = max(0.15, min(3.0, float(unit["end"]) - float(unit["start"])))
+    return np.zeros(max(1, int(round(dur * sr))), dtype=np.float32)
+
+
 def synthesize(
     model,
     manifest: dict,
@@ -1401,17 +1444,59 @@ def synthesize(
         # take (catches the occasional empty/garbled generation) — no carrier.
         tries = 3 if (prompt is not None and _clone_char_count(text) < min_clone_chars) else 1
         clip = None
+        generation_warnings: list[str] = []
         for _ in range(tries):
-            cand = np.asarray(
-                model.generate(text=text, voice_clone_prompt=prompt, language=language,
-                               duration=duration, speed=speed,
-                               num_step=num_step, guidance_scale=guidance_scale)[0],
-                dtype=np.float32,
-            ).reshape(-1)
+            cand = None
+            try:
+                cand = _synthesize_take(
+                    model,
+                    text=text,
+                    prompt=prompt,
+                    language=language,
+                    duration=duration,
+                    speed=speed,
+                    num_step=num_step,
+                    guidance_scale=guidance_scale,
+                )
+            except Exception as exc:
+                if _is_fatal_generation_error(exc):
+                    raise
+                generation_warnings.append(f"normal={exc}")
+
+            if cand is None or cand.size == 0 or _rms(cand) <= 1e-6:
+                try:
+                    retry = _synthesize_take(
+                        model,
+                        text=text,
+                        prompt=prompt,
+                        language=language,
+                        duration=duration,
+                        speed=speed,
+                        num_step=num_step,
+                        guidance_scale=guidance_scale,
+                        postprocess_output=False,
+                    )
+                    if retry.size > 0:
+                        if cand is None or _rms(retry) > _rms(cand):
+                            cand = retry
+                    else:
+                        generation_warnings.append("retry_no_postprocess=empty")
+                except Exception as exc:
+                    if _is_fatal_generation_error(exc):
+                        raise
+                    generation_warnings.append(f"retry_no_postprocess={exc}")
+
+            if cand is None:
+                cand = np.zeros(0, dtype=np.float32)
             if clip is None or _rms(cand) > _rms(clip):
                 clip = cand
             if _rms(cand) > 0.02:
                 break
+
+        used_silence_fallback = False
+        if clip is None or clip.size == 0:
+            used_silence_fallback = True
+            clip = _silence_fallback(unit, sr)
 
         if loudness_mode == "flat":
             clip = _normalize_peak(clip, 0.6)
@@ -1428,6 +1513,10 @@ def synthesize(
             loudness_note = f" gain={gain:.2f} src={src_db:.1f}dB gen={synth_db:.1f}dB out={out_db:.1f}dB"
             if loudness_mode == "envelope":
                 loudness_note += f" env(a={envelope_alpha:g})"
+        if generation_warnings:
+            loudness_note += f" warn=gen_retry({'; '.join(generation_warnings[:2])})"
+        if used_silence_fallback:
+            loudness_note += " warn=silence_fallback"
         n_noref += int(prompt is None)
         n_clone += int(prompt is not None)
         start_sample = max(0, int(round(unit["start"] * sr)))

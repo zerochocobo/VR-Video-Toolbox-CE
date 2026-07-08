@@ -209,7 +209,7 @@ def extract_shared_references(
             dst = logic.clone_dir(Path(video)) / ref_name
             if str(Path(video)) != str(Path(origin)):
                 dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(str(origin_ref), str(dst))
+                _copy_file_if_different(origin_ref, dst)
             manifest = logic.load_manifest(video)
             manifest.setdefault("speakers", {})[speaker] = {
                 "ref_audio": ref_name,
@@ -352,9 +352,10 @@ def prescan_global_diarize(
     try:
         _check_stop()
         torch_device, _ = wx.resolve_device()
+        speaker_note = num_speakers if num_speakers is not None else "auto"
         log(
             f"[multi-global] diarize {len(videos)} video(s), "
-            f"{concat.size / float(sr):.1f}s concat, speakers={num_speakers}"
+            f"{concat.size / float(sr):.1f}s concat, speakers={speaker_note}"
         )
         global_turns = diar.diarize(
             str(concat_path),
@@ -439,9 +440,95 @@ def collect_speaker_candidates_for_videos(
     return selected
 
 
+def load_existing_speaker_candidates_for_videos(
+    videos: list[str | os.PathLike[str]],
+    speaker: str,
+    *,
+    total: int = 12,
+    log: LogCallback = print,
+) -> list[dict]:
+    from tool_clonevoice import single_clone as sc
+
+    loaded = load_all_existing_speaker_candidates_for_videos(videos, speaker, log=log)
+    return sc.rank_loaded_candidates(loaded, total=total) if loaded else []
+
+
+def load_all_existing_speaker_candidates_for_videos(
+    videos: list[str | os.PathLike[str]],
+    speaker: str,
+    *,
+    log: LogCallback = print,
+) -> list[dict]:
+    from tool_clonevoice import single_clone as sc
+
+    loaded: list[dict] = []
+    for video in videos:
+        if speaker not in speaker_ids(video):
+            continue
+        path = logic.clone_dir(video) / f"candidates_{speaker}" / "candidates.json"
+        loaded.extend(sc.load_candidate_json(path, log=log))
+    return loaded
+
+
+def collect_speaker_candidates_with_existing_for_videos(
+    videos: list[str | os.PathLike[str]],
+    speaker: str,
+    existing_candidates: list[dict],
+    *,
+    per_video: int = 6,
+    total: int = 12,
+    log: LogCallback = print,
+) -> list[dict]:
+    from tool_clonevoice import single_clone as sc
+
+    speaker_videos = [video for video in videos if speaker in speaker_ids(video)]
+    existing = list(existing_candidates or [])
+    if not existing:
+        return collect_speaker_candidates_for_videos(
+            videos,
+            speaker,
+            per_video=per_video,
+            total=total,
+            log=log,
+        )
+
+    missing = sc.missing_candidate_videos(speaker_videos, existing)
+    covered_count = max(0, len(speaker_videos) - len(missing))
+    if missing:
+        log(
+            f"[multi] {speaker}: existing candidate cache covers {covered_count}/{len(speaker_videos)} video(s); "
+            f"collecting {len(missing)} missing video(s)."
+        )
+        fresh = collect_speaker_candidates_for_videos(
+            missing,
+            speaker,
+            per_video=per_video,
+            total=total,
+            log=log,
+        )
+        candidates = existing + fresh
+        for index, cand in enumerate(candidates, 1):
+            cand["global_rank"] = index
+        return candidates
+
+    log(f"[multi] {speaker}: existing candidate cache covers all {len(speaker_videos)} video(s); reusing cache.")
+    return sc.rank_loaded_candidates(existing, total=total)
+
+
 def _speaker_basis_names(speaker: str) -> tuple[str, str, str]:
     safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in (speaker or "SPEAKER"))
     return f"{safe}{BASIS_WAV_SUFFIX}", f"{safe}{BASIS_TXT_SUFFIX}", f"{safe}{BASIS_META_SUFFIX}"
+
+
+def _copy_file_if_different(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+    src_path = Path(src)
+    dst_path = Path(dst)
+    try:
+        if src_path.resolve() == dst_path.resolve():
+            return
+    except OSError:
+        pass
+    shutil.copyfile(str(src_path), str(dst_path))
 
 
 def save_speaker_basis(
@@ -466,7 +553,7 @@ def save_speaker_basis(
     cdir = logic.clone_dir(video)
     cdir.mkdir(parents=True, exist_ok=True)
     wav_name, txt_name, meta_name = _speaker_basis_names(speaker)
-    shutil.copyfile(str(basis_wav), str(cdir / wav_name))
+    _copy_file_if_different(basis_wav, cdir / wav_name)
     (cdir / txt_name).write_text(text, encoding="utf-8")
     meta_data = dict(meta or {})
     meta_data.update(

@@ -78,6 +78,93 @@ def test_collect_speaker_candidates_uses_isolated_directory_and_filters_empty_te
     assert any("without source transcript text" in message for message in logs)
 
 
+def test_load_existing_speaker_candidates_for_videos(tmp_path: Path):
+    video = tmp_path / "movie.mp4"
+    video.write_bytes(b"video")
+    _save_multi_manifest(video)
+    cand_dir = logic.clone_dir(video) / "candidates_SPEAKER_01"
+    cand_dir.mkdir(parents=True)
+    source = cand_dir / "cand_001_src.wav"
+    target = cand_dir / "cand_001_target.wav"
+    source.write_bytes(b"src")
+    target.write_bytes(b"target")
+    (cand_dir / "candidates.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": "cand_001",
+                    "source_audio": str(source),
+                    "target_sample_audio": str(target),
+                    "target_sample_text": "fixed sample",
+                    "src_text": "source",
+                    "dur": 5.0,
+                    "start": 1.0,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = mc.load_existing_speaker_candidates_for_videos(
+        [video], "SPEAKER_01", total=12, log=lambda _m: None
+    )
+
+    assert len(loaded) == 1
+    assert loaded[0]["id"] == "cand_001"
+    assert loaded[0]["source_audio"] == str(source)
+    assert loaded[0]["target_sample_audio"] == str(target)
+    assert loaded[0]["global_rank"] == 1
+
+
+def test_collect_speaker_candidates_with_existing_collects_missing_videos(tmp_path: Path):
+    video_a = tmp_path / "a.mp4"
+    video_b = tmp_path / "b.mp4"
+    video_c = tmp_path / "c.mp4"
+    for video in (video_a, video_b, video_c):
+        video.write_bytes(b"video")
+        _save_multi_manifest(video)
+    existing = [
+        {
+            "id": "cached_a",
+            "video": str(video_a),
+            "speaker": "SPEAKER_01",
+            "source_audio": str(tmp_path / "cached_a.wav"),
+            "src_text": "cached",
+            "dur": 7.0,
+            "start": 0.0,
+        }
+    ]
+    calls: list[str] = []
+
+    def fake_collect(video, speaker, *, top_n, log):
+        calls.append(Path(video).name)
+        assert speaker == "SPEAKER_01"
+        return [
+            {
+                "id": f"{Path(video).stem}_cand",
+                "video": str(video),
+                "speaker": speaker,
+                "source_audio": str(tmp_path / f"{Path(video).stem}.wav"),
+                "src_text": "fresh",
+                "dur": 5.0,
+                "start": 1.0,
+            }
+        ]
+
+    with patch("tool_clonevoice.multi_clone.collect_speaker_candidates", side_effect=fake_collect):
+        result = mc.collect_speaker_candidates_with_existing_for_videos(
+            [video_a, video_b, video_c],
+            "SPEAKER_01",
+            existing,
+            per_video=2,
+            total=12,
+            log=lambda _m: None,
+        )
+
+    assert calls == ["b.mp4", "c.mp4"]
+    assert [cand["id"] for cand in result] == ["cached_a", "b_cand", "c_cand"]
+
+
 def test_save_speaker_basis_updates_only_target_speaker_and_preserves_segments(tmp_path: Path):
     video = tmp_path / "movie.mp4"
     video.write_bytes(b"video")
@@ -109,6 +196,30 @@ def test_save_speaker_basis_updates_only_target_speaker_and_preserves_segments(t
     meta = json.loads((cdir / "SPEAKER_01.basis.meta.json").read_text(encoding="utf-8"))
     assert meta["candidate_id"] == "cand_002"
     assert meta["basis_wav"] == "SPEAKER_01.basis.wav"
+
+
+def test_save_speaker_basis_accepts_existing_basis_wav(tmp_path: Path):
+    video = tmp_path / "movie.mp4"
+    video.write_bytes(b"video")
+    _save_multi_manifest(video)
+    cdir = logic.clone_dir(video)
+    cdir.mkdir(parents=True, exist_ok=True)
+    existing = cdir / "SPEAKER_01.basis.wav"
+    existing.write_bytes(b"existing wav")
+
+    wav_path, txt_path = mc.save_speaker_basis(
+        video,
+        "SPEAKER_01",
+        basis_wav=existing,
+        basis_text="speaker one",
+        target_language="Chinese",
+        source_kind="existing_manifest",
+        log=lambda _m: None,
+    )
+
+    assert Path(wav_path) == existing
+    assert existing.read_bytes() == b"existing wav"
+    assert Path(txt_path).read_text(encoding="utf-8") == "speaker one"
 
 
 def test_all_speakers_have_basis_respects_skipped_speakers(tmp_path: Path):
@@ -303,6 +414,36 @@ def test_prescan_global_diarize_extracts_concatenates_and_splits(tmp_path: Path)
     assert turns[str(video_a)] == [(0.0, 0.6, "SPEAKER_00")]
     assert turns[str(video_b)] == [(0.0, 0.4, "SPEAKER_01"), (1.0, 2.0, "SPEAKER_00")]
     assert not (logic.clone_dir(video_a) / "global_diarize_concat.wav").exists()
+
+
+def test_prescan_global_diarize_allows_auto_speaker_count(tmp_path: Path):
+    video = tmp_path / "a.mp4"
+    video.write_bytes(b"video")
+
+    def fake_extract(_video, audio_out, **_kwargs):
+        _write_wav(Path(audio_out), 16000)
+
+    diar_calls = []
+
+    def fake_diarize(audio_path, **kwargs):
+        diar_calls.append((audio_path, kwargs))
+        return [(0.0, 1.0, "SPEAKER_00")]
+
+    logs = []
+    with patch("tool_clonevoice.multi_clone.wx.extract_audio_16k", side_effect=fake_extract), patch(
+        "tool_clonevoice.multi_clone.diar.diarize", side_effect=fake_diarize
+    ), patch("tool_clonevoice.multi_clone.wx.resolve_device", return_value=("cpu", None)):
+        turns = mc.prescan_global_diarize(
+            [video],
+            models_root=str(tmp_path / "models"),
+            diarize_backend="pyannote",
+            num_speakers=None,
+            log=logs.append,
+        )
+
+    assert diar_calls[0][1]["num_speakers"] is None
+    assert turns[str(video)] == [(0.0, 1.0, "SPEAKER_00")]
+    assert any("speakers=auto" in message for message in logs)
 
 
 def test_extract_shared_references_applies_one_ref_to_all_videos(tmp_path: Path):

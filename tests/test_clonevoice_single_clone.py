@@ -44,6 +44,103 @@ def test_collect_candidates_for_videos_filters_empty_source_text():
     assert any("without source transcript text" in message for message in logs)
 
 
+def test_load_existing_candidates_for_videos_filters_and_ranks(tmp_path: Path):
+    video = tmp_path / "movie.mp4"
+    video.write_bytes(b"video")
+    cand_dir = logic.clone_dir(video) / "single_candidates"
+    cand_dir.mkdir(parents=True)
+    source_a = cand_dir / "cand_001_src.wav"
+    source_b = cand_dir / "cand_002_src.wav"
+    target_a = cand_dir / "cand_001_target.wav"
+    translated_a = cand_dir / "cand_001_translated.wav"
+    source_a.write_bytes(b"src-a")
+    source_b.write_bytes(b"src-b")
+    target_a.write_bytes(b"target-a")
+    translated_a.write_bytes(b"translated-a")
+    (cand_dir / "candidates.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": "cand_001",
+                    "source_audio": str(source_a),
+                    "target_sample_audio": str(target_a),
+                    "translated_audio": str(translated_a),
+                    "target_sample_text": "fixed sample",
+                    "src_text": "source a",
+                    "dur": 4.0,
+                    "start": 2.0,
+                    "ecapa_similarity": 0.8,
+                    "ecapa_similarity_basis": "translated_audio",
+                },
+                {
+                    "id": "cand_002",
+                    "source_audio": str(source_b),
+                    "target_sample_audio": str(cand_dir / "missing_target.wav"),
+                    "translated_audio": "",
+                    "src_text": "source b",
+                    "dur": 9.0,
+                    "start": 1.0,
+                    "ecapa_similarity": None,
+                },
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = sc.load_existing_candidates_for_videos([str(video)], total=12, log=lambda _m: None)
+
+    assert [cand["id"] for cand in loaded] == ["cand_001", "cand_002"]
+    assert loaded[0]["global_rank"] == 1
+    assert loaded[0]["translated_audio"] == str(translated_a)
+    assert loaded[1]["target_sample_audio"] == ""
+
+
+def test_collect_candidates_with_existing_collects_missing_videos(tmp_path: Path):
+    video_a = tmp_path / "a.mp4"
+    video_b = tmp_path / "b.mp4"
+    video_c = tmp_path / "c.mp4"
+    for video in (video_a, video_b, video_c):
+        video.write_bytes(b"video")
+    existing = [
+        {
+            "id": "cached_a",
+            "video": str(video_a),
+            "source_audio": str(tmp_path / "cached_a.wav"),
+            "src_text": "cached",
+            "dur": 8.0,
+            "start": 0.0,
+            "ecapa_similarity": 0.9,
+        }
+    ]
+    calls: list[str] = []
+
+    def fake_collect(video, *, top_n, log):
+        calls.append(Path(video).name)
+        return [
+            {
+                "id": f"{Path(video).stem}_cand",
+                "video": str(video),
+                "source_audio": str(tmp_path / f"{Path(video).stem}.wav"),
+                "src_text": "fresh",
+                "dur": 6.0,
+                "start": 1.0,
+            }
+        ]
+
+    with patch("tool_clonevoice.single_clone.collect_single_candidates", side_effect=fake_collect):
+        result = sc.collect_candidates_with_existing_for_videos(
+            [str(video_a), str(video_b), str(video_c)],
+            existing,
+            per_video=2,
+            total=12,
+            log=lambda _m: None,
+        )
+
+    assert calls == ["b.mp4", "c.mp4"]
+    assert [cand["id"] for cand in result] == ["cached_a", "b_cand", "c_cand"]
+
+
 def test_save_speaker1_basis_writes_manifest_basis_and_visible_copy(tmp_path: Path):
     video = tmp_path / "movie.mp4"
     video.write_bytes(b"video")
@@ -87,6 +184,28 @@ def test_save_speaker1_basis_writes_manifest_basis_and_visible_copy(tmp_path: Pa
     meta = json.loads((clone_dir / "SPEAKER1.meta.json").read_text(encoding="utf-8"))
     assert meta["candidate_id"] == "cand_001"
     assert meta["basis_wav"] == "SPEAKER1.wav"
+
+
+def test_save_speaker1_basis_accepts_existing_visible_wav(tmp_path: Path):
+    video = tmp_path / "movie.mp4"
+    video.write_bytes(b"video")
+    visible_wav = tmp_path / "movie.SPEAKER1.wav"
+    visible_wav.write_bytes(b"existing wav")
+
+    wav_path, txt_path = sc.save_speaker1_basis(
+        [str(video)],
+        basis_wav=visible_wav,
+        basis_text="fixed target sentence",
+        target_language="Chinese",
+        visible_target=video,
+        batch=False,
+        source_kind="existing_manifest",
+        log=lambda _m: None,
+    )
+
+    assert Path(wav_path) == visible_wav
+    assert Path(txt_path).read_text(encoding="utf-8") == "fixed target sentence"
+    assert (logic.clone_dir(video) / "SPEAKER1.wav").read_bytes() == b"existing wav"
 
 
 def test_translate_and_synthesize_uses_translate_then_synthesize_not_run_full(tmp_path: Path):
