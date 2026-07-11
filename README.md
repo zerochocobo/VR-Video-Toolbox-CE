@@ -58,7 +58,7 @@ The word "fisheye" appears in three places, and they are for different jobs:
 
 If you are only removing mosaics, start with One-Click Mode. Enable the fisheye checkbox only when the mosaic shape calls for it; otherwise leave it off.
 
-The final result depends heavily on the AI mosaic removal engine (`lada-cli` or `jasna-cli`) detection and restoration quality. Complex distortion, heavy compression, or low-quality source video may produce unstable results.
+The final result depends heavily on the AI mosaic removal engine (`lada-cli` or `jasna`) detection and restoration quality. Complex distortion, heavy compression, or low-quality source video may produce unstable results.
 
 > The program includes a built-in engine selector. Switch between **Lada** and **Jasna** in the main window under "AI Engine". Your choice is saved automatically.
 > - Lada: https://codeberg.org/ladaapp/lada
@@ -178,7 +178,7 @@ Required executables and packages:
 
 - `ffmpeg.exe`
 - `ffprobe.exe`
-- `lada-cli.exe` or `jasna-cli.exe` (choose one)
+- `lada-cli.exe` or `jasna.exe` (choose one)
 - Base Python packages: `Pillow`, `pyinstaller`, `ffmpy3`, `faster-whisper`, `numpy>=1.26,<2.1`, `auditok`, `onnxruntime-gpu`, `huggingface-hub`, `keyring`, `requests`, `transformers`, `accelerate`, `librosa`, `soundfile`, `av`, `fastapi`, `uvicorn`
 - CUDA/video Python packages: `pynvvideocodec>=2.1.0`, `cupy-cuda12x>=14.0`, `nvidia-cuda-nvrtc-cu12==12.8.93`, `nvidia-cuda-runtime-cu12==12.8.90`, `nvidia-cuda-cccl-cu12>=12.9.27`
 - Native AI/GPU packages: `torch==2.8.0`, `torchvision==0.23.0`, and `torchaudio==2.8.0` from the PyTorch `cu128` wheel index, plus `ultralytics==8.4.4`, `mmengine==0.10.7`, `omegaconf`, `einops`, `safetensors`, and `opencv-python`

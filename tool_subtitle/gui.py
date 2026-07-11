@@ -159,15 +159,25 @@ class SubtitleToolsApp:
         denoise_cb = ttk.Combobox(denoise_frame, textvariable=self.denoise_var, values=list(self.denoise_mapping.keys()), state="readonly", width=30)
         denoise_cb.pack(side='left')
 
-        # Segmentation Model Selection
-        seg_model_frame = ttk.Frame(opt_frame)
-        seg_model_frame.pack(fill='x', pady=5)
-        ttk.Label(seg_model_frame, text=get_text('lbl_seg_model')).pack(side='left', padx=(0, 10))
-        
+        # Segmentation model is fixed to WhisperSeg (the only option), so no
+        # visible selector — the variable stays for logic and model download.
         self.seg_model_var = tk.StringVar(value="whisperSeg")
-        ttk.Radiobutton(seg_model_frame, text=get_text('opt_whisperseg'), variable=self.seg_model_var, value="whisperSeg", command=self.check_model_status).pack(side='left', padx=5)
 
-        self.btn_download_seg_model = ttk.Button(seg_model_frame, text=get_text('btn_download'), command=self.download_seg_model)
+        # VAD sensitivity (how quiet a sound still counts as speech)
+        vad_frame = ttk.Frame(opt_frame)
+        vad_frame.pack(fill='x', pady=5)
+        ttk.Label(vad_frame, text=get_text('lbl_vad_sensitivity')).pack(side='left', padx=(0, 10))
+        self.vad_sensitivity_mapping = {
+            get_text('opt_vad_standard'): "standard",
+            get_text('opt_vad_high'): "high",
+            get_text('opt_vad_max'): "max",
+        }
+        self.vad_sensitivity_var = tk.StringVar(value=get_text('opt_vad_high'))
+        ttk.Combobox(vad_frame, textvariable=self.vad_sensitivity_var,
+                     values=list(self.vad_sensitivity_mapping.keys()),
+                     state="readonly", width=16).pack(side='left')
+
+        self.btn_download_seg_model = ttk.Button(vad_frame, text=get_text('btn_download_seg_model'), command=self.download_seg_model)
         
         # Model Selection
         model_frame = ttk.Frame(opt_frame)
@@ -182,7 +192,13 @@ class SubtitleToolsApp:
         
         self.btn_download_model = ttk.Button(model_frame, text=get_text('btn_download'), command=self.download_current_model)
         self.btn_download_model.pack(side='left', padx=10)
-        
+
+        # Debug sidecar files (.raw.srt / .vad.srt / .removed.srt)
+        debug_frame = ttk.Frame(opt_frame)
+        debug_frame.pack(fill='x', pady=5)
+        self.gen_debug_files = tk.BooleanVar(value=False)
+        ttk.Checkbutton(debug_frame, text=get_text('chk_gen_debug_files'), variable=self.gen_debug_files).pack(side='left')
+
         # Initial model check
         self.root.after(100, self.check_model_status)
 
@@ -289,7 +305,9 @@ class SubtitleToolsApp:
                     use_gpu=self.use_gpu_var.get(),
                     log_callback=lambda msg: self.log(self.gen_log, msg),
                     stop_event=self.stop_event_gen,
-                    gen_holder=gen_holder
+                    gen_holder=gen_holder,
+                    debug_files=self.gen_debug_files.get(),
+                    vad_sensitivity=self.vad_sensitivity_mapping.get(self.vad_sensitivity_var.get(), "standard")
                 )
                 if not self.stop_event_gen.is_set():
                     self.log(self.gen_log, get_text('msg_done'))
@@ -531,12 +549,14 @@ class SubtitleToolsApp:
         self.trans_keep_orig = tk.BooleanVar(value=self.trans_config.get('keep_original', True))
         self.trans_adult_content = tk.BooleanVar(value=self.trans_config.get('adult_content', True))
         self.trans_dubbing_optimized = tk.BooleanVar(value=self.trans_config.get('dubbing_optimized', False))
-        
+        self.trans_source_correction = tk.BooleanVar(value=self.trans_config.get('source_correction', True))
+
         ttk.Checkbutton(opt_frame, text=get_text('chk_search_subdirs_trans'), variable=self.trans_search_subdirs).pack(anchor='w', pady=1)
         ttk.Checkbutton(opt_frame, text=get_text('chk_skip_if_exists_trans'), variable=self.trans_skip_if_exists).pack(anchor='w', pady=1)
         ttk.Checkbutton(opt_frame, text=get_text('chk_keep_orig'), variable=self.trans_keep_orig, command=self.on_option_toggled).pack(anchor='w', pady=1)
         ttk.Checkbutton(opt_frame, text=get_text('chk_adult_content'), variable=self.trans_adult_content, command=self.on_option_toggled).pack(anchor='w', pady=1)
         ttk.Checkbutton(opt_frame, text=get_text('chk_dubbing_optimized'), variable=self.trans_dubbing_optimized, command=self.on_option_toggled).pack(anchor='w', pady=1)
+        ttk.Checkbutton(opt_frame, text=get_text('chk_source_correction'), variable=self.trans_source_correction, command=self.on_option_toggled).pack(anchor='w', pady=1)
 
         # Action Buttons
         btn_frame = ttk.Frame(frame)
@@ -601,12 +621,15 @@ class SubtitleToolsApp:
         self.trans_config['keep_original'] = self.trans_keep_orig.get()
         self.trans_config['adult_content'] = self.trans_adult_content.get()
         self.trans_config['dubbing_optimized'] = self.trans_dubbing_optimized.get()
+        self.trans_config['source_correction'] = self.trans_source_correction.get()
         if hasattr(self, 'listen_keep_orig'):
             self.listen_keep_orig.set(self.trans_keep_orig.get())
         if hasattr(self, 'listen_adult_content'):
             self.listen_adult_content.set(self.trans_adult_content.get())
         if hasattr(self, 'listen_dubbing_optimized'):
             self.listen_dubbing_optimized.set(self.trans_dubbing_optimized.get())
+        if hasattr(self, 'listen_source_correction'):
+            self.listen_source_correction.set(self.trans_source_correction.get())
         logic.save_trans_config(self.trans_config)
 
     def save_trans_config(self):
@@ -617,6 +640,7 @@ class SubtitleToolsApp:
         self.trans_config['keep_original'] = self.trans_keep_orig.get()
         self.trans_config['adult_content'] = self.trans_adult_content.get()
         self.trans_config['dubbing_optimized'] = self.trans_dubbing_optimized.get()
+        self.trans_config['source_correction'] = self.trans_source_correction.get()
         
         lang = self.lang_var.get()
         if lang == get_text('opt_lang_other'):
@@ -692,6 +716,7 @@ class SubtitleToolsApp:
         self.trans_config['keep_original'] = self.trans_keep_orig.get()
         self.trans_config['adult_content'] = self.trans_adult_content.get()
         self.trans_config['dubbing_optimized'] = self.trans_dubbing_optimized.get()
+        self.trans_config['source_correction'] = self.trans_source_correction.get()
 
         def task():
             start_time = time.time()
@@ -799,6 +824,18 @@ class SubtitleToolsApp:
             width=24,
         ).pack(side='left')
 
+        listen_vad_frame = ttk.Frame(gen_frame)
+        listen_vad_frame.pack(fill='x', pady=1)
+        ttk.Label(listen_vad_frame, text=get_text('lbl_vad_sensitivity'), width=18).pack(side='left', padx=(0, 6))
+        self.listen_vad_sensitivity_var = tk.StringVar(value=get_text('opt_vad_high'))
+        ttk.Combobox(
+            listen_vad_frame,
+            textvariable=self.listen_vad_sensitivity_var,
+            values=list(self.vad_sensitivity_mapping.keys()),
+            state="readonly",
+            width=24,
+        ).pack(side='left')
+
         # Translation Options
         trans_frame = ttk.LabelFrame(options_frame, text=get_text('grp_trans_opt'), padding=8)
         trans_frame.grid(row=0, column=1, sticky='nsew', padx=(4, 0))
@@ -834,10 +871,12 @@ class SubtitleToolsApp:
         self.listen_keep_orig = tk.BooleanVar(value=self.trans_config.get('keep_original', True))
         self.listen_adult_content = tk.BooleanVar(value=self.trans_config.get('adult_content', True))
         self.listen_dubbing_optimized = tk.BooleanVar(value=self.trans_config.get('dubbing_optimized', False))
+        self.listen_source_correction = tk.BooleanVar(value=self.trans_config.get('source_correction', True))
 
         ttk.Checkbutton(trans_frame, text=get_text('chk_keep_orig'), variable=self.listen_keep_orig, command=self.on_listen_option_toggled).pack(anchor='w', pady=1)
         ttk.Checkbutton(trans_frame, text=get_text('chk_adult_content'), variable=self.listen_adult_content, command=self.on_listen_option_toggled).pack(anchor='w', pady=1)
         ttk.Checkbutton(trans_frame, text=get_text('chk_dubbing_optimized'), variable=self.listen_dubbing_optimized, command=self.on_listen_option_toggled).pack(anchor='w', pady=1)
+        ttk.Checkbutton(trans_frame, text=get_text('chk_source_correction'), variable=self.listen_source_correction, command=self.on_listen_option_toggled).pack(anchor='w', pady=1)
 
         # Action Buttons
         btn_frame = ttk.Frame(frame)
@@ -867,12 +906,15 @@ class SubtitleToolsApp:
         self.trans_config['keep_original'] = self.listen_keep_orig.get()
         self.trans_config['adult_content'] = self.listen_adult_content.get()
         self.trans_config['dubbing_optimized'] = self.listen_dubbing_optimized.get()
+        self.trans_config['source_correction'] = self.listen_source_correction.get()
         if hasattr(self, 'trans_keep_orig'):
             self.trans_keep_orig.set(self.listen_keep_orig.get())
         if hasattr(self, 'trans_adult_content'):
             self.trans_adult_content.set(self.listen_adult_content.get())
         if hasattr(self, 'trans_dubbing_optimized'):
             self.trans_dubbing_optimized.set(self.listen_dubbing_optimized.get())
+        if hasattr(self, 'trans_source_correction'):
+            self.trans_source_correction.set(self.listen_source_correction.get())
         logic.save_trans_config(self.trans_config)
 
     def _sync_listen_trans_config(self):
@@ -884,6 +926,7 @@ class SubtitleToolsApp:
         self.trans_config['keep_original'] = self.listen_keep_orig.get()
         self.trans_config['adult_content'] = self.listen_adult_content.get()
         self.trans_config['dubbing_optimized'] = self.listen_dubbing_optimized.get()
+        self.trans_config['source_correction'] = self.listen_source_correction.get()
 
     def run_listen(self):
         base_dir = self.listen_dir_path.get()
@@ -920,6 +963,7 @@ class SubtitleToolsApp:
                     log_callback=lambda msg: self.log(self.listen_log, msg),
                     stop_event=self.stop_event_listen,
                     gen_holder=gen_holder,
+                    vad_sensitivity=self.vad_sensitivity_mapping.get(self.listen_vad_sensitivity_var.get(), "high"),
                 )
                 if not self.stop_event_listen.is_set():
                     self.log(self.listen_log, get_text('msg_done'))

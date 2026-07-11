@@ -163,7 +163,8 @@ def run_transcribe_diarize(
     ref_strategy: str = "hybrid",
     models_root: str,
     keep_intermediate: bool = True,
-    denoise: str = "none",
+    denoise: str = "mild",
+    vad_sensitivity: str = "high",
     precomputed_turns: Optional[list] = None,
     log: LogCallback = print,
     stop_event: Optional[Event] = None,
@@ -198,6 +199,9 @@ def run_transcribe_diarize(
     if asr_device == "cpu" and torch_device == "cuda":
         log("[device] CTranslate2 cuDNN 8 DLLs not found; transcription runs on CPU to avoid a hard crash.")
 
+    from tool_subtitle import logic as subl
+    subl.warn_noisy_high_sensitivity(denoise, vad_sensitivity, log)
+
     with wx.torch_load_compat():
         _check_stop()
         # High-recall WhisperSeg-VAD + chunked decode (tool_subtitle engine),
@@ -205,7 +209,8 @@ def run_transcribe_diarize(
         # single-pass whisperx call that dropped quiet speech.
         result = seg_engine.transcribe(
             str(audio_wav), model_key=model_key, models_root=models_root,
-            language=language, log=log, model_holder=model_holder,
+            language=language, vad_sensitivity=vad_sensitivity,
+            log=log, model_holder=model_holder,
         )
         detected_lang = result.get("language") or (language or "")
         raw_segments = result.get("segments", [])
@@ -319,6 +324,7 @@ def run_translate(
     api_key: Optional[str] = None,
     temperature: float = 0.5,
     max_retries: int = 3,
+    source_correction: Optional[bool] = None,
     log: LogCallback = print,
     stop_event: Optional[Event] = None,
 ) -> dict:
@@ -327,6 +333,11 @@ def run_translate(
     Reuses tool_subtitle's LLM client, chunking, and the dubbing-optimized prompt
     (config/translate_prompt_dubbing.txt). The API endpoint/model come from the
     shared translation config; the key from the argument or the saved keyring.
+
+    ``source_correction`` (default: the shared config's flag) runs an LLM
+    proofread pass over the ASR source text first, fixing recognition errors in
+    context; corrected text is written back to the manifest's ``src_text`` so
+    the proofread panel and source.srt show the fixed lines.
     """
     from tool_subtitle import logic as sl
 
@@ -364,15 +375,53 @@ def run_translate(
     if not entries:
         raise ValueError("No source text to translate.")
 
+    tokens_per_chunk = int(cfg.get("tokens_per_chunk", 500000))
+    adult_content = bool(cfg.get("adult_content", True))
+
+    if source_correction is None:
+        source_correction = bool(cfg.get("source_correction", True))
+    if source_correction:
+        lang_names = {"ja": "Japanese", "zh": "Chinese", "en": "English"}
+        src_lang = manifest.get("language") or "ja"
+        log(f"[translate] AI source proofread ({src_lang}) ...")
+        changed, deleted = sl.correct_entries(
+            client,
+            entries,
+            lang_names.get(src_lang, src_lang),
+            tokens_per_chunk,
+            adult_content,
+            max_retries,
+            log_callback=log,
+            stop_event=stop_event,
+        )
+        if changed or deleted:
+            # Write the corrected source back so the proofread panel and
+            # source.srt show what the dub is actually translated from.
+            # Interjection-only lines (moans/laughs) marked deleted get an
+            # empty src/tgt so source.srt, translated.srt and the synthesized
+            # dub all skip them.
+            for s in segments:
+                sid = int(s["id"])
+                if sid in deleted:
+                    s["src_text"] = ""
+                    s["tgt_text"] = ""
+                elif sid in entries:
+                    new_src = entries[sid]["text"].strip()
+                    if new_src:
+                        s["src_text"] = new_src
+            write_srt(clone_dir(video) / "source.srt", segments, "src_text", speaker_prefix=True)
+
     log(f"[translate] {len(entries)} segments -> {target_language} ({cfg.get('model_name')})")
     sl.translate_entries(
         client,
         entries,
         target_language,
-        int(cfg.get("tokens_per_chunk", 500000)),
+        tokens_per_chunk,
         keep_original=False,
-        adult_content=bool(cfg.get("adult_content", True)),
-        dubbing_optimized=bool(cfg.get("dubbing_optimized", True)),
+        adult_content=adult_content,
+        # The clone pipeline always dubs, so always use the dubbing-optimized
+        # prompt — never inherit tool_subtitle's checkbox from the shared config.
+        dubbing_optimized=True,
         max_retries=max_retries,
         log_callback=log,
         stop_event=stop_event,
@@ -381,9 +430,28 @@ def run_translate(
     translated = 0
     for s in segments:
         sid = int(s["id"])
-        if sid in entries and entries[sid]["text"].strip():
+        # Only take lines the LLM actually translated: for dropped/missing
+        # translations `entries[sid]["text"]` still holds the SOURCE text,
+        # which must never end up in tgt_text (the dub would speak Japanese).
+        if sid in entries and entries[sid].get("translated") and entries[sid]["text"].strip():
             s["tgt_text"] = entries[sid]["text"].strip()
             translated += 1
+
+    untranslated = sorted(
+        int(sid) for sid, info in entries.items() if not info.get("translated")
+    )
+    if untranslated:
+        # Lines the LLM could not translate (garbled ASR fragments dropped by
+        # the kana-leak backstop, or lines missing after all retries): record
+        # them as "cleared" so the proofread panel and the pre-export check do
+        # not treat the video as untranslated and silently re-translate it.
+        pf = manifest.get("proofread") if isinstance(manifest.get("proofread"), dict) else {}
+        pf = dict(pf)
+        existing = {int(x) for x in (pf.get("cleared_ids") or []) if str(x).lstrip("-").isdigit()}
+        pf["cleared_ids"] = sorted(existing | set(untranslated))
+        manifest["proofread"] = pf
+        log(f"[translate] {len(untranslated)} line(s) left untranslated (garbled) and marked cleared: {untranslated[:10]}")
+
     manifest["target_language"] = target_language
     save_manifest(video, manifest)
     write_srt(clone_dir(video) / "translated.srt", segments, "tgt_text", speaker_prefix=True)
@@ -463,12 +531,14 @@ def run_full(
     models_root: str,
     keep_intermediate: bool = True,
     skip_existing: bool = True,
-    denoise: str = "none",
+    denoise: str = "mild",
     num_step: int = 32,
     guidance_scale: float = 2.0,
     loudness_mode: str = "envelope",
     envelope_alpha: float = 0.6,
     tempo_fit: str = "moderate",
+    source_correction: Optional[bool] = None,
+    vad_sensitivity: str = "high",
     log: LogCallback = print,
     stop_event: Optional[Event] = None,
     model_holder: Optional[list] = None,
@@ -486,8 +556,8 @@ def run_full(
     run_transcribe_diarize(
         video, model_key=model_key, language=language, diarize_backend=diarize_backend,
         num_speakers=num_speakers, target_language=target_language, models_root=models_root,
-        keep_intermediate=keep_intermediate, denoise=denoise, log=log, stop_event=stop_event,
-        model_holder=model_holder,
+        keep_intermediate=keep_intermediate, denoise=denoise, vad_sensitivity=vad_sensitivity,
+        log=log, stop_event=stop_event, model_holder=model_holder,
     )
     # ASR/diarization models can occupy several GB. Release them before
     # OmniVoice loads, otherwise batch runs may carry both stages in VRAM.
@@ -497,7 +567,10 @@ def run_full(
     run_extract_references(video, models_root=models_root, log=log, stop_event=stop_event)
 
     log("=== [3/4] AI translation ===")
-    run_translate(video, target_language=target_language, log=log, stop_event=stop_event)
+    run_translate(
+        video, target_language=target_language, source_correction=source_correction,
+        log=log, stop_event=stop_event,
+    )
 
     log("=== [4/4] Voice-clone synthesis ===")
     out = run_synthesize(

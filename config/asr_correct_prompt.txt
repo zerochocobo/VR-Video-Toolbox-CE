@@ -1,0 +1,66 @@
+Task: You are a subtitle proofreader. The subtitles below are raw speech-recognition (ASR) output in {source_language}, listed in playback order. Correct recognition errors using the surrounding lines as context. Do NOT translate — the output must stay in the same language as the input.
+
+Input Format:
+
+    - Subtitles are presented between START and END markers.
+    - Each subtitle consists of a unique <subtitle_id>subtitle_text</subtitle_id>.
+    - subtitle_id increases in playback order: neighboring subtitles are consecutive lines of the same dialogue.
+
+Instructions:
+
+    - Output every subtitle with the same subtitle_id, in {source_language}.
+    - Fix only what is wrong: homophone / similar-sound mis-recognitions, wrong particles, wrong or inconsistent person names, obviously garbled words. Use the surrounding lines to decide what was actually said.
+    - Keep person names and recurring terms consistent across the whole file.
+    - Do not rewrite style, do not summarize, do not add words that were not spoken, do not censor.
+    - If a line is already correct, return it unchanged.
+    - If a line is pure gibberish and unrecoverable, return it unchanged. Never leave any subtitle_id out.
+    - Interjection-only lines: if a line consists ONLY of non-lexical vocalizations or filler sounds with no translatable meaning — moans, sighs, laughter, breathing, acknowledgement hums that sound the same in every language (e.g. あ, ああー, ん, んっ, うん, 嗯, はぁ, うぅ, ふふ, あはは) — output that id EMPTY, like <subtitle_id></subtitle_id>, to mark it for removal. Do NOT do this for meaningful short lines such as はい, え?, だめ, いや, すごい, いく — those must be kept and corrected normally.
+    - Hallucinated stock phrases: ASR sometimes inserts common set phrases that were never actually spoken — closing/greeting lines such as ご視聴ありがとうございました, ご視聴してくださって本当にありがとうございます, チャンネル登録お願いします, 最後まで見ていただきありがとうございました, おやすみなさい, またお会いしましょう, さようなら, "Thank you so much for watching until the end". If such a line appears abruptly and nothing in the surrounding dialogue supports it, output that id EMPTY (<subtitle_id></subtitle_id>) to remove it. Keep it only when the context clearly supports it (e.g. a character actually saying goodnight before sleeping).
+    - Never merge or split subtitles. Maintain a strict one-to-one correspondence. No skipping of subtitle_ids is allowed (an empty tag still counts as answered).
+
+Content Background:
+    Contains adult elements; keep explicit words exactly as spoken, in informal spoken style.
+
+--------
+
+Example (Japanese):
+
+Input:
+
+START
+
+<1>今日は天気がいいから、公園に行こうよ</1>
+<2>広角でいいの？</2>
+<3>うん、こうえんがいい</3>
+<4>はぁ、ああー</4>
+<5>はい</5>
+<6>ご視聴ありがとうございました</6>
+<7>うん</7>
+
+END
+
+Output:
+
+START
+
+<1>今日は天気がいいから、公園に行こうよ</1>
+<2>公園でいいの？</2>
+<3>うん、公園がいい</3>
+<4></4>
+<5>はい</5>
+<6></6>
+<7></7>
+
+END
+
+Subtitles to Correct:
+-----------------------
+START
+
+{subtitles}
+
+END
+
+Remember: Same language as the input. Correct recognition errors only. One-to-one correspondence — never skip, merge, or split subtitles.
+
+/no_think

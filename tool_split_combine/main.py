@@ -154,6 +154,14 @@ class VRSplitCombineApp:
         ttk.Entry(frame_in2, textvariable=self.combine_in2_var).pack(side='left', fill='x', expand=True, padx=5)
         ttk.Button(frame_in2, text=get_text('btn_browse'), command=lambda: self.browse_file(self.combine_in2_var)).pack(side='left')
 
+        # Optional original source used only as the output bitrate reference.
+        frame_ref = ttk.Frame(self.tab_combine)
+        frame_ref.pack(fill='x', pady=5)
+        ttk.Label(frame_ref, text=get_text('lbl_bitrate_reference')).pack(side='left')
+        self.combine_bitrate_ref_var = tk.StringVar()
+        ttk.Entry(frame_ref, textvariable=self.combine_bitrate_ref_var).pack(side='left', fill='x', expand=True, padx=5)
+        ttk.Button(frame_ref, text=get_text('btn_browse'), command=lambda: self.browse_file(self.combine_bitrate_ref_var)).pack(side='left')
+
         # Output File
         frame_out = ttk.Frame(self.tab_combine)
         frame_out.pack(fill='x', pady=5)
@@ -268,12 +276,16 @@ class VRSplitCombineApp:
         in2 = self.combine_in2_var.get()
         out = self.combine_out_var.get()
         mode = self.combine_mode_var.get()
+        bitrate_reference = self.combine_bitrate_ref_var.get().strip()
 
         if not in1 or not os.path.exists(in1):
             messagebox.showerror(get_text('title_error'), get_text('msg_error_input_1'))
             return
         if not in2 or not os.path.exists(in2):
             messagebox.showerror(get_text('title_error'), get_text('msg_error_input_2'))
+            return
+        if bitrate_reference and not os.path.exists(bitrate_reference):
+            messagebox.showerror(get_text('title_error'), get_text('msg_error_bitrate_reference'))
             return
         if not out:
              # Auto-generate output filenames
@@ -309,6 +321,7 @@ class VRSplitCombineApp:
                     mode,
                     out,
                     from_fisheye=self.combine_fisheye_var.get(),
+                    bitrate_reference_path=bitrate_reference or None,
                     log_callback=self.log,
                     process_callback=_on_proc
                 )

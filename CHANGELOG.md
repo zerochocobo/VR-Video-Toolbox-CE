@@ -2,6 +2,26 @@
 
 ## English
 
+### 2026-07-11
+
+- New: Added an optional source-video bitrate reference to Split/Combine merging. GPU and FFmpeg NVENC paths use the reference bitrate as the target with a 2x peak limit; without a usable reference, the existing CQ 18 behavior remains unchanged.
+- Change: Updated the external Jasna mosaic-removal executable from `jasna-cli.exe` to `jasna.exe`, including command construction, tests, README files, and release-package instructions.
+
+### 2026-07-10
+
+- Change: Made high VAD sensitivity the default for subtitle generation, listening translation, and all Clone Translation Dubbing workflows; added sensitivity controls where needed and hid the obsolete single-choice segmentation-model row.
+- New: AI source-text correction can delete lines containing only meaningless vocalizations through an empty-tag protocol, protected by a conservative local safety check; Clone Translation Dubbing propagates approved deletions to manifests, subtitles, and synthesis.
+- Fix: Added word-timestamp reanchoring so segment boundaries use the first and last valid word timestamps when reliable, with fallback and drift logging.
+
+### 2026-07-07
+
+- Fix: Clone synthesis now retries OmniVoice empty-output postprocessing failures and falls back to a short silence for non-fatal per-line failures, while still surfacing CUDA/OOM and related fatal errors.
+- New: Single-speaker and multi-speaker clone workflows can restore saved basis/manifest state after interruption and safely reuse basis audio already at the destination path.
+- New: Candidate caches are automatically reloaded and reused; shared-folder workflows generate only missing candidates, samples, previews, and similarity scores across partially completed videos.
+- New: Added a shared translation-proofreading workflow for single-speaker and multi-speaker clone modes, including optional same-name SRT references, manifest/SRT write-back, and preservation of the original AI translation.
+- Change: Multi-speaker and shared-folder clone workflows now support automatic speaker-count estimation or an explicit range of 1-7 speakers.
+- Change: Shortened built-in OmniVoice target-language reference sentences and standardized their target duration to 8 seconds.
+
 ### 2026-07-06
 
 - Documentation: Updated the public README files and release-package user guides to explain the three separate fisheye-related entry points: OneClick's internal fisheye working view, Split/Combine fisheye input/output, and explicit Hequirect/Fisheye projection conversion.
@@ -190,6 +210,26 @@
 - Major optimization: GPU-accelerated VR split/merge, fisheye/equirectangular conversion, VR-to-flat projection, and OneClick geometry stages.
 
 ## 中文
+
+### 2026-07-11
+
+- 新功能：分割/合并工具的合并页新增可选“原始文件（码率参照）”。GPU 与 FFmpeg NVENC 路径会以参照视频码率为目标、2 倍码率为峰值；未选择有效参照时保持原有 CQ 18 行为。
+- 变更：Jasna 外部去马赛克程序由 `jasna-cli.exe` 调整为 `jasna.exe`，并同步更新命令构建、测试、中英日 README 和发布包说明。
+
+### 2026-07-10
+
+- 变更：字幕生成、一键听译及全部克隆翻译配音流程默认使用“高”人声检测敏感度；在需要的页面补充敏感度选项，并隐藏仅有单一选项的旧语音分割模型行。
+- 新功能：AI 原文校对支持通过空标签删除纯无意义语气词行，并使用保守的本地安全检查防止误删；克隆翻译配音会把确认删除同步到 manifest、字幕和语音合成。
+- 修复：新增词级时间戳重锚定，在时间可靠时使用首词和末词修正段落边界，并保留回退及漂移日志。
+
+### 2026-07-07
+
+- 修复：OmniVoice 单句生成遇到空音频后处理错误时自动重试；非致命单句失败以短静音占位继续任务，同时仍会抛出 CUDA/OOM 等致命错误。
+- 新功能：单人和多人克隆可在中断后恢复已保存的 basis/manifest 状态，并安全复用源、目标路径相同的基准音频。
+- 新功能：自动载入并复用候选缓存；同目录共用流程面对部分完成的视频时，只补齐缺失候选、样句、翻译试听和相似度。
+- 新功能：单人和多人克隆新增共享的翻译校对流程，支持同名 SRT 参考、回写 manifest/字幕，以及保留首版 AI 翻译备份。
+- 变更：多人及同目录共用克隆支持自动估算说话人数，也可明确选择 1-7 人。
+- 变更：缩短 OmniVoice 内置目标语言基准样句，并统一以 8 秒为目标时长。
 
 ### 2026-07-06
 

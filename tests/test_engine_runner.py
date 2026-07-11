@@ -114,6 +114,7 @@ class EngineRunnerTests(unittest.TestCase):
             logic.process_lada("in.mp4", "out.mp4", log_callback=logs.append)
 
         cmd = run_process.call_args.args[0]
+        self.assertEqual(cmd[0], "jasna")
         self.assertIn("--encoder-settings", cmd)
         self.assertEqual(cmd[cmd.index("--encoder-settings") + 1], "cq=18")
         self.assertNotIn("-preset", cmd)

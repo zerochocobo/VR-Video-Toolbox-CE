@@ -83,6 +83,7 @@ class CloneTranscriber(subl.SubtitleGenerator):
 
         raw: list[dict] = []
         detected_lang: Optional[str] = None
+        reanchored_far = 0
         for index, chunk in enumerate(chunks, start=1):
             offset = chunk["offset_sec"]
             self.log_callback(
@@ -113,15 +114,30 @@ class CloneTranscriber(subl.SubtitleGenerator):
                     for w in (segment.words or [])
                     if w.start is not None and w.end is not None
                 ]
+                seg_start = float(segment.start) + offset
+                seg_end = float(segment.end) + offset
+                # Re-anchor to word-level (DTW) times: on difficult audio the
+                # decoder stamps a line at the chunk start seconds before it was
+                # spoken, while word times stay on the audio. The dub's
+                # fit-to-duration depends on these boundaries being acoustic.
+                if words and words[-1]["end"] - words[0]["start"] >= 0.05:
+                    if abs(words[0]["start"] - seg_start) > 0.5:
+                        reanchored_far += 1
+                    seg_start = words[0]["start"]
+                    seg_end = words[-1]["end"]
                 raw.append({
-                    "start": float(segment.start) + offset,
-                    "end": float(segment.end) + offset,
+                    "start": seg_start,
+                    "end": seg_end,
                     "text": text,
                     "words": words,
                     "avg_logprob": getattr(segment, "avg_logprob", None),
                     "no_speech_prob": getattr(segment, "no_speech_prob", None),
                 })
 
+        if reanchored_far:
+            self.log_callback(
+                f"[seg] word-anchored timestamps moved {reanchored_far} segment(s) by more than 0.5s"
+            )
         segments = self._filter_keep_timing(raw)
         return {"segments": segments, "language": detected_lang or (self.language or "")}
 
@@ -140,7 +156,7 @@ class CloneTranscriber(subl.SubtitleGenerator):
         total_end = max((s["end"] for s in ordered), default=0.0)
 
         kept: list[dict] = []
-        removed_noise = removed_hall = removed_dup = 0
+        removed_noise = removed_hall = removed_dup = compressed = 0
         window = subl.DUPLICATE_LOOKBACK_SECONDS
 
         for item in ordered:
@@ -151,8 +167,19 @@ class CloneTranscriber(subl.SubtitleGenerator):
                 removed_noise += 1
                 continue
             if Gen.is_repetition_noise(text):
-                removed_noise += 1
-                continue
+                short = Gen.compress_repetition_text(text)
+                if short != text and not Gen.is_repetition_noise(short):
+                    # Real repeated dialogue (climax lines): keep a compressed
+                    # rendition. The word list no longer matches the text, so
+                    # drop it — timing keeps the segment's acoustic start/end.
+                    item["text"] = short
+                    item["words"] = []
+                    text = short
+                    norm = Gen.normalize_for_duplicate(text)
+                    compressed += 1
+                else:
+                    removed_noise += 1
+                    continue
             if Gen.is_known_hallucination(
                 text, item["start"], item["end"], total_end,
                 avg_logprob=item.get("avg_logprob"),
@@ -163,11 +190,17 @@ class CloneTranscriber(subl.SubtitleGenerator):
 
             # Near-duplicate against recent kept lines (overlapping chunks repeat
             # the boundary speech). Keep whichever is longer / more confident.
+            # Only pairs whose time ranges actually overlap can be duplicated
+            # decodes of the same audio; similar text at disjoint times is real
+            # repeated dialogue and must be kept.
             dup_index = None
             for j in range(len(kept) - 1, -1, -1):
                 prev = kept[j]
                 if item["start"] - prev["start"] > window:
                     break
+                time_overlap = min(item["end"], prev["end"]) - max(item["start"], prev["start"])
+                if time_overlap <= 0.15:
+                    continue
                 prev_norm = Gen.normalize_for_duplicate(prev["text"])
                 if Gen.is_near_duplicate(norm, prev_norm):
                     dup_index = j
@@ -191,7 +224,8 @@ class CloneTranscriber(subl.SubtitleGenerator):
 
         self.log_callback(
             f"[seg] kept {len(kept)} lines "
-            f"(removed {removed_dup} dup, {removed_noise} noise, {removed_hall} hallucination)"
+            f"(removed {removed_dup} dup, {removed_noise} noise, {removed_hall} hallucination; "
+            f"compressed {compressed} repetition lines)"
         )
         return kept
 
@@ -202,6 +236,7 @@ def transcribe(
     model_key: str,
     models_root: str,
     language: Optional[str],
+    vad_sensitivity: str = "high",
     log: LogCallback = print,
     model_holder: Optional[list] = None,
 ) -> dict:
@@ -219,6 +254,7 @@ def transcribe(
     gen = CloneTranscriber(
         model_path, model_key, log, language, use_gpu=(asr_device == "cuda")
     )
+    gen.set_vad_sensitivity(vad_sensitivity)
     if model_holder is not None:
         model_holder.append(gen.model)
     return gen.transcribe_words(audio16k_path)

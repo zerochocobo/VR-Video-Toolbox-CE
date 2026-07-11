@@ -7,5 +7,6 @@
     "target_language": "Chinese",
     "keep_original": true,
     "adult_content": true,
-    "dubbing_optimized": true
+    "dubbing_optimized": true,
+    "source_correction": true
 }

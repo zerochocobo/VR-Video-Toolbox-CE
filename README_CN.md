@@ -65,7 +65,7 @@
 
 如果只是去马赛克，新用户优先用一键模式；只有马赛克形态需要时才勾选鱼眼开关，否则保持关闭。
 
-处理效果主要受 AI 去马赛克引擎（`lada-cli` 或 `jasna-cli`）的识别和修复能力影响。对于复杂变形、遮挡严重或画质很差的视频，结果可能不稳定。
+处理效果主要受 AI 去马赛克引擎（`lada-cli` 或 `jasna`）的识别和修复能力影响。对于复杂变形、遮挡严重或画质很差的视频，结果可能不稳定。
 
 > 程序内置引擎选择器，可在主界面的「AI去马赛克引擎」中切换 **Lada** 和 **Jasna**，选择会自动记忆。
 > - Lada：https://codeberg.org/ladaapp/lada
@@ -196,7 +196,7 @@ python main.py
 
 - `ffmpeg.exe`
 - `ffprobe.exe`
-- `lada-cli.exe` 或 `jasna-cli.exe`（二选一）
+- `lada-cli.exe` 或 `jasna.exe`（二选一）
 - 基础 Python 包：`Pillow`、`pyinstaller`、`ffmpy3`、`faster-whisper`、`numpy>=1.26,<2.1`、`auditok`、`onnxruntime-gpu`、`huggingface-hub`、`keyring`、`requests`、`transformers`、`accelerate`、`librosa`、`soundfile`、`av`、`fastapi`、`uvicorn`
 - CUDA/视频 Python 包：`pynvvideocodec>=2.1.0`、`cupy-cuda12x>=14.0`、`nvidia-cuda-nvrtc-cu12==12.8.93`、`nvidia-cuda-runtime-cu12==12.8.90`、`nvidia-cuda-cccl-cu12>=12.9.27`
 - 内置 AI/GPU 包：`torch==2.8.0`、`torchvision==0.23.0` 和 `torchaudio==2.8.0`（来自 PyTorch `cu128` wheel 源），以及 `ultralytics==8.4.4`、`mmengine==0.10.7`、`omegaconf`、`einops`、`safetensors`、`opencv-python`

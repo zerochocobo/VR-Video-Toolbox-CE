@@ -4,7 +4,7 @@ Mosaic-removal engine command builder layer.
 
 Supported engines:
   - lada   : lada-cli  (https://codeberg.org/ladaapp/lada)
-  - jasna  : jasna-cli (https://github.com/Kruk2/jasna)
+  - jasna  : jasna (https://github.com/Kruk2/jasna)
 
 Public API
 ----------
@@ -33,7 +33,7 @@ def get_engine_executable() -> "str | None":
     engine = app_config.get_engine()
     if engine == 'native_gpu':
         return None
-    return 'jasna-cli' if engine == 'jasna' else 'lada-cli'
+    return 'jasna' if engine == 'jasna' else 'lada-cli'
 
 
 def is_native_engine() -> bool:
@@ -134,7 +134,7 @@ def _build_jasna_cmd(input_file, output_file,
                      mosaic_model_path, mosaic_restoration_model_path,
                      encoder_options) -> list:
     cmd = [
-        'jasna-cli',
+        'jasna',
         '--input', input_file,
         '--output', output_file,
     ]

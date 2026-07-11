@@ -2446,6 +2446,13 @@ def _run_source_scan_branch(input_file, final_output, *, use_fisheye: bool,
 
         if log_callback:
             log_callback("[source-scan] Stage 4 merge timeline")
+        # Native restoration keeps the BasicVSR++/detector models cached so the
+        # next clip can reuse them.  They are no longer needed once all mosaic
+        # clips have been produced.  Release them before the final merge opens
+        # additional NVDEC/NVENC sessions; otherwise 12 GB cards can exhaust
+        # VRAM here and the CUDA/PyNv native stack may terminate the process
+        # instead of raising a recoverable Python exception.
+        _release_gpu_models_before_paste(log_callback=log_callback)
         if mode == "single_eye":
             concat_bitrate = single_eye_final_bitrate
         else:
@@ -2557,6 +2564,11 @@ def _resolve_merge_final_bitrate(left_file, right_file, original_bitrate, keep_o
 def merge_videos(left_file, right_file, output_file, original_bitrate, keep_original_bitrate=False, log_callback=None, process_callback=None):
     """Merge left and right eyes into SBS. Prefer GPU and fall back to ffmpeg on failure."""
     try:
+        # Lada's cached restoration engine can occupy most of a 12 GB GPU even
+        # though restoration has already finished.  The merge needs two decoder
+        # sessions, an encoder session and full-resolution frame buffers, so
+        # release the models before allocating those resources.
+        _release_gpu_models_before_paste(log_callback=log_callback)
         from gpu_engine import probe as gpu_probe, fallback as gpu_fallback, files as gpu_files
         _, d1 = gpu_probe.route(left_file)
         _, d2 = gpu_probe.route(right_file)
@@ -2634,6 +2646,7 @@ def _merge_videos_ffmpeg(left_file, right_file, output_file, original_bitrate, k
 def merge_videos_fisheye(left_fisheye_file, right_fisheye_file, output_file, original_bitrate, keep_original_bitrate=False, log_callback=None, process_callback=None):
     """Fisheye->VR + left/right merge. Prefer GPU and fall back to ffmpeg on failure."""
     try:
+        _release_gpu_models_before_paste(log_callback=log_callback)
         from gpu_engine import probe as gpu_probe, fallback as gpu_fallback, files as gpu_files
         _, d1 = gpu_probe.route(left_fisheye_file)
         _, d2 = gpu_probe.route(right_fisheye_file)

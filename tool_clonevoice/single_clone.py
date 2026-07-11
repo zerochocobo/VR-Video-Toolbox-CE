@@ -64,7 +64,8 @@ def run_single_transcribe(
     language: Optional[str],
     target_language: str,
     models_root: str,
-    denoise: str = "none",
+    denoise: str = "mild",
+    vad_sensitivity: str = "high",
     log: LogCallback = print,
     stop_event: Optional[Event] = None,
     model_holder: Optional[list] = None,
@@ -78,6 +79,7 @@ def run_single_transcribe(
         target_language=target_language,
         models_root=models_root,
         denoise=denoise,
+        vad_sensitivity=vad_sensitivity,
         log=log,
         stop_event=stop_event,
         model_holder=model_holder,
@@ -573,6 +575,7 @@ def ensure_translated(
     *,
     target_language: str,
     api_key: Optional[str] = None,
+    source_correction: Optional[bool] = None,
     log: LogCallback = print,
     stop_event: Optional[Event] = None,
 ) -> dict:
@@ -584,6 +587,7 @@ def ensure_translated(
         video,
         target_language=target_language,
         api_key=api_key,
+        source_correction=source_correction,
         log=log,
         stop_event=stop_event,
     )
@@ -594,6 +598,7 @@ def ensure_translated_for_videos(
     *,
     target_language: str,
     api_key: Optional[str] = None,
+    source_correction: Optional[bool] = None,
     log: LogCallback = print,
     stop_event: Optional[Event] = None,
 ) -> None:
@@ -604,6 +609,7 @@ def ensure_translated_for_videos(
             video,
             target_language=target_language,
             api_key=api_key,
+            source_correction=source_correction,
             log=log,
             stop_event=stop_event,
         )
@@ -733,6 +739,7 @@ def translate_and_synthesize(
     target_language: str,
     models_root: str,
     api_key: Optional[str] = None,
+    source_correction: Optional[bool] = None,
     loudness_mode: str = "envelope",
     envelope_alpha: float = 0.6,
     tempo_fit: str = "moderate",
@@ -759,6 +766,7 @@ def translate_and_synthesize(
             video,
             target_language=target_language,
             api_key=api_key,
+            source_correction=source_correction,
             log=log,
             stop_event=stop_event,
         )

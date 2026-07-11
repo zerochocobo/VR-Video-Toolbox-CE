@@ -215,7 +215,8 @@ def _split_video_ffmpeg(input_path, mode, output_dir, to_fisheye=False, log_call
         return False
 
 
-def combine_video(input_path_1, input_path_2, mode, output_path, from_fisheye=False, log_callback=None, process_callback=None):
+def combine_video(input_path_1, input_path_2, mode, output_path, from_fisheye=False,
+                  bitrate_reference_path=None, log_callback=None, process_callback=None):
     """
     Combine two videos.
     mode: 'left_right' (SBS), 'top_bottom' (Over-Under)
@@ -227,6 +228,17 @@ def combine_video(input_path_1, input_path_2, mode, output_path, from_fisheye=Fa
         # Both sources must be GPU-decodable before using the GPU path.
         _, dec1 = gpu_probe.route(input_path_1)
         _, dec2 = gpu_probe.route(input_path_2)
+        target_bitrate_bps = None
+        max_bitrate_bps = None
+        if bitrate_reference_path:
+            target_bitrate_bps = get_video_bitrate(bitrate_reference_path, log_callback)
+            if target_bitrate_bps:
+                target_bitrate_bps = int(target_bitrate_bps)
+                max_bitrate_bps = int(target_bitrate_bps * 2)
+                if log_callback:
+                    log_callback(f"Using bitrate reference: {bitrate_reference_path} -> {target_bitrate_bps / 1_000_000:.2f} Mbps")
+            elif log_callback:
+                log_callback("Could not detect the reference video bitrate; falling back to CQ 18.")
 
         def _gpu_fn():
             token = gpu_files.CancelToken()
@@ -234,12 +246,19 @@ def combine_video(input_path_1, input_path_2, mode, output_path, from_fisheye=Fa
                 process_callback(token)
             if log_callback: log_callback(f"Combining (GPU, {mode}{', from_fisheye' if from_fisheye else ''})...")
             gpu_files.combine_video(input_path_1, input_path_2, output_path, mode,
-                                    from_fisheye=from_fisheye, cq=18, keep_audio=True,
+                                    from_fisheye=from_fisheye,
+                                    cq=None if target_bitrate_bps else 18,
+                                    bitrate_bps=target_bitrate_bps,
+                                    max_bitrate_bps=max_bitrate_bps,
+                                    keep_audio=True,
                                     log_callback=log_callback, cancel_token=token)
             return True
 
         def _ffmpeg_fn():
-            return _combine_video_ffmpeg(input_path_1, input_path_2, mode, output_path, from_fisheye, log_callback, process_callback)
+            return _combine_video_ffmpeg(
+                input_path_1, input_path_2, mode, output_path, from_fisheye,
+                log_callback, process_callback, target_bitrate_bps, max_bitrate_bps,
+            )
 
         return gpu_fallback.run_with_fallback(
             _gpu_fn, _ffmpeg_fn, gpu_eligible=(dec1.is_gpu and dec2.is_gpu),
@@ -250,7 +269,9 @@ def combine_video(input_path_1, input_path_2, mode, output_path, from_fisheye=Fa
         return False
 
 
-def _combine_video_ffmpeg(input_path_1, input_path_2, mode, output_path, from_fisheye=False, log_callback=None, process_callback=None):
+def _combine_video_ffmpeg(input_path_1, input_path_2, mode, output_path, from_fisheye=False,
+                          log_callback=None, process_callback=None,
+                          bitrate_bps=None, max_bitrate_bps=None):
     """Original ffmpeg combine implementation used as the fallback path."""
     try:
         if log_callback: log_callback(f"Combining {input_path_1} and {input_path_2} into {output_path} (Mode: {mode})")
@@ -301,11 +322,15 @@ def _combine_video_ffmpeg(input_path_1, input_path_2, mode, output_path, from_fi
         cmd.extend(["-map", "[v]", "-map", "0:a?"]) # Take audio from first video
         cmd.extend(["-c:a", "copy"])
         
-        cmd.extend([
-            "-c:v", "hevc_nvenc", 
-            "-preset", "p7", 
-            "-cq", "18"
-        ])
+        cmd.extend(["-c:v", "hevc_nvenc", "-preset", "p7"])
+        if bitrate_bps:
+            cmd.extend([
+                "-rc", "vbr", "-b:v", str(int(bitrate_bps)),
+                "-maxrate", str(int(max_bitrate_bps or bitrate_bps * 2)),
+                "-bufsize", str(int((max_bitrate_bps or bitrate_bps * 2) * 2)),
+            ])
+        else:
+            cmd.extend(["-cq", "18"])
         # Ensure consistent color (optional but good practice as seen in reference)
         # cmd.extend(["-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"])
         

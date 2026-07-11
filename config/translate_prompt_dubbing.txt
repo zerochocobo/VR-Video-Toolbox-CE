@@ -1,5 +1,7 @@
 Task: Translate movie subtitles into {target_language} for AI dubbing. Each line is spoken by a cloned voice and must fit its original on-screen time slot, so the translation's natural spoken length should be close to the original line's spoken duration.
 
+The subtitles are the complete dialogue of one video, listed in playback order (subtitle_id increases in playback order), and were produced by speech recognition (ASR), so they may contain recognition errors.
+
 Core Constraint: Match the spoken duration (both directions)
 - Aim for a translation whose natural spoken length is close to the original line's spoken length.
   * Too LONG -> the dub has to rush or overruns into the next line.
@@ -11,6 +13,12 @@ Core Constraint: Match the spoken duration (both directions)
   * Any other source/target pair: judge by natural spoken length rather than character count — the line should take about as long to say out loud as the original.
 - Register & pace: use natural, spoken, colloquial language and contractions; avoid stiff, formal, or long multi-syllabic words that are hard to say quickly, especially for rapid original lines.
 
+Context & Consistency (important):
+- Always use the surrounding subtitles as context. A sentence often spans several consecutive subtitles; the dubbed lines must connect naturally and read as one continuous dialogue.
+- Keep person names, nicknames, forms of address, and recurring terms consistent across the whole file.
+- Keep each speaker's tone and register consistent across the whole file.
+- The source text is ASR output: it may contain homophone mistakes, wrong particles, or garbled fragments. Infer the intended meaning from the context and translate that intended meaning, not the literal mis-recognized words.
+
 Content Background:
     Contains adult elements; therefore, the translation will primarily use informal, spoken-style language suitable.
 
@@ -19,12 +27,13 @@ Content Background:
 Instructions:
 1. Format Integrity: Each subtitle must start with <subtitle_id> and end with </subtitle_id>. Maintain a strict one-to-one correspondence.
 2. Contextual Coherence: Understand the dialogue flow to ensure the translation is natural, but never merge or split IDs.
-3. Handle Noise: Ignore gibberish or errors; if a subtitle_text is empty or nonsensical, output <subtitle_id></subtitle_id>.
+3. Handle Noise: Ignore gibberish or errors; if a subtitle_text is empty or nonsensical, output <subtitle_id></subtitle_id>. NEVER echo the source text or leave source-language words in the output — every non-empty output line must be written entirely in {target_language} (a cloned voice has to speak it).
 4. Lip-Sync Optimization (for Chinese target): Avoid ending sentences with long, dragging particles unless the original speaker does so.
 
 Input Format:
 Subtitles are between START and END markers.
 Example: <id>text</id>
+subtitle_id increases in playback order: neighboring subtitles are consecutive lines of the same dialogue.
 
 Length Reference Guide (for {target_language}):
 - Short original (e.g. "さあ") -> an equally punchy translation (e.g. "来吧" or "So"). Do not pad it into a full sentence.
@@ -37,14 +46,14 @@ Example (Japanese to Chinese):
 
 Input:
 START
-<10>もちろん「はい」と言うでしょう。-なぜ？でも、それは商品を買うということではありません。</10>
-<56>さあ。</56>
+<1>もちろん「はい」と言うでしょう。-なぜ？でも、それは商品を買うということではありません。</1>
+<2>さあ。</2>
 END
 
 Output (Optimized for Sync):
 START
-<10>当然会说“会”。-为啥？但这不代表就会买。</10>
-<56>来。</56>
+<1>当然会说“会”。-为啥？但这不代表就会买。</1>
+<2>来。</2>
 END
 
 ---
@@ -57,4 +66,4 @@ START
 
 END
 
-Remember: The goal is synchronized dubbing. Match the original line's spoken duration (neither much longer nor much shorter) and keep a natural spoken rhythm. Never skip or merge IDs.
+Remember: The goal is synchronized dubbing. Match the original line's spoken duration (neither much longer nor much shorter), keep a natural spoken rhythm, use the surrounding lines as context, and keep names, terms, and tone consistent across the whole file. Never skip or merge IDs.

@@ -281,7 +281,13 @@ def video_status(video: str | Path) -> dict[str, Any]:
             "edited": 0,
             "reference_srt": str(ref_srt) if ref_srt else "",
         }
-    segments = list(manifest.get("segments") or [])
+    # Only segments that still have source text need a translation: lines the
+    # AI proofread removed (interjections/hallucinations) have src_text == ""
+    # and must not make a fully translated video look "untranslated".
+    segments = [
+        s for s in (manifest.get("segments") or [])
+        if (s.get("src_text") or "").strip()
+    ]
     total = len(segments)
     cleared = cleared_segment_ids(manifest)
 

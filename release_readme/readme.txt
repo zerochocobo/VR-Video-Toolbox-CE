@@ -50,8 +50,8 @@ compatible with the same workflow.
 
 1. Visit: https://github.com/Kruk2/jasna/releases
 2. Download the latest Windows release.
-3. There are two ways to make jasna-cli available to the program:
-   Option 1: Extract and copy jasna-cli.exe (and its _internal folder if any)
+3. There are two ways to make jasna available to the program:
+   Option 1: Extract and copy jasna.exe (and its _internal folder if any)
              into the same folder as VR_Video_Toolbox.exe.
    Option 2: Add the jasna folder to Windows' PATH environment variable.
 4. Select the engine in the main window: choose "Jasna" or "Lada" under AI Engine.

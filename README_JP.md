@@ -60,7 +60,7 @@ VRビデオの整理、修復、および字幕処理向けに設計されたWin
 
 モザイク除去だけが目的なら、まずワンクリックモードを使ってください。魚眼チェックは、モザイク形状が合う場合だけ有効にします。
 
-処理結果は主にAIモザイク除去エンジン（`lada-cli` または `jasna-cli`）の識別および修復能力に依存します。複雑な歪み、激しい遮蔽、または画質が非常に悪いビデオの場合、結果が不安定になることがあります。
+処理結果は主にAIモザイク除去エンジン（`lada-cli` または `jasna`）の識別および修復能力に依存します。複雑な歪み、激しい遮蔽、または画質が非常に悪いビデオの場合、結果が不安定になることがあります。
 
 > プログラムにはエンジンセレクターが内蔵されており、メイン画面の「AIモザイク除去エンジン」で **Lada** と **Jasna** を切り替えることができます。選択は自動的に保存されます。
 > - Lada：https://codeberg.org/ladaapp/lada
@@ -191,7 +191,7 @@ python main.py
 
 - `ffmpeg.exe`
 - `ffprobe.exe`
-- `lada-cli.exe` または `jasna-cli.exe`（いずれか一つ）
+- `lada-cli.exe` または `jasna.exe`（いずれか一つ）
 - 基本 Python パッケージ：`Pillow`、`pyinstaller`、`ffmpy3`、`faster-whisper`、`numpy>=1.26,<2.1`、`auditok`、`onnxruntime-gpu`、`huggingface-hub`、`keyring`、`requests`、`transformers`、`accelerate`、`librosa`、`soundfile`、`av`、`fastapi`、`uvicorn`
 - CUDA/ビデオ Python パッケージ：`pynvvideocodec>=2.1.0`、`cupy-cuda12x>=14.0`、`nvidia-cuda-nvrtc-cu12==12.8.93`、`nvidia-cuda-runtime-cu12==12.8.90`、`nvidia-cuda-cccl-cu12>=12.9.27`
 - 内蔵 AI/GPU パッケージ：PyTorch `cu128` wheel インデックスの `torch==2.8.0`、`torchvision==0.23.0`、`torchaudio==2.8.0`、および `ultralytics==8.4.4`、`mmengine==0.10.7`、`omegaconf`、`einops`、`safetensors`、`opencv-python`

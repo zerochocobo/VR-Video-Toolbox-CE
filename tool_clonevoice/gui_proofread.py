@@ -32,6 +32,7 @@ class ProofreadPanel(ttk.LabelFrame):
         show_speaker: bool,
         get_target_language,
         get_stop_event,
+        get_source_correction=None,
     ):
         super().__init__(parent, text=get_text("lbl_proofread_panel"), padding=6)
         self.app = app
@@ -41,6 +42,7 @@ class ProofreadPanel(ttk.LabelFrame):
         self.show_speaker = show_speaker
         self.get_target_language = get_target_language
         self.get_stop_event = get_stop_event
+        self.get_source_correction = get_source_correction
         self.videos: list[str] = []
         self.iid_to_video: dict[str, str] = {}
 
@@ -135,6 +137,7 @@ class ProofreadPanel(ttk.LabelFrame):
                 messagebox.showerror("Error", get_text("err_no_translation_api_key"))
                 return
             target_language = self.get_target_language()
+            source_correction = self.get_source_correction() if self.get_source_correction else None
 
             def worker(_holder, _release_holder):
                 from tool_clonevoice import logic
@@ -142,6 +145,7 @@ class ProofreadPanel(ttk.LabelFrame):
                 return logic.run_translate(
                     video,
                     target_language=target_language,
+                    source_correction=source_correction,
                     log=lambda m: self.app.log(self._log_widget(), m),
                     stop_event=self.get_stop_event(),
                 )

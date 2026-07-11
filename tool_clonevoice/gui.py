@@ -187,6 +187,33 @@ class ClonevoiceToolsApp:
         self.asr_model_status_row.pack(fill="x", pady=(0, 2))
         ttk.Label(self.asr_model_status_row, textvariable=self.asr_model_status_var, foreground="dim gray").pack(side="left")
 
+        # VAD sensitivity on its own row (the model row above is already full).
+        self.vad_sensitivity_map = {
+            get_text("opt_vad_standard"): "standard",
+            get_text("opt_vad_high"): "high",
+            get_text("opt_vad_max"): "max",
+        }
+        # Denoise + sensitivity share one row: the two must be tuned together
+        # (high sensitivity without denoise feeds noise to the decoder).
+        clone_vad_row = ttk.Frame(options_frame)
+        clone_vad_row.pack(fill="x", pady=2)
+        ttk.Label(clone_vad_row, text=get_text("lbl_denoise"), width=12).pack(side="left")
+        self._denoise_map = {
+            get_text("opt_denoise_none"): "none",
+            get_text("opt_denoise_mild"): "mild",
+            get_text("opt_denoise_balanced"): "balanced",
+            get_text("opt_denoise_strong"): "strong",
+        }
+        self.denoise_var = tk.StringVar(value=get_text("opt_denoise_mild"))
+        ttk.Combobox(clone_vad_row, textvariable=self.denoise_var, values=list(self._denoise_map.keys()), state="readonly", width=12).pack(side="left", padx=(0, 16))
+        ttk.Label(clone_vad_row, text=get_text("lbl_vad_sensitivity"), width=12).pack(side="left")
+        self.clone_vad_var = tk.StringVar(value=get_text("opt_vad_high"))
+        ttk.Combobox(
+            clone_vad_row, textvariable=self.clone_vad_var,
+            values=list(self.vad_sensitivity_map.keys()),
+            state="readonly", width=16,
+        ).pack(side="left")
+
         self.voice_model_frame = ttk.LabelFrame(options_frame, text=get_text("grp_voice_models"), padding=6)
         self.voice_model_frame_packed = True
         self.voice_model_frame.pack(fill="x", pady=(2, 4))
@@ -234,16 +261,15 @@ class ClonevoiceToolsApp:
             "7": 7,
         }
         self.num_spk_var = tk.StringVar(value=get_text("opt_num_auto"))
-        ttk.Combobox(row2, textvariable=self.num_spk_var, values=list(self._num_map.keys()), state="readonly", width=14).pack(side="left", padx=(0, 16))
-        ttk.Label(row2, text=get_text("lbl_denoise"), width=10).pack(side="left")
-        self._denoise_map = {
-            get_text("opt_denoise_none"): "none",
-            get_text("opt_denoise_mild"): "mild",
-            get_text("opt_denoise_balanced"): "balanced",
-            get_text("opt_denoise_strong"): "strong",
-        }
-        self.denoise_var = tk.StringVar(value=get_text("opt_denoise_none"))
-        ttk.Combobox(row2, textvariable=self.denoise_var, values=list(self._denoise_map.keys()), state="readonly", width=12).pack(side="left")
+        ttk.Combobox(row2, textvariable=self.num_spk_var, values=list(self._num_map.keys()), state="readonly", width=14).pack(side="left")
+
+        correction_row = ttk.Frame(options_frame)
+        correction_row.pack(fill="x", pady=2)
+        self.source_correction_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            correction_row, text=get_text("chk_source_correction"),
+            variable=self.source_correction_var,
+        ).pack(side="left")
 
         row3 = ttk.Frame(options_frame)
         row3.pack(fill="x", pady=2)
@@ -473,13 +499,26 @@ class ClonevoiceToolsApp:
         ttk.Label(single_clone_options_row, text=get_text("lbl_denoise"), width=step1_secondary_label_width).pack(
             side="left", padx=(0, 6)
         )
-        self.single_clone_denoise_var = tk.StringVar(value=get_text("opt_denoise_none"))
+        self.single_clone_denoise_var = tk.StringVar(value=get_text("opt_denoise_mild"))
         ttk.Combobox(
             single_clone_options_row,
             textvariable=self.single_clone_denoise_var,
             values=list(self.single_clone_denoise_map.keys()),
             state="readonly",
             width=14,
+        ).pack(side="left", padx=(0, 16))
+
+        self.vad_sensitivity_map = {
+            get_text("opt_vad_standard"): "standard",
+            get_text("opt_vad_high"): "high",
+            get_text("opt_vad_max"): "max",
+        }
+        ttk.Label(single_clone_options_row, text=get_text("lbl_vad_sensitivity")).pack(side="left", padx=(0, 6))
+        self.single_clone_vad_var = tk.StringVar(value=get_text("opt_vad_high"))
+        ttk.Combobox(
+            single_clone_options_row, textvariable=self.single_clone_vad_var,
+            values=list(self.vad_sensitivity_map.keys()),
+            state="readonly", width=14,
         ).pack(side="left")
 
         ttk.Label(step1, text=get_text("lbl_model"), width=step1_label_width).grid(
@@ -507,8 +546,15 @@ class ClonevoiceToolsApp:
             row=4, column=1, columnspan=3, sticky="ew", pady=(0, 3)
         )
 
+        self.single_clone_source_correction_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            step1,
+            text=get_text("chk_source_correction"),
+            variable=self.single_clone_source_correction_var,
+        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=3)
+
         single_clone_target_row = ttk.Frame(step1)
-        single_clone_target_row.grid(row=5, column=0, columnspan=4, sticky="ew", pady=3)
+        single_clone_target_row.grid(row=6, column=0, columnspan=4, sticky="ew", pady=3)
         ttk.Label(single_clone_target_row, text=get_text("lbl_single_clone_target_lang"), width=step1_label_width).pack(
             side="left", padx=(0, 6)
         )
@@ -535,7 +581,7 @@ class ClonevoiceToolsApp:
         )
 
         self.single_clone_btn_transcribe = ttk.Button(step1, text=get_text("btn_start_transcribe"), command=self._single_clone_run_transcribe)
-        self.single_clone_btn_transcribe.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self.single_clone_btn_transcribe.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(8, 0))
 
         step2 = ttk.Frame(content, padding=8)
         step2.columnconfigure(0, weight=1)
@@ -688,6 +734,7 @@ class ClonevoiceToolsApp:
             show_speaker=False,
             get_target_language=self._selected_single_target_language,
             get_stop_event=lambda: self.single_clone_stop_event,
+            get_source_correction=lambda: self.single_clone_source_correction_var.get(),
         )
         self.single_clone_proofread_panel.grid(row=0, column=0, sticky="ew", pady=(4, 8))
         self.single_clone_btn_translate_clone = ttk.Button(
@@ -877,13 +924,21 @@ class ClonevoiceToolsApp:
             width=14,
         ).pack(side="left", padx=(0, 16))
         ttk.Label(lang_row, text=get_text("lbl_denoise"), width=secondary_width).pack(side="left", padx=(0, 6))
-        self.multi_clone_denoise_var = tk.StringVar(value=get_text("opt_denoise_none"))
+        self.multi_clone_denoise_var = tk.StringVar(value=get_text("opt_denoise_mild"))
         ttk.Combobox(
             lang_row,
             textvariable=self.multi_clone_denoise_var,
             values=list(self.multi_clone_denoise_map.keys()),
             state="readonly",
             width=14,
+        ).pack(side="left", padx=(0, 16))
+
+        ttk.Label(lang_row, text=get_text("lbl_vad_sensitivity")).pack(side="left", padx=(0, 6))
+        self.multi_clone_vad_var = tk.StringVar(value=get_text("opt_vad_high"))
+        ttk.Combobox(
+            lang_row, textvariable=self.multi_clone_vad_var,
+            values=list(self.vad_sensitivity_map.keys()),
+            state="readonly", width=14,
         ).pack(side="left")
 
         model_row = ttk.Frame(step1)
@@ -920,8 +975,15 @@ class ClonevoiceToolsApp:
         self.multi_asr_model_status_label = ttk.Label(step1, textvariable=self.multi_asr_model_status_var, foreground="dim gray")
         self.multi_asr_model_status_label.grid(row=4, column=1, columnspan=3, sticky="ew", pady=(0, 3))
 
+        self.multi_clone_source_correction_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            step1,
+            text=get_text("chk_source_correction"),
+            variable=self.multi_clone_source_correction_var,
+        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=3)
+
         target_row = ttk.Frame(step1)
-        target_row.grid(row=5, column=0, columnspan=4, sticky="ew", pady=3)
+        target_row.grid(row=6, column=0, columnspan=4, sticky="ew", pady=3)
         ttk.Label(target_row, text=get_text("lbl_single_clone_target_lang"), width=label_width).pack(side="left", padx=(0, 6))
         self.multi_clone_tgt_lang_var = tk.StringVar(value=get_text("opt_lang_zh"))
         ttk.Combobox(
@@ -946,7 +1008,7 @@ class ClonevoiceToolsApp:
             text=get_text("btn_start_multi_transcribe"),
             command=self._multi_clone_run_transcribe,
         )
-        self.multi_clone_btn_transcribe.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self.multi_clone_btn_transcribe.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(8, 0))
 
         step2 = ttk.Frame(content, padding=8)
         step2.columnconfigure(0, weight=1)
@@ -1081,6 +1143,7 @@ class ClonevoiceToolsApp:
             show_speaker=True,
             get_target_language=self._selected_multi_target_language,
             get_stop_event=lambda: self.multi_clone_stop_event,
+            get_source_correction=lambda: self.multi_clone_source_correction_var.get(),
         )
         self.multi_clone_proofread_panel.grid(row=0, column=0, sticky="ew", pady=(4, 8))
         self.multi_clone_btn_start_export = ttk.Button(
@@ -1638,6 +1701,8 @@ class ClonevoiceToolsApp:
         model_key = self._selected_single_model_key()
         language = self.single_clone_lang_map.get(self.single_clone_src_lang_var.get())
         denoise = self.single_clone_denoise_map.get(self.single_clone_denoise_var.get(), "none")
+        source_correction = self.single_clone_source_correction_var.get()
+        vad_sensitivity = self.vad_sensitivity_map.get(self.single_clone_vad_var.get(), "high")
 
         def worker(holder, release_holder):
             from tool_clonevoice import single_clone as sc
@@ -1654,6 +1719,7 @@ class ClonevoiceToolsApp:
                     target_language=target_language,
                     models_root=self.models_root,
                     denoise=denoise,
+                    vad_sensitivity=vad_sensitivity,
                     log=lambda m: self.log(self.single_clone_log, m),
                     stop_event=self.single_clone_stop_event,
                     model_holder=holder,
@@ -1663,6 +1729,7 @@ class ClonevoiceToolsApp:
             sc.ensure_translated_for_videos(
                 videos,
                 target_language=target_language,
+                source_correction=source_correction,
                 log=lambda m: self.log(self.single_clone_log, m),
                 stop_event=self.single_clone_stop_event,
             )
@@ -2150,6 +2217,7 @@ class ClonevoiceToolsApp:
         envelope_alpha = self.single_clone_envelope_alpha_map.get(self.single_clone_envelope_alpha_var.get(), 0.6)
         tempo_fit = self.single_clone_tempo_fit_map.get(self.single_clone_tempo_fit_var.get(), "moderate")
         skip_existing = self.single_clone_skip_existing_var.get()
+        source_correction = self.single_clone_source_correction_var.get()
 
         def worker(holder, _release_holder):
             from tool_clonevoice import single_clone as sc
@@ -2158,6 +2226,7 @@ class ClonevoiceToolsApp:
                 videos,
                 target_language=target_language,
                 models_root=self.models_root,
+                source_correction=source_correction,
                 loudness_mode=loudness_mode,
                 envelope_alpha=envelope_alpha,
                 tempo_fit=tempo_fit,
@@ -2547,6 +2616,8 @@ class ClonevoiceToolsApp:
         model_key = self._selected_multi_model_key()
         language = self.multi_clone_lang_map.get(self.multi_clone_src_lang_var.get())
         denoise = self.multi_clone_denoise_map.get(self.multi_clone_denoise_var.get(), "none")
+        source_correction = self.multi_clone_source_correction_var.get()
+        vad_sensitivity = self.vad_sensitivity_map.get(self.multi_clone_vad_var.get(), "high")
         diarize_backend = "pyannote"
 
         def worker(holder, release_holder):
@@ -2580,6 +2651,7 @@ class ClonevoiceToolsApp:
                     diarize_backend=diarize_backend,
                     num_speakers=num_speakers,
                     denoise=denoise,
+                    vad_sensitivity=vad_sensitivity,
                     precomputed_turns=turns_by_video.get(str(Path(video))) if batch_mode else None,
                     log=lambda m: self.log(self.multi_clone_log, m),
                     stop_event=self.multi_clone_stop_event,
@@ -2590,6 +2662,7 @@ class ClonevoiceToolsApp:
             sc.ensure_translated_for_videos(
                 videos,
                 target_language=target_language,
+                source_correction=source_correction,
                 log=lambda m: self.log(self.multi_clone_log, m),
                 stop_event=self.multi_clone_stop_event,
             )
@@ -3333,6 +3406,7 @@ class ClonevoiceToolsApp:
         tempo_fit = self.multi_clone_tempo_fit_map.get(self.multi_clone_tempo_fit_var.get(), "moderate")
         skip_existing = self.multi_clone_skip_existing_var.get()
         skipped = set(self.multi_clone_skipped)
+        source_correction = self.multi_clone_source_correction_var.get()
 
         def worker(holder, _release_holder):
             from tool_clonevoice import multi_clone as mc
@@ -3347,6 +3421,7 @@ class ClonevoiceToolsApp:
                 videos,
                 target_language=target_language,
                 models_root=self.models_root,
+                source_correction=source_correction,
                 loudness_mode=loudness_mode,
                 envelope_alpha=envelope_alpha,
                 tempo_fit=tempo_fit,
@@ -3900,6 +3975,8 @@ class ClonevoiceToolsApp:
         tempo_fit = self._tempo_fit_map.get(self.tempo_fit_var.get(), "moderate")
         keep_intermediate = self.keep_intermediate_var.get()
         skip_existing = self.skip_existing_var.get()
+        source_correction = self.source_correction_var.get()
+        vad_sensitivity = self.vad_sensitivity_map.get(self.clone_vad_var.get(), "high")
 
         def task():
             holder: list = []
@@ -3931,7 +4008,8 @@ class ClonevoiceToolsApp:
                             num_speakers=num_speakers, target_language=target_language,
                             denoise=denoise, loudness_mode=loudness_mode,
                             envelope_alpha=envelope_alpha, tempo_fit=tempo_fit,
-                            skip_existing=skip_existing,
+                            skip_existing=skip_existing, source_correction=source_correction,
+                            vad_sensitivity=vad_sensitivity,
                         )
                     return
                 if shared_mode:
@@ -3941,7 +4019,8 @@ class ClonevoiceToolsApp:
                         num_speakers=num_speakers, target_language=target_language,
                         denoise=denoise, loudness_mode=loudness_mode,
                         envelope_alpha=envelope_alpha, tempo_fit=tempo_fit,
-                        skip_existing=skip_existing,
+                        skip_existing=skip_existing, source_correction=source_correction,
+                        vad_sensitivity=vad_sensitivity,
                     )
                     return
                 if batch_mode:
@@ -3966,6 +4045,8 @@ class ClonevoiceToolsApp:
                         models_root=self.models_root,
                         keep_intermediate=keep_intermediate,
                         skip_existing=skip_existing,
+                        source_correction=source_correction,
+                        vad_sensitivity=vad_sensitivity,
                         log=lambda m: self.log(self.clone_log, m),
                         stop_event=self.stop_event,
                         model_holder=holder,
@@ -3998,7 +4079,8 @@ class ClonevoiceToolsApp:
 
     def _run_shared_folder(self, videos, holder, release_holder, *, model_key, language,
                            backend, num_speakers, target_language, denoise, loudness_mode,
-                           envelope_alpha, tempo_fit, skip_existing):
+                           envelope_alpha, tempo_fit, skip_existing, source_correction=None,
+                           vad_sensitivity="high"):
         """One-click 'same folder' mode: global-diarize the folder, auto-pick one
         shared reference per speaker, then translate + synthesize every video so
         the whole folder clones each speaker from the same voice."""
@@ -4023,7 +4105,8 @@ class ClonevoiceToolsApp:
             mc.run_multi_transcribe(
                 video, model_key=model_key, language=language, target_language=target_language,
                 models_root=self.models_root, diarize_backend=diar_backend, num_speakers=num_speakers,
-                denoise=denoise, precomputed_turns=turns_by_video.get(str(Path(video))),
+                denoise=denoise, vad_sensitivity=vad_sensitivity,
+                precomputed_turns=turns_by_video.get(str(Path(video))),
                 log=clog, stop_event=self.stop_event, model_holder=holder,
             )
             release_holder()
@@ -4040,7 +4123,10 @@ class ClonevoiceToolsApp:
                 self.log(self.clone_log, get_text("msg_shared_skip_existing").format(out_path))
                 continue
             self.log(self.clone_log, get_text("msg_batch_item").format(index, len(videos), video))
-            logic.run_translate(video, target_language=target_language, log=clog, stop_event=self.stop_event)
+            logic.run_translate(
+                video, target_language=target_language, source_correction=source_correction,
+                log=clog, stop_event=self.stop_event,
+            )
             logic.run_synthesize(
                 video, models_root=self.models_root, text_field="tgt_text", language=target_language,
                 loudness_mode=loudness_mode, envelope_alpha=envelope_alpha, tempo_fit=tempo_fit,

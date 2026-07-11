@@ -124,8 +124,13 @@ MODEL_SCENE_OVERRIDES = {
     },
     "large-v3": {
         "compression_ratio_threshold": 2.4,
-        "log_prob_threshold": -1.0,
-        "no_speech_threshold": 0.70,
+        # Decode-side silence gating OFF (like kotoba scene options): with
+        # -1.0/0.70 faster-whisper silently dropped quiet lines inside chunks
+        # before they ever reached raw output / our own postprocess filters
+        # (debug session 2026-07-09: ~1/3 of missing lines vs reference subs).
+        # Our postprocess still drops no_speech>0.90 & logprob<-1.35 lines.
+        "log_prob_threshold": None,
+        "no_speech_threshold": None,
         "condition_on_previous_text": False,
         "word_timestamps": True,
         "repetition_penalty": 1.0,
@@ -133,8 +138,11 @@ MODEL_SCENE_OVERRIDES = {
     },
     "large-v2": {
         "compression_ratio_threshold": 2.4,
-        "log_prob_threshold": -1.5,
-        "no_speech_threshold": 0.34,
+        # Decode-side silence gating OFF for the same reason as large-v3 below;
+        # the old 0.34 no-speech gate was the most aggressive of all models.
+        # Anti-loop measures (repetition_penalty / no_repeat_ngram_size) stay.
+        "log_prob_threshold": None,
+        "no_speech_threshold": None,
         "condition_on_previous_text": False,
         "word_timestamps": True,
         "repetition_penalty": 1.15,
@@ -218,6 +226,32 @@ WHISPERSEG_MERGE_GAP_SECONDS = 2.0
 WHISPERSEG_MIN_CHUNK_SECONDS = 2.0
 ENABLE_RMS_SPEECH_GATE = True
 RMS_SPEECH_MIN_DB = -50.0
+
+# VAD sensitivity presets (how quiet a sound still counts as speech).
+# "standard" reproduces the historical constants above. Higher levels lower the
+# WhisperSeg gate, widen the speech padding, and relax/disable the RMS energy
+# gate so breathy or whispered lines reach the decoder; the decode-side and
+# postprocess confidence filters still guard against the extra noise.
+VAD_SENSITIVITY_PRESETS = {
+    "standard": {
+        "threshold": WHISPERSEG_THRESHOLD,
+        "neg_threshold": WHISPERSEG_NEG_THRESHOLD,
+        "speech_pad_ms": WHISPERSEG_SPEECH_PAD_MS,
+        "rms_gate_db": RMS_SPEECH_MIN_DB,
+    },
+    "high": {
+        "threshold": 0.35,
+        "neg_threshold": 0.22,
+        "speech_pad_ms": 200.0,
+        "rms_gate_db": -58.0,
+    },
+    "max": {
+        "threshold": 0.20,
+        "neg_threshold": 0.12,
+        "speech_pad_ms": 320.0,
+        "rms_gate_db": None,
+    },
+}
 
 DUPLICATE_LOOKBACK_SECONDS = max(6.0, CHUNK_OVERLAP_SECONDS + 2.0)
 NEAR_DUPLICATE_RATIO = 0.92
@@ -722,6 +756,20 @@ class SubtitleGenerator:
         self.whisperseg_session = None
         self.whisperseg_feature_extractor = None
         self.last_raw_segments = []
+        self.last_chunks = []
+        self.set_vad_sensitivity("standard")
+
+    def set_vad_sensitivity(self, preset_name: str):
+        preset = VAD_SENSITIVITY_PRESETS.get(preset_name)
+        if preset is None:
+            self.log_callback(f"Unknown VAD sensitivity {preset_name!r}; using 'standard'")
+            preset_name = "standard"
+            preset = VAD_SENSITIVITY_PRESETS["standard"]
+        self.vad_sensitivity = preset_name
+        self.vad_threshold = preset["threshold"]
+        self.vad_neg_threshold = preset["neg_threshold"]
+        self.vad_speech_pad_ms = preset["speech_pad_ms"]
+        self.vad_rms_gate_db = preset["rms_gate_db"]
 
     @staticmethod
     def scene_to_chunk(
@@ -1022,6 +1070,40 @@ class SubtitleGenerator:
         return False
 
     @staticmethod
+    def compress_repetition_text(text: str, repeats_kept: int = 3) -> str:
+        """Collapse looped repetition to a few units ("無理無理×20" -> "無理無理無理").
+
+        Real climax lines genuinely repeat one word dozens of times; dropping the
+        whole line (the old behaviour) deleted real dialogue. Keep a readable,
+        compressed rendition instead and let the timing stay untouched.
+        """
+        s = text.strip()
+        # Any unit of 1..12 chars repeated 4+ times consecutively -> keep 3.
+        s = re.sub(
+            r"(.{1,12}?)\1{" + str(repeats_kept) + r",}",
+            lambda m: m.group(1) * repeats_kept,
+            s,
+            flags=re.DOTALL,
+        )
+
+        # Same, but with a punctuation separator between units and no trailing
+        # separator ("ごめん、ごめん、ごめん、ごめん"), which the pattern above
+        # cannot fold into whole units.
+        sep_pattern = re.compile(
+            r"(.{1,12}?)(([、。，,．.!！?？~〜・\s…]+)\1(?:\3\1)*)",
+            re.DOTALL,
+        )
+
+        def collapse(match):
+            unit, tail, sep = match.group(1), match.group(2), match.group(3)
+            total = 1 + tail.count(sep + unit)
+            if total > repeats_kept:
+                return (unit + sep) * (repeats_kept - 1) + unit
+            return match.group(0)
+
+        return sep_pattern.sub(collapse, s)
+
+    @staticmethod
     def subtitle_duration_for_text(text: str, current_duration: float) -> float:
         text_len = len(SubtitleGenerator.normalize_for_duplicate(text))
         if text_len <= 0:
@@ -1171,11 +1253,11 @@ class SubtitleGenerator:
         raw_segments = self.frame_probs_to_segments(
             probs,
             len(audio),
-            threshold=WHISPERSEG_THRESHOLD,
-            neg_threshold=WHISPERSEG_NEG_THRESHOLD,
+            threshold=self.vad_threshold,
+            neg_threshold=self.vad_neg_threshold,
             min_speech_ms=WHISPERSEG_MIN_SPEECH_MS,
             min_silence_ms=WHISPERSEG_MIN_SILENCE_MS,
-            speech_pad_ms=WHISPERSEG_SPEECH_PAD_MS,
+            speech_pad_ms=self.vad_speech_pad_ms,
             sampling_rate=sampling_rate,
         )
         if not raw_segments:
@@ -1224,11 +1306,11 @@ class SubtitleGenerator:
         global_segments = self.frame_probs_to_segments(
             probs,
             len(audio),
-            threshold=WHISPERSEG_THRESHOLD,
-            neg_threshold=WHISPERSEG_NEG_THRESHOLD,
+            threshold=self.vad_threshold,
+            neg_threshold=self.vad_neg_threshold,
             min_speech_ms=WHISPERSEG_MIN_SPEECH_MS,
             min_silence_ms=WHISPERSEG_MIN_SILENCE_MS,
-            speech_pad_ms=WHISPERSEG_SPEECH_PAD_MS,
+            speech_pad_ms=self.vad_speech_pad_ms,
             sampling_rate=16000,
         )
         if not global_segments:
@@ -1303,7 +1385,8 @@ class SubtitleGenerator:
             f"to {len(segmented_chunks)} ASR chunks, "
             f"kept {kept_duration:.2f}s / {auditok_duration:.2f}s "
             f"(speech_regions={len(global_segments)}, fallback_chunks={fallback_chunks}, "
-            f"threshold={WHISPERSEG_THRESHOLD}, rms_gate_removed={removed_by_energy})"
+            f"sensitivity={self.vad_sensitivity}, threshold={self.vad_threshold}, "
+            f"rms_gate_removed={removed_by_energy})"
         )
         return segmented_chunks
 
@@ -1317,11 +1400,11 @@ class SubtitleGenerator:
         speech_regions = self.frame_probs_to_segments(
             probs,
             len(audio),
-            threshold=WHISPERSEG_THRESHOLD,
-            neg_threshold=WHISPERSEG_NEG_THRESHOLD,
+            threshold=self.vad_threshold,
+            neg_threshold=self.vad_neg_threshold,
             min_speech_ms=WHISPERSEG_MIN_SPEECH_MS,
             min_silence_ms=WHISPERSEG_MIN_SILENCE_MS,
-            speech_pad_ms=WHISPERSEG_SPEECH_PAD_MS,
+            speech_pad_ms=self.vad_speech_pad_ms,
             sampling_rate=16000,
         )
         speech_regions, removed_by_energy = self.filter_regions_by_rms(audio, speech_regions)
@@ -1373,7 +1456,8 @@ class SubtitleGenerator:
             f"WhisperSeg split into {len(speech_regions)} speech regions, "
             f"coalesced to {len(chunks)} ASR chunks, "
             f"kept {kept_duration:.2f}s / {total_duration:.2f}s "
-            f"(threshold={WHISPERSEG_THRESHOLD}, rms_gate_removed={removed_by_energy})"
+            f"(sensitivity={self.vad_sensitivity}, threshold={self.vad_threshold}, "
+            f"rms_gate_removed={removed_by_energy})"
         )
         return chunks
 
@@ -1384,9 +1468,9 @@ class SubtitleGenerator:
         rms = float(np.sqrt(np.mean(np.square(audio.astype(np.float32)))))
         return 20.0 * np.log10(rms + 1e-10)
 
-    @staticmethod
-    def filter_regions_by_rms(audio: np.ndarray, regions: list, sampling_rate: int = 16000) -> tuple:
-        if not ENABLE_RMS_SPEECH_GATE or not regions:
+    def filter_regions_by_rms(self, audio: np.ndarray, regions: list, sampling_rate: int = 16000) -> tuple:
+        gate_db = self.vad_rms_gate_db
+        if not ENABLE_RMS_SPEECH_GATE or gate_db is None or not regions:
             return regions, 0
 
         filtered = []
@@ -1395,7 +1479,7 @@ class SubtitleGenerator:
             region = audio[max(0, start):min(len(audio), end)]
             duration = (end - start) / sampling_rate
             rms_db = SubtitleGenerator.segment_rms_db(region)
-            if rms_db < RMS_SPEECH_MIN_DB and duration < 4.0:
+            if rms_db < gate_db and duration < 4.0:
                 removed += 1
                 continue
             filtered.append((start, end))
@@ -1411,6 +1495,30 @@ class SubtitleGenerator:
         if SCENE_SPLIT_METHOD not in {"fixed", "none"}:
             self.log_callback(f"Unknown SCENE_SPLIT_METHOD={SCENE_SPLIT_METHOD!r}; using fixed chunks")
         return self.split_audio(audio_path, chunk_seconds)
+
+    @staticmethod
+    def reanchor_segment_times(segment) -> tuple[float, float, bool]:
+        """Chunk-relative (start, end, anchored?) for a decoded segment.
+
+        Prefers word-level times (DTW alignment) over the decoder's segment
+        times: on difficult audio (quiet lines, climax loops) the decoder often
+        stamps a line several seconds early, at the chunk start, while the word
+        timestamps stay anchored to the audio (debug session 2026-07-09).
+        Falls back to the segment times when words are missing or degenerate.
+        """
+        words = getattr(segment, "words", None) or []
+        times = [
+            (float(w.start), float(w.end))
+            for w in words
+            if w.start is not None and w.end is not None
+        ]
+        if not times:
+            return float(segment.start), float(segment.end), False
+        w_start = times[0][0]
+        w_end = times[-1][1]
+        if w_end - w_start < 0.05:
+            return float(segment.start), float(segment.end), False
+        return w_start, w_end, True
 
     @staticmethod
     def is_known_hallucination(
@@ -1442,40 +1550,41 @@ class SubtitleGenerator:
 
         return False
 
-    def postprocess_segments(self, raw_segments: list, scene_mode: bool = False) -> list:
+    def postprocess_segments(self, raw_segments: list, scene_mode: bool = False,
+                             removal_log: list | None = None) -> list:
         filtered = []
-        recent_texts = []
         removed_duplicates = 0
         removed_noise = 0
         removed_hallucinations = 0
         removed_low_confidence = 0
+        compressed_repetitions = 0
         total_end = max((item.get("end", 0.0) for item in raw_segments), default=0.0)
-        strong_dedupe_scene = scene_mode and self.model_preset == "large-v2"
-        duplicate_window = 16.0 if strong_dedupe_scene else (10.0 if scene_mode else DUPLICATE_LOOKBACK_SECONDS)
-        duplicate_history = 36 if strong_dedupe_scene else (24 if scene_mode else 12)
-        duplicate_threshold = 0.88 if strong_dedupe_scene else (0.91 if scene_mode else NEAR_DUPLICATE_RATIO)
+        duplicate_window = 10.0 if scene_mode else DUPLICATE_LOOKBACK_SECONDS
+        duplicate_threshold = 0.91 if scene_mode else NEAR_DUPLICATE_RATIO
+
+        def log_removal(reason: str, item: dict):
+            if removal_log is not None:
+                removal_log.append({"reason": reason, **item})
 
         def find_duplicate_index(item: dict, norm: str):
+            # Only a pair that covers the SAME audio can be a duplicated decode
+            # (padded short WhisperSeg chunks and auditok/fixed fallback chunks
+            # overlap their neighbours). Similar or identical text at disjoint
+            # times is real repeated dialogue and must be kept — the old
+            # window-based text matching silently deleted such lines.
             for index in range(len(filtered) - 1, -1, -1):
                 previous = filtered[index]
                 if item["start"] - previous["start"] > duplicate_window:
                     break
 
-                previous_norm = SubtitleGenerator.normalize_for_duplicate(previous["text"])
-                strength = SubtitleGenerator.duplicate_strength(norm, previous_norm)
                 time_overlap = min(item["end"], previous["end"]) - max(item["start"], previous["start"])
-                gap = max(item["start"] - previous["end"], previous["start"] - item["end"], 0.0)
-                start_distance = abs(item["start"] - previous["start"])
+                if time_overlap <= 0.15:
+                    continue
 
-                if norm == previous_norm and gap <= duplicate_window:
+                previous_norm = SubtitleGenerator.normalize_for_duplicate(previous["text"])
+                if norm == previous_norm:
                     return index
-                if (
-                    strength >= (0.76 if strong_dedupe_scene else 0.82)
-                    and (norm in previous_norm or previous_norm in norm)
-                    and start_distance <= (6.0 if strong_dedupe_scene else 4.0)
-                ):
-                    return index
-                if strength >= duplicate_threshold and (time_overlap > -0.2 or gap <= 1.5):
+                if SubtitleGenerator.duplicate_strength(norm, previous_norm) >= duplicate_threshold:
                     return index
 
             return None
@@ -1489,10 +1598,20 @@ class SubtitleGenerator:
 
             if not text or not HAS_LINGUISTIC_CONTENT_RE.search(text):
                 removed_noise += 1
+                log_removal("no_linguistic_content", item)
                 continue
             if SubtitleGenerator.is_repetition_noise(text):
-                removed_noise += 1
-                continue
+                compressed = SubtitleGenerator.compress_repetition_text(text)
+                if compressed != text and not SubtitleGenerator.is_repetition_noise(compressed):
+                    # Real repeated dialogue: keep it, compressed to a readable form.
+                    item["text"] = compressed
+                    text = compressed
+                    norm = SubtitleGenerator.normalize_for_duplicate(text)
+                    compressed_repetitions += 1
+                else:
+                    removed_noise += 1
+                    log_removal("repetition_noise", item)
+                    continue
             if SubtitleGenerator.is_known_hallucination(
                 text,
                 item["start"],
@@ -1502,6 +1621,7 @@ class SubtitleGenerator:
                 no_speech_prob=no_speech_prob,
             ):
                 removed_hallucinations += 1
+                log_removal("hallucination", item)
                 continue
             if (
                 no_speech_prob is not None
@@ -1510,6 +1630,7 @@ class SubtitleGenerator:
                 and avg_logprob < -1.35
             ):
                 removed_low_confidence += 1
+                log_removal("low_confidence", item)
                 continue
 
             if duration > 0:
@@ -1530,19 +1651,10 @@ class SubtitleGenerator:
                     )
                 )
                 if should_replace:
+                    log_removal("overlap_duplicate_replaced", previous)
                     filtered[duplicate_index] = item
-                removed_duplicates += 1
-                continue
-
-            is_recent_duplicate = any(
-                item["start"] - prev_start <= 4.0
-                and (
-                    norm == prev_norm
-                    or SubtitleGenerator.duplicate_strength(norm, prev_norm) >= 0.96
-                )
-                for prev_norm, prev_start in recent_texts[-duplicate_history:]
-            )
-            if is_recent_duplicate:
+                else:
+                    log_removal("overlap_duplicate", item)
                 removed_duplicates += 1
                 continue
 
@@ -1552,13 +1664,13 @@ class SubtitleGenerator:
                     item["end"] = item["start"] + SubtitleGenerator.subtitle_duration_for_text(text, 2.0)
 
             filtered.append(item)
-            recent_texts.append((norm, item["start"]))
 
         self.log_callback(
             "Postprocess removed "
             f"{removed_duplicates} duplicates, {removed_noise} noisy/repeated lines, "
             f"{removed_hallucinations} known hallucinations, "
-            f"{removed_low_confidence} low-confidence silence lines"
+            f"{removed_low_confidence} low-confidence silence lines; "
+            f"compressed {compressed_repetitions} repetition lines"
         )
         return filtered
 
@@ -1576,12 +1688,15 @@ class SubtitleGenerator:
         asr_options.update(WIDE_INTAKE_OVERRIDES)
         return asr_options
 
-    def transcribe_profile(self, audio_file: str, profile_name: str) -> list:
+    def transcribe_profile(self, audio_file: str, profile_name: str,
+                           removal_log: list | None = None) -> list:
         if profile_name not in PROFILE_CONFIGS:
             raise ValueError(f"Unknown ASR profile: {profile_name}")
 
         profile = PROFILE_CONFIGS[profile_name]
         raw_segments = []
+        self.last_chunks = []
+        reanchored_far = 0
         scene_mode = self.is_scene_split_enabled()
         asr_options = self.base_asr_options(scene_mode=scene_mode)
         asr_options.update(profile["options"])
@@ -1624,15 +1739,22 @@ class SubtitleGenerator:
                     if not clean_text:
                         continue
 
+                    rel_start, rel_end, anchored = self.reanchor_segment_times(segment)
+                    if anchored and abs(rel_start - float(segment.start)) > 0.5:
+                        reanchored_far += 1
                     raw_segments.append({
-                        "start": segment.start + offset,
-                        "end": segment.end + offset,
+                        "start": rel_start + offset,
+                        "end": rel_end + offset,
                         "text": clean_text,
                         "avg_logprob": getattr(segment, "avg_logprob", None),
                         "no_speech_prob": getattr(segment, "no_speech_prob", None),
                     })
         elif TRANSCRIBE_MODE == "chunked":
             chunks = self.split_audio_for_profile(audio_file, chunk_seconds, profile_name)
+            self.last_chunks = [
+                {"offset_sec": c["offset_sec"], "duration_sec": c["duration_sec"]}
+                for c in chunks
+            ]
             total_chunks = len(chunks)
             for chunk_index, chunk in enumerate(chunks, start=1):
                 offset = chunk["offset_sec"]
@@ -1662,12 +1784,13 @@ class SubtitleGenerator:
                     clean_text = self.clean_text(segment.text)
                     if not clean_text:
                         continue
-                    absolute_start = segment.start + offset
-                    absolute_end = segment.end + offset
+                    rel_start, rel_end, anchored = self.reanchor_segment_times(segment)
+                    if anchored and abs(rel_start - float(segment.start)) > 0.5:
+                        reanchored_far += 1
 
                     raw_segments.append({
-                        "start": absolute_start,
-                        "end": absolute_end,
+                        "start": rel_start + offset,
+                        "end": rel_end + offset,
                         "text": clean_text,
                         "avg_logprob": getattr(segment, "avg_logprob", None),
                         "no_speech_prob": getattr(segment, "no_speech_prob", None),
@@ -1701,16 +1824,23 @@ class SubtitleGenerator:
                 if not clean_text:
                     continue
 
+                rel_start, rel_end, anchored = self.reanchor_segment_times(segment)
+                if anchored and abs(rel_start - float(segment.start)) > 0.5:
+                    reanchored_far += 1
                 raw_segments.append({
-                    "start": segment.start,
-                    "end": segment.end,
+                    "start": rel_start,
+                    "end": rel_end,
                     "text": clean_text,
                     "avg_logprob": getattr(segment, "avg_logprob", None),
                     "no_speech_prob": getattr(segment, "no_speech_prob", None),
                 })
 
+        if reanchored_far:
+            self.log_callback(
+                f"Word-anchored timestamps moved {reanchored_far} segment(s) by more than 0.5s"
+            )
         self.last_raw_segments = sorted(raw_segments, key=lambda seg: (seg["start"], seg["end"]))
-        return self.postprocess_segments(raw_segments, scene_mode=scene_mode)
+        return self.postprocess_segments(raw_segments, scene_mode=scene_mode, removal_log=removal_log)
     @staticmethod
     def write_srt(segments: list, output_file: str):
         lines = []
@@ -1725,15 +1855,87 @@ class SubtitleGenerator:
         with open(output_file, "w", encoding="utf-8") as file:
             file.write("\n".join(lines))
 
-    def transcribe(self, audio_file: str, output_file: str):
+    def debug_base_path(self, output_file: str) -> str:
+        """foo.jp.srt / foo.srt -> <dir>/foo_debug/foo (folder is created)."""
+        path = Path(output_file)
+        name = path.name
+        if name.lower().endswith(".jp.srt"):
+            stem = name[:-7]
+        else:
+            stem = path.stem
+        debug_dir = path.parent / f"{stem}_debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        return str(debug_dir / stem)
+
+    def write_debug_files(self, output_file: str, removal_log: list):
+        """Debug files for auditing dropped speech (enabled by the GUI checkbox),
+        written into a per-video ``<stem>_debug`` folder next to the output SRT.
+
+        .raw.srt     decoder output before postprocess, with confidence values;
+        .vad.srt     each ASR chunk as one entry — shows exactly which time
+                     ranges the VAD sent to the decoder (a missing interval here
+                     means VAD miss; present here but absent in .raw.srt means
+                     the decoder produced nothing; present in .raw.srt but not
+                     in the final SRT means postprocess removed it);
+        .removed.srt lines postprocess removed, prefixed with the reason.
+        """
+        base = self.debug_base_path(output_file)
+
+        raw_entries = []
+        for item in self.last_raw_segments:
+            lp = item.get("avg_logprob")
+            ns = item.get("no_speech_prob")
+            lp_text = f"{lp:.2f}" if lp is not None else "n/a"
+            ns_text = f"{ns:.2f}" if ns is not None else "n/a"
+            raw_entries.append({
+                "start": item["start"],
+                "end": item["end"],
+                "text": f"{item['text']} {{lp={lp_text} ns={ns_text}}}",
+            })
+        self.write_srt(raw_entries, f"{base}.raw.srt")
+
+        chunk_entries = [
+            {
+                "start": chunk["offset_sec"],
+                "end": chunk["offset_sec"] + chunk["duration_sec"],
+                "text": f"chunk {index}/{len(self.last_chunks)} dur={chunk['duration_sec']:.2f}s",
+            }
+            for index, chunk in enumerate(self.last_chunks, start=1)
+        ]
+        self.write_srt(chunk_entries, f"{base}.vad.srt")
+
+        removed_entries = [
+            {
+                "start": item["start"],
+                "end": item["end"],
+                "text": f"[{item['reason']}] {item['text']}",
+            }
+            for item in sorted(removal_log, key=lambda it: (it["start"], it["end"]))
+        ]
+        self.write_srt(removed_entries, f"{base}.removed.srt")
+
+        self.log_callback(
+            f"Debug files saved to {os.path.dirname(base)}: "
+            f".raw.srt ({len(raw_entries)} raw), .vad.srt ({len(chunk_entries)} chunks), "
+            f".removed.srt ({len(removed_entries)} removed)"
+        )
+
+    def transcribe(self, audio_file: str, output_file: str, debug_files: bool = False):
         start_time = time.time()
-        
-        final_segments = self.transcribe_profile(audio_file, "stable")
+
+        removal_log: list | None = [] if debug_files else None
+        final_segments = self.transcribe_profile(audio_file, "stable", removal_log=removal_log)
 
         if not final_segments:
             self.log_callback(f"No speech detected in {audio_file}. Creating empty SRT.")
 
         self.write_srt(final_segments, output_file)
+
+        if debug_files:
+            try:
+                self.write_debug_files(output_file, removal_log or [])
+            except Exception as e:
+                self.log_callback(f"Failed to write debug files: {e}")
 
         elapsed = time.time() - start_time
         self.log_callback(f"Saved SRT: {output_file} | Time elapsed: {elapsed:.2f}s")
@@ -1742,7 +1944,7 @@ class SubtitleGenerator:
             os.remove(audio_file)
         except Exception as e:
             self.log_callback(f"Failed to delete temp audio file: {e}")
-            
+
         return output_file
 
 def extract_audio(video_path: str, audio_path: str, denoise_preset: str, log_callback, stop_event):
@@ -1771,6 +1973,29 @@ def extract_audio(video_path: str, audio_path: str, denoise_preset: str, log_cal
     except Exception as e:
         log_callback(f"Error extracting audio: {e}")
         return False
+
+def warn_noisy_high_sensitivity(denoise_preset: str, vad_sensitivity: str, log_callback):
+    """Warn when high/max VAD sensitivity runs without denoise.
+
+    The low gate lets background noise through to the decoder, and Whisper
+    hallucinates text on noise; the denoise preset raises the SNR of the ASR
+    feed (never the dubbing bed) and suppresses most of it.
+    """
+    if (denoise_preset or "none") != "none" or vad_sensitivity not in ("high", "max"):
+        return
+    try:
+        if app_config.get_language() == 'zh':
+            log_callback("[!] 提示：未开启降噪且人声检测敏感度为高/极高时，噪声容易进入识别并产生幻觉字幕，建议选择轻度降噪。")
+            return
+        if app_config.get_language() == 'ja':
+            log_callback("[!] ヒント：ノイズ除去なし＋音声検出感度が高/最高の場合、ノイズによる幻覚字幕が出やすくなります。軽度ノイズ除去を推奨します。")
+            return
+    except Exception:
+        pass
+    log_callback(
+        "[warn] denoise=none with high/max voice-detection sensitivity lets noise reach "
+        "the decoder and often produces hallucinated lines; consider the 'mild' denoise preset."
+    )
 
 # Module-level generator cache — we intentionally never destroy the WhisperModel
 # during the app's lifetime. CTranslate2's thread pool destructor is not safe to call
@@ -1802,9 +2027,10 @@ def _get_or_create_subtitle_generator(model_key: str, models_root: str, use_gpu:
         return None
 
 
-def batch_generate_srt(base_dir: str, search_subdirs: bool, skip_if_exists: bool, 
-                       denoise_preset: str, model_key: str, models_root: str, 
-                       use_gpu: bool, log_callback, stop_event=None, gen_holder=None):
+def batch_generate_srt(base_dir: str, search_subdirs: bool, skip_if_exists: bool,
+                       denoise_preset: str, model_key: str, models_root: str,
+                       use_gpu: bool, log_callback, stop_event=None, gen_holder=None,
+                       debug_files: bool = False, vad_sensitivity: str = "high"):
                        
     if not check_ffmpeg():
         log_callback("[!] Error: ffmpeg or ffprobe not found. Please refer to '说明.txt' or 'readme.txt' for installation steps.")
@@ -1840,6 +2066,8 @@ def batch_generate_srt(base_dir: str, search_subdirs: bool, skip_if_exists: bool
     generator = _get_or_create_subtitle_generator(model_key, models_root, use_gpu, log_callback)
     if generator is None:
         return False
+    generator.set_vad_sensitivity(vad_sensitivity)
+    warn_noisy_high_sensitivity(denoise_preset, vad_sensitivity, log_callback)
 
     total_tasks = len(tasks)
     for task_idx, filepath in enumerate(tasks, start=1):
@@ -1870,7 +2098,7 @@ def batch_generate_srt(base_dir: str, search_subdirs: bool, skip_if_exists: bool
 
         log_callback("Transcription started...")
         try:
-            generator.transcribe(str(audio_file), str(src_srt_file))
+            generator.transcribe(str(audio_file), str(src_srt_file), debug_files=debug_files)
             log_callback(f"[{task_idx}/{total_tasks}] Transcription complete.")
         except Exception as e:
             log_callback(f"Transcription failed: {e}")
@@ -1882,7 +2110,6 @@ def batch_generate_srt(base_dir: str, search_subdirs: bool, skip_if_exists: bool
 # ============================================================
 # Subtitle Translation Logic
 # ============================================================
-import random
 
 DEFAULT_TRANS_CONFIG = {
     "api_base_url": "https://api.deepseek.com/",
@@ -1893,12 +2120,35 @@ DEFAULT_TRANS_CONFIG = {
     "target_language": "Chinese",
     "keep_original": True,
     "adult_content": True,
-    "dubbing_optimized": False
+    "dubbing_optimized": False,
+    "source_correction": True
 }
 
 DEFAULT_PROMPT = """\
 Translate the following subtitles to {target_language}.
-Keep the XML tags <id>...</id> intact. Only translate the text content.
+The subtitles are numbered in playback order and form one continuous dialogue:
+always use the surrounding lines as context, and keep person names, forms of
+address, and tone consistent across the whole file. The source text is ASR
+output and may contain recognition errors — infer the intended meaning from
+context and translate that meaning.
+Keep the XML tags <id>...</id> intact and one-to-one. Only translate the text content.
+
+{subtitles}
+"""
+
+DEFAULT_CORRECT_PROMPT = """\
+The following subtitles are raw speech-recognition (ASR) output in {source_language},
+numbered in playback order. Correct recognition errors (homophones, wrong particles,
+wrong or inconsistent person names, garbled words) using the surrounding lines as
+context. Do NOT translate — output must stay in the same language as the input.
+If a line is already correct or unrecoverable, return it unchanged.
+If a line consists ONLY of non-lexical vocalizations or fillers (moans, sighs,
+laughter, hums — e.g. あ, ああー, ん, うん, 嗯, はぁ, ふふ, あはは), output its
+tag EMPTY like <id></id> to mark it for removal; keep meaningful short lines
+(はい, え?, だめ). Also output an EMPTY tag for hallucinated stock phrases that
+appear abruptly with no contextual support (ご視聴ありがとうございました,
+おやすみなさい, またお会いしましょう and similar closing/greeting lines).
+Keep the XML tags <id>...</id> intact and one-to-one; never leave an id out.
 
 {subtitles}
 """
@@ -1928,6 +2178,14 @@ def load_trans_config():
         try:
             with open(prompt_file, "w", encoding="utf-8") as f:
                 f.write(DEFAULT_PROMPT)
+        except:
+            pass
+
+    correct_prompt_file = os.path.join(config_dir, "asr_correct_prompt.txt")
+    if not os.path.exists(correct_prompt_file):
+        try:
+            with open(correct_prompt_file, "w", encoding="utf-8") as f:
+                f.write(DEFAULT_CORRECT_PROMPT)
         except:
             pass
 
@@ -2021,14 +2279,19 @@ def split_into_chunks(entries: dict, limit: int) -> list[dict]:
         chunks.append(current)
     return chunks
 
-def obfuscate_ids(chunk: dict) -> tuple[str, dict]:
-    n = len(chunk)
-    rand_ids = random.sample(range(1, max(n * 100, 200)), n)
+def sequential_ids(chunk: dict) -> tuple[str, dict]:
+    """Tag entries with sequential ids (1..n, playback order).
+
+    Sequential tags keep the "these lines are consecutive dialogue" signal for
+    the LLM; the previous randomized ids deliberately hid the ordering, which
+    encouraged line-by-line isolated translation. The tag -> original-id mapping
+    still shields the model from the real SRT numbering.
+    """
     mapping = {}
     lines = []
-    for rand_id, (orig_id, text) in zip(rand_ids, chunk.items()):
-        mapping[rand_id] = orig_id
-        lines.append(f"<{rand_id}>{text}</{rand_id}>")
+    for seq, (orig_id, text) in enumerate(chunk.items(), start=1):
+        mapping[seq] = orig_id
+        lines.append(f"<{seq}>{text}</{seq}>")
     return "\n".join(lines), mapping
 
 _TAG_PAIR = re.compile(r"<(\d+)>(.*?)</\d+>", re.DOTALL | re.MULTILINE)
@@ -2045,6 +2308,10 @@ def deobfuscate_ids(response: str, mapping: dict) -> dict:
             results[mapping[tag_id]] = text.strip()
     return results
 
+def _strip_adult_background(template: str) -> str:
+    # Remove Content Background section up to "--------" separator
+    return re.sub(r'Content Background:.*?(?=-{5,})', '', template, flags=re.DOTALL)
+
 def _load_prompt_template(adult_content: bool = True, dubbing_optimized: bool = False) -> str:
     prompt_name = "translate_prompt_dubbing.txt" if dubbing_optimized else "translate_prompt.txt"
     prompt_file = os.path.join(get_config_dir(), prompt_name)
@@ -2052,61 +2319,94 @@ def _load_prompt_template(adult_content: bool = True, dubbing_optimized: bool = 
     if os.path.isfile(prompt_file):
         with open(prompt_file, encoding="utf-8-sig") as f:
             template = f.read()
-            
+
     if not adult_content:
-        # Remove Content Background section up to "--------" separator
-        template = re.sub(r'Content Background:.*?(?=-{5,})', '', template, flags=re.DOTALL)
-        
+        template = _strip_adult_background(template)
+
     return template
 
-def _build_prompt(tagged_text: str, lang: str, template: str) -> str:
-    return template.replace("{subtitles}", tagged_text.strip()).replace("{target_language}", lang)
+def _load_correct_prompt_template(adult_content: bool = True) -> str:
+    prompt_file = os.path.join(get_config_dir(), "asr_correct_prompt.txt")
+    template = DEFAULT_CORRECT_PROMPT
+    if os.path.isfile(prompt_file):
+        with open(prompt_file, encoding="utf-8-sig") as f:
+            template = f.read()
 
-def _translate_chunk(client: LLMClient, chunk: dict, lang: str, template: str, max_retries: int, log_callback, stop_event) -> dict:
-    tagged, mapping = obfuscate_ids(chunk)
-    translated = {}
+    if not adult_content:
+        template = _strip_adult_background(template)
+
+    return template
+
+def _build_prompt(tagged_text: str, template: str, placeholders: dict) -> str:
+    prompt = template.replace("{subtitles}", tagged_text.strip())
+    for key, value in placeholders.items():
+        prompt = prompt.replace("{" + key + "}", value)
+    return prompt
+
+def _with_context(missing_ids: list, pool: dict, before: int = 2, after: int = 1) -> dict:
+    """Missing entries plus their neighbours from ``pool``, in playback order.
+
+    Retried lines used to be re-sent alone, i.e. translated with zero context;
+    surrounding lines give the model something to anchor on.
+    """
+    order = list(pool)
+    index = {sid: i for i, sid in enumerate(order)}
+    keep = set()
+    for sid in missing_ids:
+        i = index.get(sid)
+        if i is None:
+            continue
+        keep.update(order[max(0, i - before): i + after + 1])
+    return {sid: pool[sid] for sid in order if sid in keep}
+
+def _llm_chunk_pass(client: LLMClient, chunk: dict, template: str, placeholders: dict,
+                    max_retries: int, log_callback, stop_event) -> dict:
+    tagged, mapping = sequential_ids(chunk)
+    results = {}
 
     for attempt in range(1, max_retries + 1):
         if stop_event and stop_event.is_set():
             break
         try:
-            prompt = _build_prompt(tagged, lang, template)
+            prompt = _build_prompt(tagged, template, placeholders)
             response = client.complete(prompt)
-            translated = deobfuscate_ids(response, mapping)
+            # Accumulate across attempts: a retry response only contains the
+            # re-sent lines and must not wipe earlier successful ones.
+            results.update(deobfuscate_ids(response, mapping))
         except Exception as exc:
-            log_callback(f"  [WARN] Chunk translation error (attempt {attempt}): {exc}")
+            log_callback(f"  [WARN] Chunk LLM error (attempt {attempt}): {exc}")
             if attempt == max_retries:
                 break
             continue
 
-        missing_ids = [oid for oid in chunk if oid not in translated]
+        missing_ids = [oid for oid in chunk if oid not in results]
         if not missing_ids:
             break
         if attempt < max_retries:
-            log_callback(f"  [INFO] {len(missing_ids)} entries missing, retrying...")
-            missing_chunk = {oid: chunk[oid] for oid in missing_ids}
-            tagged, mapping = obfuscate_ids(missing_chunk)
+            log_callback(f"  [INFO] {len(missing_ids)} entries missing, retrying with context...")
+            retry_chunk = _with_context(missing_ids, chunk)
+            tagged, mapping = sequential_ids(retry_chunk)
         else:
             log_callback(f"  [WARN] Still missing {len(missing_ids)} entries after {max_retries} attempts.")
 
-    return translated
+    return results
 
-def translate_entries(client: LLMClient, entries: dict, lang: str,
-                      tokens_per_chunk: int, keep_original: bool, adult_content: bool,
-                      dubbing_optimized: bool, max_retries: int, log_callback, stop_event) -> dict:
-    template = _load_prompt_template(adult_content, dubbing_optimized)
+def _run_entries_llm(client: LLMClient, entries: dict, template: str, placeholders: dict,
+                     tokens_per_chunk: int, max_retries: int, log_callback, stop_event,
+                     label: str = "Translating") -> dict:
+    """Run one LLM pass over all entries, returning {sid: response_text}."""
     chunks = split_into_chunks(entries, tokens_per_chunk)
     log_callback(f"[INFO] Total chunks: {len(chunks)}")
 
-    all_translated = {}
+    all_results = {}
 
     for idx, chunk in enumerate(chunks):
         if stop_event and stop_event.is_set():
-            log_callback("Translation stopped by user.")
+            log_callback(f"{label} stopped by user.")
             break
-            
-        log_callback(f"[INFO] Translating chunk {idx + 1}/{len(chunks)} ({len(chunk)} entries)...")
-        result = _translate_chunk(client, chunk, lang, template, max_retries, log_callback, stop_event)
+
+        log_callback(f"[INFO] {label} chunk {idx + 1}/{len(chunks)} ({len(chunk)} entries)...")
+        result = _llm_chunk_pass(client, chunk, template, placeholders, max_retries, log_callback, stop_event)
 
         if not result and len(chunk) > 1:
             mid = len(chunk) // 2
@@ -2115,17 +2415,147 @@ def translate_entries(client: LLMClient, entries: dict, lang: str,
                 if stop_event and stop_event.is_set():
                     break
                 log_callback(f"  [INFO] Retrying {half_label} half ({len(half)} entries)...")
-                half_result = _translate_chunk(client, half, lang, template, max_retries, log_callback, stop_event)
-                all_translated.update(half_result)
+                half_result = _llm_chunk_pass(client, half, template, placeholders, max_retries, log_callback, stop_event)
+                all_results.update(half_result)
         else:
-            all_translated.update(result)
+            all_results.update(result)
+
+    return all_results
+
+_KANA_RE = re.compile(r"[ぁ-ゟ゠-ヿ]")
+
+def _target_expects_kana(lang: str) -> bool:
+    return (lang or "").strip().lower() in ("japanese", "ja", "jp", "日本語", "日语", "日文")
+
+def translate_entries(client: LLMClient, entries: dict, lang: str,
+                      tokens_per_chunk: int, keep_original: bool, adult_content: bool,
+                      dubbing_optimized: bool, max_retries: int, log_callback, stop_event) -> dict:
+    template = _load_prompt_template(adult_content, dubbing_optimized)
+    all_translated = _run_entries_llm(
+        client, entries, template, {"target_language": lang},
+        tokens_per_chunk, max_retries, log_callback, stop_event,
+        label="Translating",
+    )
+
+    # Kana-leak backstop: on garbled ASR fragments the model tends to echo the
+    # Japanese source (or half-translate it) instead of answering empty. Retry
+    # those lines once with context; drop the translation if kana remains, so a
+    # bilingual SRT shows only the original and the dub skips the line.
+    if not _target_expects_kana(lang) and not (stop_event and stop_event.is_set()):
+        leaked = sorted(sid for sid, text in all_translated.items() if _KANA_RE.search(text))
+        if leaked:
+            log_callback(f"[WARN] {len(leaked)} translations still contain source kana; retrying with context...")
+            pool = {sid: info["text"] for sid, info in entries.items()}
+            retry_chunk = _with_context(leaked, pool)
+            retry_result = _llm_chunk_pass(
+                client, retry_chunk, template, {"target_language": lang},
+                1, log_callback, stop_event,
+            )
+            dropped = 0
+            for sid in leaked:
+                new_text = (retry_result.get(sid) or "").strip()
+                if new_text and not _KANA_RE.search(new_text):
+                    all_translated[sid] = new_text
+                else:
+                    all_translated.pop(sid, None)
+                    dropped += 1
+            if dropped:
+                log_callback(f"[WARN] Dropped {dropped} untranslatable (garbled) lines after retry.")
 
     for sid, trans_text in all_translated.items():
         if sid in entries:
             orig = entries[sid]["text"]
             entries[sid]["text"] = f"{trans_text}\n{orig}" if keep_original else trans_text
+            # Consumers that need "was this line actually translated?" (the
+            # dub must not speak source text left behind by a dropped/missing
+            # translation) check this flag instead of the text itself.
+            entries[sid]["translated"] = True
 
     return entries
+
+# Deletion safety gate: the model may answer an empty tag to mean "drop this
+# line", but we only honour that when the source line itself looks droppable —
+# a pure interjection (short, no real words) or a known ASR stock-phrase
+# hallucination. A lazy empty answer can never wipe a real sentence.
+_INTERJECTION_MAX_NORM_CHARS = 10
+_INTERJECTION_HANZI = "啊哈嗯哦呃唔呀噢喔嘿呜哎唉咦哇"
+_CJK_IDEOGRAPH_RE = re.compile(r"[一-鿿]")
+
+_STOCK_HALLUCINATION_EXTRA = {
+    "おやすみなさい",
+    "またお会いしましょう",
+    "また見てね",
+    "さようなら",
+    "お疲れ様でした",
+    "ご視聴してくださって本当にありがとうございます",
+    "Thank you so much for watching until the end",
+    "Thank you for watching",
+}
+_STOCK_PHRASE_NORMS = (
+    HARD_HALLUCINATION_NORMS
+    | SHORT_HALLUCINATION_NORMS
+    | {re.sub(r"[、。！？!?….\s]+", "", p).lower() for p in _STOCK_HALLUCINATION_EXTRA}
+)
+
+def _deletable_interjection(text: str) -> bool:
+    norm = SubtitleGenerator.normalize_for_duplicate(text)
+    if not norm or len(norm) > _INTERJECTION_MAX_NORM_CHARS:
+        return False
+    remainder = re.sub(f"[{_INTERJECTION_HANZI}]", "", text)
+    return not _CJK_IDEOGRAPH_RE.search(remainder)
+
+def _deletable_line(text: str) -> bool:
+    if _deletable_interjection(text):
+        return True
+    norm = SubtitleGenerator.normalize_for_duplicate(text)
+    for phrase in _STOCK_PHRASE_NORMS:
+        if phrase and (norm == phrase or (phrase in norm and len(norm) <= len(phrase) + 6)):
+            return True
+    return False
+
+def correct_entries(client: LLMClient, entries: dict, source_language: str,
+                    tokens_per_chunk: int, adult_content: bool, max_retries: int,
+                    log_callback, stop_event) -> tuple[int, set]:
+    """LLM proofread pass over ASR source text before translation.
+
+    Fixes recognition errors (homophones, wrong names/particles) using the
+    surrounding lines as context, in the source language. Mutates each entry's
+    ``text`` in place. An empty model answer marks a line for deletion (pure
+    interjections/moans, or out-of-place ASR stock-phrase hallucinations); it
+    is honoured only when the source line itself looks droppable (see
+    :func:`_deletable_line`), and the entry is then removed from ``entries``.
+
+    Returns ``(changed_count, deleted_ids)``.
+    """
+    template = _load_correct_prompt_template(adult_content)
+    total = len(entries)
+    results = _run_entries_llm(
+        client, entries, template,
+        {"source_language": source_language or "Japanese"},
+        tokens_per_chunk, max_retries, log_callback, stop_event,
+        label="Proofreading source",
+    )
+
+    changed = 0
+    deleted: set = set()
+    for sid, text in results.items():
+        if sid not in entries:
+            continue
+        old_text = entries[sid]["text"].strip()
+        new_text = text.strip()
+        if not new_text:
+            if _deletable_line(old_text):
+                del entries[sid]
+                deleted.add(sid)
+            continue
+        if new_text != old_text:
+            entries[sid]["text"] = new_text
+            changed += 1
+    log_callback(
+        f"[INFO] Source proofread changed {changed}/{total} lines, "
+        f"removed {len(deleted)} interjection-only lines"
+    )
+    return changed, deleted
 
 
 def _translate_srt_path(src_path: Path, out_path: Path, client: LLMClient, config: dict, log_callback, stop_event=None) -> bool:
@@ -2134,6 +2564,7 @@ def _translate_srt_path(src_path: Path, out_path: Path, client: LLMClient, confi
     keep_original = config.get("keep_original", True)
     adult_content = config.get("adult_content", True)
     dubbing_optimized = config.get("dubbing_optimized", False)
+    source_correction = config.get("source_correction", False)
     max_retries = int(config.get("max_retries", 3))
 
     log_callback(f"[INFO] Translating: {src_path.name}")
@@ -2142,6 +2573,22 @@ def _translate_srt_path(src_path: Path, out_path: Path, client: LLMClient, confi
             srt_data = f.read()
 
         entries = parse_srt(srt_data)
+
+        if source_correction:
+            log_callback("[INFO] AI source proofread started...")
+            correct_entries(
+                client,
+                entries,
+                "Japanese",
+                tokens_per_chunk,
+                adult_content,
+                max_retries,
+                log_callback,
+                stop_event,
+            )
+            if stop_event and stop_event.is_set():
+                return False
+
         entries = translate_entries(
             client,
             entries,
@@ -2235,7 +2682,8 @@ def _collect_listen_translate_videos(base_dir: str, search_subdirs: bool, log_ca
 def batch_listen_translate_srt(base_dir: str, search_subdirs: bool, skip_if_translated: bool,
                                keep_jp_srt: bool, denoise_preset: str, model_key: str,
                                models_root: str, use_gpu: bool, api_key: str, config: dict,
-                               log_callback, stop_event=None, gen_holder=None):
+                               log_callback, stop_event=None, gen_holder=None,
+                               vad_sensitivity: str = "high"):
     if not os.path.exists(base_dir):
         log_callback(f"Error: Directory not found: {base_dir}")
         return False
@@ -2270,6 +2718,8 @@ def batch_listen_translate_srt(base_dir: str, search_subdirs: bool, skip_if_tran
         generator = _get_or_create_subtitle_generator(model_key, models_root, use_gpu, log_callback)
         if generator is None:
             return False
+        generator.set_vad_sensitivity(vad_sensitivity)
+        warn_noisy_high_sensitivity(denoise_preset, vad_sensitivity, log_callback)
 
     client = LLMClient(config["api_base_url"], api_key, config["model_name"], config.get("temperature", 0.5))
     total_tasks = len(pending)
@@ -2417,8 +2867,9 @@ def batch_convert_srt_to_ass(base_dir: str, alignment: int, base_cn_size: int, b
     pattern = "**/*.srt" if search_subdirs else "*.srt"
     srt_files = list(base_path.glob(pattern))
     
-    # Filter out .jp.srt files
-    srt_files = [f for f in srt_files if not f.name.lower().endswith(".jp.srt")]
+    # Filter out .jp.srt and transcription debug files
+    _excluded_suffixes = (".jp.srt", ".raw.srt", ".vad.srt", ".removed.srt")
+    srt_files = [f for f in srt_files if not f.name.lower().endswith(_excluded_suffixes)]
     
     if not srt_files:
         log_callback("[INFO] No valid .srt files found.")
