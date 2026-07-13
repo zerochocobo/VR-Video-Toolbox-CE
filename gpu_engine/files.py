@@ -383,6 +383,29 @@ class _EncodeSink:
         self.pending.clear()
 
 
+def _memory_bounded_decoder_kwargs() -> dict:
+    """Use a bounded NVDEC queue for memory-heavy decode/encode replacement.
+
+    The generic serial decoder defaults to a 32-frame device queue for maximum
+    throughput.  An 8K P016 frame is roughly 96 MiB before pitch/alignment, so
+    that queue alone can consume several GiB. Paste and GPU timeline replacement
+    are limited by patching/NVENC rather than NVDEC, therefore a smaller queue
+    preserves useful prefetching while substantially lowering the peak.
+
+    The existing config key keeps its name for backward compatibility with
+    manually configured installations.
+    """
+    try:
+        buffer_size = int(_cfg("gpu_paste_decoder_buffer_size", 8) or 8)
+    except (TypeError, ValueError):
+        buffer_size = 8
+    buffer_size = max(2, buffer_size)
+    return {
+        "batch_size": min(8, buffer_size),
+        "buffer_size": buffer_size,
+    }
+
+
 def process_video(
     src: str | Path,
     dst: str | Path,
@@ -781,8 +804,9 @@ def combine_video(
     src_a = Path(src_a); src_b = Path(src_b); dst = Path(dst)
     meta = probe.probe_video(src_a)
     bd = 10 if meta.bit_depth > 8 else 8
-    da = PyNvThreadedSerialDecoder(src_a, bit_depth=bd)
-    db = PyNvThreadedSerialDecoder(src_b, bit_depth=bd)
+    decoder_kwargs = _memory_bounded_decoder_kwargs()
+    da = PyNvThreadedSerialDecoder(src_a, bit_depth=bd, **decoder_kwargs)
+    db = PyNvThreadedSerialDecoder(src_b, bit_depth=bd, **decoder_kwargs)
     ia, ib = da.info, db.info
     if mode == "left_right":
         out_w, out_h = ia.width + ib.width, max(ia.height, ib.height)
@@ -797,6 +821,11 @@ def combine_video(
     enc = PyNvEncoderSession(out_w, out_h, bit_depth=bd, codec="hevc",
                              **enc_kwargs)
     raw = _media_temp_path(dst, "raw")
+    if log_callback:
+        log_callback(
+            f"[gpu-memory] combine decoder queue: "
+            f"batch={decoder_kwargs['batch_size']}, buffer={decoder_kwargs['buffer_size']} frames"
+        )
 
     def _maybe_defish(y, uv):
         if not from_fisheye:
@@ -897,7 +926,13 @@ def paste_segments_gpu(
         raise RuntimeError(f"base video is not GPU-paste eligible: {decision.reason}")
     bd = 10 if meta.bit_depth > 8 else 8
     frame_start_hint = max(0, int(start_frame or 0))
-    base_dec = PyNvThreadedSerialDecoder(base_src, bit_depth=bd, start_frame=frame_start_hint)
+    decoder_kwargs = _memory_bounded_decoder_kwargs()
+    base_dec = PyNvThreadedSerialDecoder(
+        base_src,
+        bit_depth=bd,
+        start_frame=frame_start_hint,
+        **decoder_kwargs,
+    )
     info = base_dec.info
     fps = meta.source_fps or info.fps or 30.0
     total = len(base_dec)
@@ -913,7 +948,12 @@ def paste_segments_gpu(
         seg_meta = restored_sidecar.metadata_from_sidecar(seg.path) or probe.probe_video(seg.path)
         seg_bd = 10 if seg_meta.bit_depth > 8 else 8
         seg_start_frame = max(0, int(at_frame) - int(seg.base_frame_start))
-        dec = PyNvThreadedSerialDecoder(seg.path, bit_depth=seg_bd, start_frame=seg_start_frame)
+        dec = PyNvThreadedSerialDecoder(
+            seg.path,
+            bit_depth=seg_bd,
+            start_frame=seg_start_frame,
+            **decoder_kwargs,
+        )
         if int(seg.x) < 0 or int(seg.y) < 0 or int(seg.x + seg.w) > info.width or int(seg.y + seg.h) > info.height:
             dec.stop()
             raise ValueError(f"segment {seg.seg_id} rect out of bounds: {(seg.x, seg.y, seg.w, seg.h)} for {info.width}x{info.height}")
@@ -939,6 +979,11 @@ def paste_segments_gpu(
         **enc_kwargs,
     )
     raw = _media_temp_path(dst, "paste")
+    if log_callback:
+        log_callback(
+            f"[gpu-memory] paste decoder queue: "
+            f"batch={decoder_kwargs['batch_size']}, buffer={decoder_kwargs['buffer_size']} frames"
+        )
 
     next_idx = 0
     active: list[dict] = []
@@ -1105,7 +1150,8 @@ def paste_fisheye_eye_rects_to_sbs_gpu(
     if not decision.is_gpu:
         raise RuntimeError(f"base video is not GPU fisheye-paste eligible: {decision.reason}")
     bd = 10 if meta.bit_depth > 8 else 8
-    base_dec = PyNvThreadedSerialDecoder(base_src, bit_depth=bd)
+    decoder_kwargs = _memory_bounded_decoder_kwargs()
+    base_dec = PyNvThreadedSerialDecoder(base_src, bit_depth=bd, **decoder_kwargs)
     info = base_dec.info
     if int(info.width) % 4 or int(info.height) % 2:
         base_dec.stop()
@@ -1141,7 +1187,7 @@ def paste_fisheye_eye_rects_to_sbs_gpu(
             temp_inputs.append(temp_path)
         seg_meta = restored_sidecar.metadata_from_sidecar(seg.path) or probe.probe_video(decoder_path)
         seg_bd = 10 if seg_meta.bit_depth > 8 else 8
-        dec = PyNvThreadedSerialDecoder(decoder_path, bit_depth=seg_bd)
+        dec = PyNvThreadedSerialDecoder(decoder_path, bit_depth=seg_bd, **decoder_kwargs)
         sx = int(seg.x)
         sy = int(seg.y)
         sw = int(seg.w)
@@ -1191,6 +1237,11 @@ def paste_fisheye_eye_rects_to_sbs_gpu(
         **enc_kwargs,
     )
     raw = _media_temp_path(dst, "fishpatch")
+    if log_callback:
+        log_callback(
+            f"[gpu-memory] fisheye paste decoder queue: "
+            f"batch={decoder_kwargs['batch_size']}, buffer={decoder_kwargs['buffer_size']} frames"
+        )
 
     def _paste_into_eye(state, dst_y, dst_uv, frame_idx: int) -> bool:
         seg = state["seg"]
@@ -1411,7 +1462,8 @@ def replace_timeline_segments_gpu(
     if not decision.is_gpu:
         raise RuntimeError(f"source video is not GPU timeline eligible: {decision.reason}")
     bd = 10 if meta.bit_depth > 8 else 8
-    src_dec = PyNvThreadedSerialDecoder(source_src, bit_depth=bd)
+    decoder_kwargs = _memory_bounded_decoder_kwargs()
+    src_dec = PyNvThreadedSerialDecoder(source_src, bit_depth=bd, **decoder_kwargs)
     info = src_dec.info
     fps = meta.source_fps or info.fps or 30.0
     total = len(src_dec)
@@ -1453,6 +1505,11 @@ def replace_timeline_segments_gpu(
         **enc_kwargs,
     )
     raw = _media_temp_path(dst, "timeline")
+    if log_callback:
+        log_callback(
+            f"[gpu-memory] timeline merge decoder queue: "
+            f"batch={decoder_kwargs['batch_size']}, buffer={decoder_kwargs['buffer_size']} frames"
+        )
 
     def _open_state(item):
         seg_meta = restored_sidecar.metadata_from_sidecar(item["path"])
@@ -1461,7 +1518,7 @@ def replace_timeline_segments_gpu(
             if not seg_decision.is_gpu:
                 raise RuntimeError(f"restored segment is not GPU timeline eligible: {seg_decision.reason}")
         seg_bd = 10 if seg_meta.bit_depth > 8 else 8
-        dec = PyNvThreadedSerialDecoder(item["path"], bit_depth=seg_bd)
+        dec = PyNvThreadedSerialDecoder(item["path"], bit_depth=seg_bd, **decoder_kwargs)
         seg_info = dec.info
         if int(seg_info.width) != int(info.width) or int(seg_info.height) != int(info.height):
             dec.stop()
@@ -1608,7 +1665,13 @@ def extract_clip(
     bd = 10 if meta.bit_depth > 8 else 8
     fps = meta.source_fps or 30.0
     start_idx = int(round(start_sec * fps)) if start_sec else 0
-    dec = PyNvThreadedSerialDecoder(src, bit_depth=bd, start_frame=start_idx)
+    decoder_kwargs = _memory_bounded_decoder_kwargs()
+    dec = PyNvThreadedSerialDecoder(
+        src,
+        bit_depth=bd,
+        start_frame=start_idx,
+        **decoder_kwargs,
+    )
     info = dec.info
     fps = meta.source_fps or info.fps or 30.0
     end_idx = int(round(end_sec * fps)) if end_sec else len(dec)
@@ -1637,6 +1700,11 @@ def extract_clip(
     enc = PyNvEncoderSession(out_w, out_h, bit_depth=bd, codec="hevc",
                              **enc_kwargs)
     raw = _media_temp_path(dst, "raw")
+    if log_callback:
+        log_callback(
+            f"[gpu-memory] extract decoder queue: "
+            f"batch={decoder_kwargs['batch_size']}, buffer={decoder_kwargs['buffer_size']} frames"
+        )
     cancelled = False
     written = 0
     prog = _Progress(end_idx - start_idx, log_callback)
@@ -1713,7 +1781,13 @@ def extract_transformed_rect_clip(
     bd = 10 if meta.bit_depth > 8 else 8
     fps = meta.source_fps or 30.0
     start_idx = int(round(start_sec * fps)) if start_sec else 0
-    dec = PyNvThreadedSerialDecoder(src, bit_depth=bd, start_frame=start_idx)
+    decoder_kwargs = _memory_bounded_decoder_kwargs()
+    dec = PyNvThreadedSerialDecoder(
+        src,
+        bit_depth=bd,
+        start_frame=start_idx,
+        **decoder_kwargs,
+    )
     info = dec.info
     fps = meta.source_fps or info.fps or 30.0
     end_idx = int(round(end_sec * fps)) if end_sec else len(dec)
@@ -1750,6 +1824,11 @@ def extract_transformed_rect_clip(
     enc = PyNvEncoderSession(rw, rh, bit_depth=bd, codec="hevc",
                              **enc_kwargs)
     raw = _media_temp_path(dst, "raw")
+    if log_callback:
+        log_callback(
+            f"[gpu-memory] transformed extract decoder queue: "
+            f"batch={decoder_kwargs['batch_size']}, buffer={decoder_kwargs['buffer_size']} frames"
+        )
     cancelled = False
     written = 0
     prog = _Progress(end_idx - start_idx, log_callback)
@@ -1828,7 +1907,13 @@ def extract_multi_rect_clip(
     bd = 10 if meta.bit_depth > 8 else 8
     fps = meta.source_fps or 30.0
     start_idx = int(round(start_sec * fps)) if start_sec else 0
-    dec = PyNvThreadedSerialDecoder(src, bit_depth=bd, start_frame=start_idx)
+    decoder_kwargs = _memory_bounded_decoder_kwargs()
+    dec = PyNvThreadedSerialDecoder(
+        src,
+        bit_depth=bd,
+        start_frame=start_idx,
+        **decoder_kwargs,
+    )
     states: list[dict] = []
     raws_to_cleanup: list[Path] = []
     dsts_to_cleanup: list[Path] = []
@@ -1905,6 +1990,10 @@ def extract_multi_rect_clip(
             log_callback(
                 f"[gpu] extract multi-rect group: src={src}, tasks={len(states)}, "
                 f"sec={start_sec}-{end_sec}, frames={start_idx}-{end_idx}, to_fisheye={to_fisheye}"
+            )
+            log_callback(
+                f"[gpu-memory] multi-rect extract decoder queue: "
+                f"batch={decoder_kwargs['batch_size']}, buffer={decoder_kwargs['buffer_size']} frames"
             )
 
         cancelled = False

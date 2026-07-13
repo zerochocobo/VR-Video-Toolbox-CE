@@ -38,7 +38,7 @@ import subprocess
 from tkinter import filedialog
 from tkinter import messagebox
 
-ver_name = "v1.5 (build 2026-07-11)"
+ver_name = "v1.5 Patch.1 (build 2026-07-13)"
 DLNA_SERVER_EXE_NAME = "vr_dlna_server.exe"
 TWO_DVR_DOWNLOAD_URL = "https://wapok.com"
 

@@ -518,7 +518,6 @@ def run_process(cmd, log_callback, process_callback=None):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         universal_newlines=True,
-        encoding='utf-8',
         errors='replace',
         startupinfo=get_startupinfo(),
     )
@@ -892,13 +891,74 @@ def _release_pre_extract_detector_if_needed(pre_extract_enabled, log_callback=No
     try:
         from utils.mosaic_prescan import release_detector
 
+        _log_gpu_memory_stage("before detector release", log_callback)
         release_detector(log_callback=log_callback)
+        _log_gpu_memory_stage("after detector release", log_callback)
     except Exception:
         pass
 
 
+def _loaded_gpu_cache_summary() -> str:
+    """Describe already-loaded allocator caches without importing GPU modules."""
+    parts = []
+    torch_mod = sys.modules.get("torch")
+    if torch_mod is not None:
+        try:
+            cuda = getattr(torch_mod, "cuda", None)
+            if cuda is not None and cuda.is_initialized():
+                parts.append(
+                    f"torch={int(cuda.memory_allocated()) // (1 << 20)}/"
+                    f"{int(cuda.memory_reserved()) // (1 << 20)}MiB allocated/reserved"
+                )
+        except Exception:
+            pass
+    cupy_mod = sys.modules.get("cupy")
+    if cupy_mod is not None:
+        try:
+            pool = cupy_mod.get_default_memory_pool()
+            parts.append(
+                f"cupy={int(pool.used_bytes()) // (1 << 20)}/"
+                f"{int(pool.total_bytes()) // (1 << 20)}MiB used/pooled"
+            )
+        except Exception:
+            pass
+    return ", ".join(parts) if parts else "no loaded allocator stats"
+
+
+def _log_gpu_memory_stage(stage: str, log_callback=None) -> None:
+    if log_callback:
+        log_callback(f"[gpu-memory] stage={stage}: {_loaded_gpu_cache_summary()}")
+
+
+def _cleanup_gpu_after_split(log_callback=None) -> None:
+    """Reclaim objects that become unreachable only after a GPU split returns."""
+    _log_gpu_memory_stage("post-split before cleanup", log_callback)
+    try:
+        import gc
+
+        gc.collect()
+    except Exception:
+        pass
+    runtime_mod = sys.modules.get("gpu_engine.runtime")
+    if runtime_mod is not None:
+        try:
+            runtime_mod.free_memory_pool()
+        except Exception:
+            pass
+    torch_mod = sys.modules.get("torch")
+    if torch_mod is not None:
+        try:
+            cuda = getattr(torch_mod, "cuda", None)
+            if cuda is not None and cuda.is_initialized():
+                cuda.empty_cache()
+        except Exception:
+            pass
+    _log_gpu_memory_stage("post-split after cleanup", log_callback)
+
+
 def _release_gpu_models_before_paste(log_callback=None) -> None:
     """Free model VRAM before 8K GPU paste opens NVDEC/NVENC surfaces."""
+    _log_gpu_memory_stage("before paste/merge cleanup", log_callback)
     _release_pre_extract_detector_if_needed(True, log_callback=log_callback)
     try:
         if engine_runner.is_native_engine():
@@ -914,13 +974,15 @@ def _release_gpu_models_before_paste(log_callback=None) -> None:
         runtime.free_memory_pool()
     except Exception:
         pass
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
+    torch_mod = sys.modules.get("torch")
+    if torch_mod is not None:
+        try:
+            cuda = getattr(torch_mod, "cuda", None)
+            if cuda is not None and cuda.is_initialized():
+                cuda.empty_cache()
+        except Exception:
+            pass
+    _log_gpu_memory_stage("after paste/merge cleanup", log_callback)
 
 
 def _run_pre_extract_branch(base_path, restored_path, keep_intermediate=False,
@@ -967,6 +1029,10 @@ def _run_pre_extract_branch(base_path, restored_path, keep_intermediate=False,
         if log_callback:
             log_callback(f"[pre-extract] scan failed: {type(exc).__name__}: {exc}")
         return PreExtractResult.SCAN_FAILED
+    finally:
+        # scan_segments is synchronous.  Once it returns (or fails), no worker
+        # retains the detector, while all returned segment data is CPU-only.
+        _release_pre_extract_detector_if_needed(True, log_callback=log_callback)
     if not segments:
         save_segments_json([], segments_json, source=base_path)
         if log_callback:
@@ -1525,6 +1591,10 @@ def _process_sbs_paired_pre_extract_clip(base_clip, output_file, *, use_fisheye:
         if log_callback:
             log_callback(f"[source-scan] paired fine scan failed: {type(exc).__name__}: {exc}")
         return PreExtractResult.SCAN_FAILED
+    finally:
+        # Both eyes are scanned synchronously above.  Release YOLO before GPU
+        # extract and restoration start so their peak does not overlap.
+        _release_pre_extract_detector_if_needed(True, log_callback=log_callback)
 
     meta = gpu_probe.probe_video(base_clip)
     fps = meta.source_fps or 30.0
@@ -1998,6 +2068,10 @@ def _process_sbs_clip_to_output(input_file, output_file, *, use_fisheye: bool,
     file_l_fish_restored = os.path.join(directory, f"{stem}_L_fisheye.restored.mp4")
     file_r_fish_restored = os.path.join(directory, f"{stem}_R_fisheye.restored.mp4")
     pre_extract_enabled = _pre_extract_supported(pre_extract_inner, log_callback)
+    # This path may be entered after the coarse source scan without a paired
+    # fine scan.  Its interval data is CPU-only, so the detector is no longer
+    # needed before split and restoration.
+    _release_pre_extract_detector_if_needed(True, log_callback=log_callback)
     eye_intermediate_bitrate = None
     try:
         from gpu_engine import probe as gpu_probe
@@ -2026,6 +2100,7 @@ def _process_sbs_clip_to_output(input_file, output_file, *, use_fisheye: bool,
             start_time, end_time, log_callback, process_callback,
             keep_audio=split_keep_audio,
         )
+        _cleanup_gpu_after_split(log_callback=log_callback)
         if log_callback:
             log_callback("[source-scan] Stage 3: restore fisheye eyes")
         _process_pre_extract_or_lada(file_l_fish, file_l_fish_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf, output_bitrate_bps=eye_intermediate_bitrate)
@@ -2045,6 +2120,7 @@ def _process_sbs_clip_to_output(input_file, output_file, *, use_fisheye: bool,
             start_time, end_time, log_callback, process_callback,
             keep_audio=split_keep_audio,
         )
+        _cleanup_gpu_after_split(log_callback=log_callback)
         if log_callback:
             log_callback("[source-scan] Stage 3: restore eyes")
         _process_pre_extract_or_lada(file_l, file_l_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf, output_bitrate_bps=eye_intermediate_bitrate)
@@ -2085,6 +2161,9 @@ def _process_single_eye_clip_to_output(input_file, output_file, *, eye_mode: int
     file_cut_fish = os.path.join(directory, f"{stem}{side_suffix}_fisheye.mp4")
     file_cut_fish_restored = os.path.join(directory, f"{stem}{side_suffix}_fisheye.restored.mp4")
     pre_extract_enabled = _pre_extract_supported(pre_extract_inner, log_callback)
+    # Mirror the SBS interval path: coarse source-scan results are CPU-only at
+    # this point, so release the detector before single-eye split/restoration.
+    _release_pre_extract_detector_if_needed(True, log_callback=log_callback)
     final_bitrate_bps = int(final_bitrate_kbps * 1000) if final_bitrate_kbps else None
 
     if use_fisheye:
@@ -2098,6 +2177,7 @@ def _process_single_eye_clip_to_output(input_file, output_file, *, eye_mode: int
             start_time, end_time, log_callback, process_callback,
             keep_audio=split_keep_audio,
         )
+        _cleanup_gpu_after_split(log_callback=log_callback)
         _process_pre_extract_or_lada(file_cut_fish, file_cut_fish_restored, pre_extract_enabled, keep_intermediate, log_callback, process_callback, fine_conf=fine_conf)
         convert_projection(file_cut_fish_restored, output_file, "fisheye:hequirect", final_bitrate_kbps=final_bitrate_kbps, log_callback=log_callback, process_callback=process_callback)
         cleanup = [file_cut_fish, file_cut_fish_restored]
@@ -2112,6 +2192,7 @@ def _process_single_eye_clip_to_output(input_file, output_file, *, eye_mode: int
             start_time, end_time, log_callback, process_callback,
             keep_audio=split_keep_audio,
         )
+        _cleanup_gpu_after_split(log_callback=log_callback)
         _process_pre_extract_or_lada(
             file_cut,
             output_file,

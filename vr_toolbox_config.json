@@ -1,5 +1,5 @@
 {
-  "engine": "native_gpu",
+  "engine": "lada",
   "custom_args_lada": "",
   "custom_args_jasna": "",
   "language": "zh",

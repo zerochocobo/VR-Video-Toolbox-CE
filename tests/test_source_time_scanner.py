@@ -86,6 +86,7 @@ class SourceTimeScannerTests(unittest.TestCase):
                 patch("one_click.logic.split_video_dual") as split_plain,
                 patch("one_click.logic._process_pre_extract_or_lada") as process_lada,
                 patch("one_click.logic.merge_videos_fisheye") as merge_fish,
+                patch("one_click.logic._cleanup_gpu_after_split") as cleanup_after_split,
             ):
                 logic._process_sbs_clip_to_output(
                     str(src),
@@ -112,6 +113,7 @@ class SourceTimeScannerTests(unittest.TestCase):
                 "20.000000",
             ))
             self.assertFalse(split_fish.call_args.kwargs["keep_audio"])
+            cleanup_after_split.assert_called_once_with(log_callback=None)
             self.assertEqual(process_lada.call_count, 2)
             merge_fish.assert_called_once()
 
@@ -128,6 +130,8 @@ class SourceTimeScannerTests(unittest.TestCase):
                 patch("one_click.logic.split_video") as split_plain,
                 patch("one_click.logic.split_video_fisheye") as split_fish,
                 patch("one_click.logic._process_pre_extract_or_lada") as process_lada,
+                patch("one_click.logic._release_pre_extract_detector_if_needed") as release_detector,
+                patch("one_click.logic._cleanup_gpu_after_split") as cleanup_after_split,
             ):
                 logic._process_single_eye_clip_to_output(
                     str(src),
@@ -155,6 +159,8 @@ class SourceTimeScannerTests(unittest.TestCase):
             ))
             self.assertNotIn("final_bitrate_kbps", split_plain.call_args.kwargs)
             self.assertFalse(split_plain.call_args.kwargs["keep_audio"])
+            release_detector.assert_called_once_with(True, log_callback=None)
+            cleanup_after_split.assert_called_once_with(log_callback=None)
             process_lada.assert_called_once()
 
     def test_pair_eye_segments_skips_one_sided_groups(self) -> None:

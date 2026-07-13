@@ -40,7 +40,7 @@ class ExtractMultiRectTests(unittest.TestCase):
                 return y, uv
 
         class FakeDecoder:
-            def __init__(self, _src, bit_depth=8, start_frame=0):
+            def __init__(self, _src, bit_depth=8, start_frame=0, **_kwargs):
                 self.info = types.SimpleNamespace(width=8, height=4, fps=30.0)
                 self.start_frame = start_frame
 
@@ -120,7 +120,7 @@ class ExtractMultiRectTests(unittest.TestCase):
                 return np.zeros((4, 8), dtype=np.uint8), np.zeros((2, 4, 2), dtype=np.uint8)
 
         class FakeDecoder:
-            def __init__(self, _src, bit_depth=8, start_frame=0):
+            def __init__(self, _src, bit_depth=8, start_frame=0, **_kwargs):
                 self.info = types.SimpleNamespace(width=8, height=4, fps=30.0)
 
             def __len__(self):
@@ -203,8 +203,11 @@ class ExtractMultiRectTests(unittest.TestCase):
                     uv = np.zeros((2, 4, 2), dtype=np.uint8)
                     return y, uv
 
+            decoder_kwargs = []
+
             class FakeDecoder:
-                def __init__(self, _src, bit_depth=8, start_frame=0):
+                def __init__(self, _src, bit_depth=8, start_frame=0, **kwargs):
+                    decoder_kwargs.append(kwargs)
                     self.info = types.SimpleNamespace(width=8, height=4, fps=30.0)
 
                 def __len__(self):
@@ -236,11 +239,21 @@ class ExtractMultiRectTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as raw:
                 root = Path(raw)
                 src = root / "base.mp4"
+                segment = root / "segment.mp4"
                 audio = root / "source_audio.mp4"
                 out = root / "out.mp4"
                 src.write_bytes(b"base")
+                segment.write_bytes(b"segment")
                 audio.write_bytes(b"audio")
                 meta = VideoMetadata(path=str(src), width=8, height=4, source_fps=30.0, bitrate_bps=3000)
+                timeline = [
+                    types.SimpleNamespace(
+                        kind="mosaic",
+                        path=segment,
+                        start_s=0.0,
+                        end_s=1.0 / 30.0,
+                    )
+                ]
 
                 with (
                     patch("gpu_engine.files.probe.route", return_value=(meta, BackendDecision("gpu_nv12", "ok"))),
@@ -253,12 +266,14 @@ class ExtractMultiRectTests(unittest.TestCase):
                     gpu_files.replace_timeline_segments_gpu(
                         src,
                         out,
-                        [],
+                        timeline,
                         audio_source=audio,
                     )
 
             self.assertEqual(mux_kwargs["audio_source"], str(audio))
             self.assertIs(mux_kwargs["shortest"], False)
+            self.assertEqual(len(decoder_kwargs), 2)
+            self.assertTrue(all(item == {"batch_size": 8, "buffer_size": 8} for item in decoder_kwargs))
 
     def test_combine_video_muxes_first_input_audio_without_shortest(self) -> None:
         import tempfile
@@ -280,7 +295,7 @@ class ExtractMultiRectTests(unittest.TestCase):
                     return y, uv
 
             class FakeDecoder:
-                def __init__(self, _src, bit_depth=8):
+                def __init__(self, _src, bit_depth=8, **_kwargs):
                     self.info = types.SimpleNamespace(width=8, height=4, fps=30.0)
 
                 def __len__(self):

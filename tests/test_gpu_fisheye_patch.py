@@ -34,7 +34,7 @@ class FisheyePatchRawWrapTests(unittest.TestCase):
                 return y, uv
 
         class FakeDecoder:
-            def __init__(self, path, bit_depth=8, start_frame=0):
+            def __init__(self, path, bit_depth=8, start_frame=0, **_kwargs):
                 p = Path(path)
                 decoder_paths.append(p)
                 if len(decoder_paths) == 1:

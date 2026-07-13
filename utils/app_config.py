@@ -100,6 +100,9 @@ _DEFAULTS = {
     'paste_passthrough_enabled': True,
     'paste_passthrough_min_frames': 60,
     'paste_passthrough_max_subseg': 32,
+    # ThreadedDecoder keeps decoded frames in device memory. At 8K P016 the old
+    # default buffer of 32 frames can reserve multiple GiB during final paste.
+    'gpu_paste_decoder_buffer_size': 8,
     # OneClick source-scan: scan the source SBS first and process only time ranges containing mosaics.
     'source_scan_enabled': True,
     'source_scan_strategy': 'keyframes',
@@ -143,6 +146,7 @@ _CODE_DEFAULT_ONLY_KEYS = {
     'paste_passthrough_enabled',
     'paste_passthrough_min_frames',
     'paste_passthrough_max_subseg',
+    'gpu_paste_decoder_buffer_size',
 }
 
 # --- In-memory cache to avoid frequent IO ---

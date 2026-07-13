@@ -34,7 +34,10 @@ class OneClickPreExtractTests(unittest.TestCase):
             base.write_bytes(b"not a real video, but enough for copy-through")
             logs: list[str] = []
 
-            with patch("utils.mosaic_prescan.scan_segments", return_value=[]) as scan_segments:
+            with (
+                patch("utils.mosaic_prescan.scan_segments", return_value=[]) as scan_segments,
+                patch.object(logic, "_release_pre_extract_detector_if_needed") as release_detector,
+            ):
                 result = logic._run_pre_extract_branch(
                     str(base),
                     str(restored),
@@ -44,6 +47,7 @@ class OneClickPreExtractTests(unittest.TestCase):
                 )
 
             self.assertEqual(result, logic.PreExtractResult.NO_MOSAIC)
+            release_detector.assert_called_once_with(True, log_callback=logs.append)
             self.assertEqual(scan_segments.call_args.kwargs["min_conf"], 0.5)
             self.assertEqual(restored.read_bytes(), base.read_bytes())
             self.assertTrue(any("skipping lada/jasna" in item for item in logs))
@@ -127,6 +131,7 @@ class OneClickPreExtractTests(unittest.TestCase):
             with (
                 patch("utils.mosaic_prescan.scan_segments", side_effect=RuntimeError("detector failed")),
                 patch.object(logic, "process_lada") as process_lada,
+                patch.object(logic, "_release_pre_extract_detector_if_needed") as release_detector,
             ):
                 result = logic._process_pre_extract_or_lada(
                     str(base),
@@ -135,6 +140,7 @@ class OneClickPreExtractTests(unittest.TestCase):
                 )
 
             self.assertEqual(result, logic.PreExtractResult.OK)
+            release_detector.assert_called_once_with(True, log_callback=None)
             process_lada.assert_called_once_with(
                 str(base),
                 str(restored),

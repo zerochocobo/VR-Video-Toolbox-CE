@@ -677,13 +677,20 @@ def release_detector(log_callback=None) -> None:
         _DETECTOR_CONFIG = None
     try:
         import gc
-        import torch
 
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
     except Exception:
         pass
+    # The detector itself necessarily loaded torch.  Still use sys.modules so
+    # this cleanup helper can never initialize CUDA merely to empty a cache.
+    torch_mod = sys.modules.get("torch")
+    if torch_mod is not None:
+        try:
+            cuda = getattr(torch_mod, "cuda", None)
+            if cuda is not None and cuda.is_initialized():
+                cuda.empty_cache()
+        except Exception:
+            pass
     if log_callback:
         log_callback("[pre-extract] released detector")
 
