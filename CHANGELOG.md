@@ -2,6 +2,38 @@
 
 ## English
 
+### 2026-07-16
+
+- UI: Reorganized the homepage mosaic controls into a global settings group. Quality/speed now lives above three visible Jasna, Lada, and built-in GPU radio choices instead of in the OneClick footer.
+- UI: Built-in GPU mode now hides the external-engine custom-arguments controls; switching back to Jasna or Lada restores the matching controls and saved argument summary.
+- Fix: Subtitle generation and one-click directory scans now ignore generated `.si.duck.wav` sidecars alongside `.si.wav` and `.si.mp4` outputs.
+- Refactor/Fix: Centralized Clone Translation Dubbing duck-key span selection around the active synthesis text, with regression coverage ensuring deleted/empty translations and skipped speakers do not duck the original audio.
+
+### 2026-07-15
+
+- Fix: Translation proofreading no longer blocks manually incomplete manifests or prompts to call the AI translation API. Any transcribed manifest can be reopened directly, and the list shows a neutral `Completed X/Y` counter.
+- Investigation: Confirmed a reported RTX 5070 12GB failure occurred inside Jasna's full-resolution 4096x4096 RGB/P010 pipeline, not OneClick's final merge. Parent-process split buffers were already released before Jasna launch, leaving only a small CUDA-context-level residual.
+
+### 2026-07-14
+
+- New: Added an independent subtitle debug analyzer with final/raw/VAD/removed subtitle tracks, a cached waveform, time ruler, subtitle regions, click-to-seek, horizontal dragging, progress control, and active-subtitle display.
+- New: Added Windows WinMM `waveOut` streaming playback for the analyzer, including play, pause/resume, seek, device-position reporting, and safe cleanup without bundling `ffplay` or another playback dependency.
+- Fix: Debug subtitle generation now retains the ASR WAV under the matching `<stem>_debug` directory while normal generation still deletes temporary audio; selecting a debug directory directly is also supported.
+- Optimization/UI: Limited waveform work to the visible local viewport, coalesced redraws, used binary search for visible subtitles and vectorized NumPy peak reduction, and removed fit/zoom toolbar actions that could freeze on long recordings.
+
+### 2026-07-13
+
+- Major optimization: Released the cached mosaic detector immediately after coarse/fine scans and added post-split GPU cleanup before restoration, covering success, no-mosaic, cancellation, exception, SBS, fisheye, and single-eye paths.
+- Fix: GPU cleanup and diagnostics now inspect only already-loaded Torch/CuPy modules and call `empty_cache()` only when Torch CUDA is initialized, avoiding accidental CUDA-context creation in external-engine paths.
+- New: Added read-only GPU-memory stage logging around scan, split, restore, paste, and merge boundaries.
+- Major optimization: Reduced memory-bounded PyNv decoder queues from 32 to 8 frames for paste, fisheye paste, timeline merge, SBS combine, and extract paths. Controlled 8K A/B tests reduced normalized peak VRAM by roughly 2.15-2.32 GiB without meaningful throughput loss or output changes.
+- New: Added an automated decoder-queue A/B benchmark runner with isolated processes, `nvidia-smi` sampling, output probing, and JSON summaries.
+
+### 2026-07-12
+
+- Investigation/Planning: Evaluated the RTX 5070 12GB OneClick crash and the user's successful workaround. The primary lifecycle issue was the cached detector overlapping later split/restoration stages, while an additional cleanup after the GPU split wrapper could release buffers whose references disappeared only after return.
+- Planning: Defined a staged low-risk GPU-memory plan: guarded read-only diagnostics first, then detector release at completed scan boundaries and post-split cleanup, while retaining proven paste/merge cleanup and avoiding scan counters, hidden deduplication state, GPU-tier-specific behavior, or unconditional Torch CUDA initialization.
+
 ### 2026-07-11
 
 - New: Added an optional source-video bitrate reference to Split/Combine merging. GPU and FFmpeg NVENC paths use the reference bitrate as the target with a 2x peak limit; without a usable reference, the existing CQ 18 behavior remains unchanged.
@@ -210,6 +242,38 @@
 - Major optimization: GPU-accelerated VR split/merge, fisheye/equirectangular conversion, VR-to-flat projection, and OneClick geometry stages.
 
 ## 中文
+
+### 2026-07-16
+
+- UI：首页去马赛克设置重组为“全局去马赛克设置”分组；画质/速度从一键页面底部移到首页，并置于 Jasna、Lada、内置 GPU 三个可直接查看的 Radio 单选项上方。
+- UI：选择内置 GPU 时隐藏外部引擎的“自定义参数”控件；切换回 Jasna 或 Lada 时恢复对应控件及已保存参数摘要。
+- 修复：字幕生成和一键目录扫描会忽略生成的 `.si.duck.wav`，与 `.si.wav`、`.si.mp4` 一样不再被误当作源媒体。
+- 重构/修复：统一克隆翻译配音 duck-key 区间选择规则，以实际参与合成的文本为准，并增加回归测试，确保已删除/空译文及跳过说话人不会压低原声。
+
+### 2026-07-15
+
+- 修复：“校对翻译”不再因译文不完整阻止进入或提示调用 AI 翻译 API；只要已有转录 manifest 就能直接继续人工编辑，列表统一显示中性的“已完成 X/Y”。
+- 调查：确认 RTX 5070 12GB 用户的新崩溃发生在 Jasna 的 4096x4096 全分辨率 RGB/P010 流水线，而不是 OneClick 最终合并；Jasna 启动前父进程的大型 split 缓冲已释放，仅剩少量 CUDA context 级固定占用。
+
+### 2026-07-14
+
+- 新功能：新增独立字幕调试分析器，可查看最终/原始/VAD/已删除字幕轨、缓存波形、时间刻度、字幕区间、点击跳转、横向拖动、播放进度和当前字幕。
+- 新功能：分析器使用 Windows WinMM `waveOut` 流式播放，支持播放、暂停/继续、跳转、设备播放位置和安全清理，无需打包 `ffplay` 或新增播放器依赖。
+- 修复：调试模式会把 ASR WAV 保留到对应 `<stem>_debug` 目录，普通模式仍删除临时音频；同时支持直接选择 debug 目录本身。
+- 优化/UI：波形只处理当前局部视口，合并重绘请求，使用二分查找筛选可见字幕并以 NumPy 向量化生成峰值；隐藏可能在长时间轴上造成卡顿的全局适配和缩放按钮。
+
+### 2026-07-13
+
+- 重大优化：coarse/fine 扫描结束后立即释放缓存 detector，并在 GPU split wrapper 完全返回后执行阶段清理；覆盖成功、无马赛克、取消、异常、SBS、鱼眼和单眼路径。
+- 修复：GPU 清理和诊断仅检查已经载入的 Torch/CuPy 模块，且只在 Torch CUDA 已初始化时调用 `empty_cache()`，避免外部引擎路径因清理动作反而创建 CUDA context。
+- 新功能：在扫描、拆分、恢复、粘贴和合并等阶段边界新增只读显存日志。
+- 重大优化：paste、鱼眼 paste、timeline merge、SBS combine 和 extract 路径的 PyNv 解码队列由 32 帧限制为 8 帧。8K 同条件 A/B 显示归一化峰值显存降低约 2.15-2.32 GiB，吞吐和输出无明显变化。
+- 新功能：新增自动化解码队列 A/B 脚本，使用独立进程、`nvidia-smi` 采样、输出探测和 JSON 汇总完成对比。
+
+### 2026-07-12
+
+- 调查/规划：评估 RTX 5070 12GB OneClick 崩溃及用户已验证有效的修改。主要生命周期问题是缓存 detector 与后续拆分/恢复阶段重叠；GPU split wrapper 返回后再次清理，也能回收只有在函数退出后才解除引用的缓冲。
+- 规划：制定低风险分阶段显存方案：先加入带守卫的只读诊断，再在扫描完成边界释放 detector、在 split 返回后清理；保留已验证的 paste/merge 清理，并避免扫描计数、隐藏去重状态、按显卡容量分档及无条件初始化 Torch CUDA。
 
 ### 2026-07-11
 

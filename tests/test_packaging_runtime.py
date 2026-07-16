@@ -46,6 +46,7 @@ class _LauncherFake:
     def __init__(self, process=None) -> None:
         self.dlna_process = process
         self.btn_dlna_toggle = _Button()
+        self.refresh_dlna_ui_calls = 0
 
     def get_configured_dlna_dirs(self):
         return [r"C:\Videos"]
@@ -56,8 +57,8 @@ class _LauncherFake:
     def get_startupinfo(self):
         return None
 
-    def get_dlna_btn_text(self):
-        return "Start"
+    def _refresh_dlna_ui(self):
+        self.refresh_dlna_ui_calls += 1
 
 
 class PackagingRuntimeTests(unittest.TestCase):
@@ -112,7 +113,7 @@ class PackagingRuntimeTests(unittest.TestCase):
         cleanup.assert_called_once()
         terminate_tree.assert_not_called()
         self.assertIsNone(launcher.dlna_process)
-        self.assertEqual(launcher.btn_dlna_toggle.kwargs, {"text": "Start"})
+        self.assertEqual(launcher.refresh_dlna_ui_calls, 1)
 
     def test_packaged_start_cleans_stale_dlna_before_launching_exe(self) -> None:
         launcher = _LauncherFake(process=None)

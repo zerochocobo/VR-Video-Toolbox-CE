@@ -5,7 +5,7 @@ import threading
 import sys
 import locale
 import time
-from utils import app_config, i18n
+from utils import app_config, i18n, ui_theme
 
 # Import logic module - use try/except to handle both direct run and import from main
 try:
@@ -26,39 +26,34 @@ class VRSplitCombineApp:
         self.root = root
         self.on_return = on_return
         self.root.title(get_text('title'))
+        ui_theme.apply_theme(self.root)
         
         # Configure layout
-        self.main_frame = ttk.Frame(root, padding="10")
+        self.main_frame = ttk.Frame(root)
         self.main_frame.pack(fill='both', expand=True)
 
-        # Header Frame
-        header_frame = ttk.Frame(self.main_frame)
-        header_frame.pack(fill='x', pady=(0, 10))
-        
-        # Title (Left)
-        ttk.Label(header_frame, text=get_text('title'), font=('Arial', 14, 'bold')).pack(side='left')
-        
-        # Return Button (Right)
-        if self.on_return:
-            ttk.Button(header_frame, text=get_text('btn_back'), command=self.go_back).pack(side='right')
-
-        # Notebook (Tabs)
-        self.notebook = ttk.Notebook(self.main_frame)
+        # Full-height left rail: tool title on top, back-to-home pinned at the bottom
+        self.notebook = ui_theme.ToolShell(
+            self.main_frame,
+            title=get_text('title'),
+            back_text=get_text('btn_back'),
+            on_back=self.go_back if self.on_return else None,
+        )
         self.notebook.pack(fill='both', expand=True)
 
         # Tab 1: Split
         self.tab_split = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.tab_split, text=get_text('tab_split'))
+        self.notebook.add(self.tab_split, text=get_text('tab_split'), icon=ui_theme.TAB_ICONS['split'])
         self.setup_split_tab()
 
         # Tab 2: Combine
         self.tab_combine = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.tab_combine, text=get_text('tab_combine'))
+        self.notebook.add(self.tab_combine, text=get_text('tab_combine'), icon=ui_theme.TAB_ICONS['merge'])
         self.setup_combine_tab()
 
-        # Log Area
-        log_frame = ttk.LabelFrame(self.main_frame, text=get_text('log_title'), padding=5)
-        log_frame.pack(fill='both', expand=True, pady=10)
+        # Log Area (shared across tabs, in the shell footer)
+        log_frame = ttk.LabelFrame(self.notebook.footer(expand=True), text=get_text('log_title'), padding=5)
+        log_frame.pack(fill='both', expand=True, padx=10, pady=(4, 10))
         self.log_text = tk.Text(log_frame, height=10, state='disabled')
         self.log_text.pack(fill='both', expand=True, side='left')
         scrollbar = ttk.Scrollbar(log_frame, command=self.log_text.yview)
@@ -81,7 +76,7 @@ class VRSplitCombineApp:
         def _do():
             self.log_text.config(state='normal')
             self.log_text.insert('end', message + "\n")
-            self.log_text.see('end')
+            ui_theme.scroll_text_to_end(self.log_text)
             self.log_text.config(state='disabled')
         self.root.after(0, _do)
 

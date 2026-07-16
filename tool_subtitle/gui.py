@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, scrolledtext
 import os
 import gc
 import threading
@@ -7,7 +7,7 @@ import time
 import sys
 
 from tool_subtitle import logic
-from utils import i18n
+from utils import i18n, ui_theme
 
 import locale
 
@@ -28,6 +28,7 @@ class SubtitleToolsApp:
         self.root = root
         self.on_return = on_return
         self.root.title(get_text('title'))
+        ui_theme.apply_theme(self.root)
         
         # Determine models root based on persistent directory, not PyInstaller's temp extraction dir (_MEIPASS)
         if getattr(sys, 'frozen', False):
@@ -58,65 +59,58 @@ class SubtitleToolsApp:
 
     def setup_ui(self):
         # Main container
-        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame = ttk.Frame(self.root)
         main_frame.pack(fill='both', expand=True)
 
-        # Header
-        header_frame = ttk.Frame(main_frame)
-        header_frame.pack(fill='x', pady=(0, 10))
-        
-        ttk.Label(header_frame, text=get_text('title'), font=('Arial', 14, 'bold')).pack(side='left')
-        
-        if self.on_return:
-            ttk.Button(header_frame, text=get_text('btn_return'), command=self.on_return).pack(side='right')
-
-        # Tabs
-        style = ttk.Style()
-        style.configure("TNotebook.Tab", padding=[12, 8], font=('Arial', 10, 'bold'))
-
-        self.notebook = ttk.Notebook(main_frame)
+        # Full-height left rail: tool title on top, back-to-home pinned at the bottom
+        self.notebook = ui_theme.ToolShell(
+            main_frame,
+            title=get_text('title'),
+            back_text=get_text('btn_return'),
+            on_back=self.on_return,
+        )
         self.notebook.pack(fill='both', expand=True)
 
         # Tab 1: Generate Subtitles
         self.tab_generate = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.tab_generate, text=get_text('tab_generate'))
+        self.notebook.add(self.tab_generate, text=get_text('tab_generate'), icon=ui_theme.TAB_ICONS['cc'])
         self.setup_generate_tab()
 
         # Tab 2: Subtitle Translation
         self.tab_trans = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.tab_trans, text=get_text('tab_trans'))
+        self.notebook.add(self.tab_trans, text=get_text('tab_trans'), icon=ui_theme.TAB_ICONS['globe_wire'])
         self.setup_trans_tab()
 
         # Tab 3: One-click Listening Translation
         self.tab_listen = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.tab_listen, text=get_text('tab_listen'))
+        self.notebook.add(self.tab_listen, text=get_text('tab_listen'), icon=ui_theme.TAB_ICONS['volume'])
         self.setup_listen_tab()
-        
+
         # Tab 4: SRT to ASS
         self.tab_ass = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.tab_ass, text=get_text('tab_ass'))
+        self.notebook.add(self.tab_ass, text=get_text('tab_ass'), icon=ui_theme.TAB_ICONS['font'])
         self.setup_ass_tab()
 
         # Tab 5: Batch Add Soft Subtitles
         self.tab_srt = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.tab_srt, text=get_text('tab_srt'))
+        self.notebook.add(self.tab_srt, text=get_text('tab_srt'), icon=ui_theme.TAB_ICONS['attach'])
         self.setup_srt_tab()
 
         # Tab 6: Remove Soft Subtitles
         self.tab_rm_sub = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.tab_rm_sub, text=get_text('tab_rm_sub'))
+        self.notebook.add(self.tab_rm_sub, text=get_text('tab_rm_sub'), icon=ui_theme.TAB_ICONS['delete'])
         self.setup_rm_sub_tab()
-        
+
         # Tab 7: Rank Subtitles
         self.tab_rank = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.tab_rank, text=get_text('tab_rank'))
+        self.notebook.add(self.tab_rank, text=get_text('tab_rank'), icon=ui_theme.TAB_ICONS['star'])
         self.setup_rank_tab()
         
     def log(self, text_widget, message):
         def _log():
             text_widget.config(state='normal')
             text_widget.insert('end', message + "\n")
-            text_widget.see('end')
+            ui_theme.scroll_text_to_end(text_widget)
             text_widget.config(state='disabled')
         self.root.after(0, _log)
 
@@ -197,7 +191,10 @@ class SubtitleToolsApp:
         debug_frame = ttk.Frame(opt_frame)
         debug_frame.pack(fill='x', pady=5)
         self.gen_debug_files = tk.BooleanVar(value=False)
-        ttk.Checkbutton(debug_frame, text=get_text('chk_gen_debug_files'), variable=self.gen_debug_files).pack(side='left')
+        ttk.Checkbutton(debug_frame, text=get_text('chk_gen_debug_files'), variable=self.gen_debug_files,
+                        command=self._update_debug_button).pack(side='left')
+        self.btn_debug_subtitles = ttk.Button(debug_frame, text=get_text('btn_debug_subtitles'),
+                                              command=self.open_debug_analyzer)
 
         # Initial model check
         self.root.after(100, self.check_model_status)
@@ -220,13 +217,23 @@ class SubtitleToolsApp:
         log_frame = ttk.LabelFrame(frame, text=get_text('lbl_log'), padding=10)
         log_frame.pack(fill='both', expand=True, pady=5)
         
-        self.gen_log = tk.Text(log_frame, height=12, state='disabled')
+        self.gen_log = scrolledtext.ScrolledText(log_frame, height=12, state='disabled')
         self.gen_log.pack(fill='both', expand=True)
 
     def browse_gen_dir(self):
         path = filedialog.askdirectory()
         if path:
             self.gen_dir_path.set(path)
+
+    def _update_debug_button(self):
+        if self.gen_debug_files.get():
+            self.btn_debug_subtitles.pack(side='left', padx=(10, 0))
+        else:
+            self.btn_debug_subtitles.pack_forget()
+
+    def open_debug_analyzer(self):
+        from tool_subtitle.debug_analyzer import SubtitleDebugAnalyzer
+        SubtitleDebugAnalyzer(self.root, self.gen_dir_path.get())
             
     def check_model_status(self):
         model_key = self.model_var.get()
@@ -385,7 +392,7 @@ class SubtitleToolsApp:
         log_frame = ttk.LabelFrame(frame, text=get_text('lbl_log'), padding=10)
         log_frame.pack(fill='both', expand=True, pady=5)
         
-        self.srt_log = tk.Text(log_frame, height=12, state='disabled')
+        self.srt_log = scrolledtext.ScrolledText(log_frame, height=12, state='disabled')
         self.srt_log.pack(fill='both', expand=True)
 
     def browse_srt_dir(self):
@@ -572,7 +579,7 @@ class SubtitleToolsApp:
         log_frame = ttk.LabelFrame(frame, text=get_text('lbl_log'), padding=6)
         log_frame.pack(fill='both', expand=True, pady=(0, 2))
         
-        self.trans_log = tk.Text(log_frame, height=10, state='disabled')
+        self.trans_log = scrolledtext.ScrolledText(log_frame, height=10, state='disabled')
         self.trans_log.pack(fill='both', expand=True)
         
         self.stop_event_trans = threading.Event()
@@ -892,7 +899,7 @@ class SubtitleToolsApp:
         log_frame = ttk.LabelFrame(frame, text=get_text('lbl_log'), padding=6)
         log_frame.pack(fill='both', expand=True, pady=(0, 2))
 
-        self.listen_log = tk.Text(log_frame, height=8, state='disabled')
+        self.listen_log = scrolledtext.ScrolledText(log_frame, height=8, state='disabled')
         self.listen_log.pack(fill='both', expand=True)
 
         self.stop_event_listen = threading.Event()
@@ -1077,7 +1084,7 @@ class SubtitleToolsApp:
         log_frame = ttk.LabelFrame(frame, text=get_text('lbl_log'), padding=10)
         log_frame.pack(fill='both', expand=True, pady=5)
         
-        self.ass_log = tk.Text(log_frame, height=12, state='disabled')
+        self.ass_log = scrolledtext.ScrolledText(log_frame, height=12, state='disabled')
         self.ass_log.pack(fill='both', expand=True)
         
         self.stop_event_ass = threading.Event()
@@ -1196,7 +1203,7 @@ class SubtitleToolsApp:
         log_frame.grid(row=4, column=0, columnspan=2, padx=5, pady=5, sticky='nsew')
         frame.grid_rowconfigure(4, weight=1)
         
-        self.rm_log = tk.Text(log_frame, height=10, state='disabled')
+        self.rm_log = scrolledtext.ScrolledText(log_frame, height=10, state='disabled')
         self.rm_log.pack(fill='both', expand=True)
 
         self.stop_event_rm = threading.Event()
@@ -1323,7 +1330,7 @@ class SubtitleToolsApp:
         log_frame = ttk.LabelFrame(frame, text=get_text('lbl_log'), padding=10)
         log_frame.pack(fill='both', pady=5)
         
-        self.rank_log = tk.Text(log_frame, height=6, state='disabled')
+        self.rank_log = scrolledtext.ScrolledText(log_frame, height=6, state='disabled')
         self.rank_log.pack(fill='both', expand=True)
         
         self.stop_event_rank = threading.Event()

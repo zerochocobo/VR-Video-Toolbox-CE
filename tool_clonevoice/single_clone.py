@@ -556,17 +556,25 @@ def manifest_has_target_translation(video: str | os.PathLike[str], target_langua
         return False
     # Lines the user deliberately emptied while proofreading count as done;
     # re-translating here would overwrite every proofread edit.
-    cleared = proofread.cleared_segment_ids(manifest)
+    cleared = proofread.effective_cleared_segment_ids(manifest)
+    translated_srt = logic.clone_dir(video) / "translated.srt"
+    segments = [s for s in manifest.get("segments", []) if (s.get("src_text") or "").strip()]
+    legacy_completed = (
+        "proofread" not in manifest
+        and translated_srt.is_file()
+        and any((seg.get("tgt_text") or "").strip() for seg in segments)
+    )
 
     def _done(seg: dict) -> bool:
         if (seg.get("tgt_text") or "").strip():
+            return True
+        if legacy_completed:
             return True
         try:
             return int(seg.get("id")) in cleared
         except Exception:
             return False
 
-    segments = [s for s in manifest.get("segments", []) if (s.get("src_text") or "").strip()]
     return bool(segments) and all(_done(s) for s in segments)
 
 

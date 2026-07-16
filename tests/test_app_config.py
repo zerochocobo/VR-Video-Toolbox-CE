@@ -56,6 +56,21 @@ class AppConfigLanguageTests(unittest.TestCase):
             self.assertEqual(app_config.get_language(), "en")
             self.assertIn('"language": "en"', Path(app_config._CONFIG_PATH).read_text(encoding="utf-8"))
 
+    def test_ui_theme_defaults_normalizes_and_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            app_config._cache = {}
+            app_config._CONFIG_PATH = str(Path(raw) / "config.json")
+
+            self.assertEqual(app_config.get_ui_theme(), "light")
+            app_config.set_ui_theme("dark")
+            self.assertEqual(app_config.get_ui_theme(), "dark")
+
+            saved = json.loads(Path(app_config._CONFIG_PATH).read_text(encoding="utf-8-sig"))
+            self.assertEqual(saved["ui_theme"], "dark")
+
+            app_config.set_ui_theme("unsupported")
+            self.assertEqual(app_config.get_ui_theme(), "light")
+
     def test_code_default_only_keys_ignore_stale_config_file(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             app_config._cache = {}

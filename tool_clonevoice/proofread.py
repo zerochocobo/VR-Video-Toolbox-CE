@@ -189,6 +189,11 @@ def cleared_segment_ids(manifest: dict) -> set[int]:
     return _int_id_set(proofread.get("cleared_ids"))
 
 
+def effective_cleared_segment_ids(manifest: dict) -> set[int]:
+    """Return only explicitly persisted cleared translation segment ids."""
+    return cleared_segment_ids(manifest)
+
+
 def save_rows(video: str | Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
     manifest = logic.load_manifest(video)
     if manifest is None:
@@ -289,10 +294,18 @@ def video_status(video: str | Path) -> dict[str, Any]:
         if (s.get("src_text") or "").strip()
     ]
     total = len(segments)
-    cleared = cleared_segment_ids(manifest)
+    cleared = effective_cleared_segment_ids(manifest)
+    translated_srt = logic.clone_dir(video) / "translated.srt"
+    legacy_completed = (
+        "proofread" not in manifest
+        and translated_srt.is_file()
+        and any((seg.get("tgt_text") or "").strip() for seg in segments)
+    )
 
     def _seg_done(seg: dict) -> bool:
         if (seg.get("tgt_text") or "").strip():
+            return True
+        if legacy_completed:
             return True
         try:
             return int(seg.get("id")) in cleared

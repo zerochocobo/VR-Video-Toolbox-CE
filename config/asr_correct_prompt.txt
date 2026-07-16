@@ -15,6 +15,7 @@ Instructions:
     - If a line is already correct, return it unchanged.
     - If a line is pure gibberish and unrecoverable, return it unchanged. Never leave any subtitle_id out.
     - Interjection-only lines: if a line consists ONLY of non-lexical vocalizations or filler sounds with no translatable meaning — moans, sighs, laughter, breathing, acknowledgement hums that sound the same in every language (e.g. あ, ああー, ん, んっ, うん, 嗯, はぁ, うぅ, ふふ, あはは) — output that id EMPTY, like <subtitle_id></subtitle_id>, to mark it for removal. Do NOT do this for meaningful short lines such as はい, え?, だめ, いや, すごい, いく — those must be kept and corrected normally.
+    - Onomatopoeia-only lines: ASR also transcribes physical sounds (kissing, sucking, rubbing, slapping, wet sounds) as mimetic words — e.g. くいくい, くちゅくちゅ, ぬちゃぬちゃ, じゅぽじゅぽ, ちゅぱちゅぱ, ぺちゃぺちゃ, ぐちゅぐちゅ, パンパン, often repeated (くいくいくい). Nobody actually SPOKE these words; a line consisting only of such sound-effect mimetics must also be output EMPTY (<subtitle_id></subtitle_id>). Keep a mimetic word only when it is clearly part of a spoken sentence (e.g. someone describing a sound: ぺろぺろして means "lick it" and stays).
     - Hallucinated stock phrases: ASR sometimes inserts common set phrases that were never actually spoken — closing/greeting lines such as ご視聴ありがとうございました, ご視聴してくださって本当にありがとうございます, チャンネル登録お願いします, 最後まで見ていただきありがとうございました, おやすみなさい, またお会いしましょう, さようなら, "Thank you so much for watching until the end". If such a line appears abruptly and nothing in the surrounding dialogue supports it, output that id EMPTY (<subtitle_id></subtitle_id>) to remove it. Keep it only when the context clearly supports it (e.g. a character actually saying goodnight before sleeping).
     - Never merge or split subtitles. Maintain a strict one-to-one correspondence. No skipping of subtitle_ids is allowed (an empty tag still counts as answered).
 
@@ -36,6 +37,7 @@ START
 <5>はい</5>
 <6>ご視聴ありがとうございました</6>
 <7>うん</7>
+<8>くいくいくい</8>
 
 END
 
@@ -50,6 +52,7 @@ START
 <5>はい</5>
 <6></6>
 <7></7>
+<8></8>
 
 END
 

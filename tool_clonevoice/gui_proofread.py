@@ -99,11 +99,7 @@ class ProofreadPanel(ttk.LabelFrame):
         code = status.get("status")
         if code == "no_manifest":
             return get_text("pf_status_no_manifest")
-        if code == "proofread":
-            return get_text("pf_status_proofread").format(status.get("edited", 0), status.get("total", 0))
-        if code == "translated":
-            return get_text("pf_status_translated").format(status.get("translated", 0))
-        return get_text("pf_status_untranslated").format(status.get("translated", 0), status.get("total", 0))
+        return get_text("pf_status_completed").format(status.get("translated", 0), status.get("total", 0))
 
     def _format_ref(self, status: dict) -> str:
         ref = status.get("reference_srt") or ""
@@ -114,9 +110,6 @@ class ProofreadPanel(ttk.LabelFrame):
         if not selection:
             return ""
         return self.iid_to_video.get(selection[0], "")
-
-    def _log_widget(self):
-        return self.log_widget() if callable(self.log_widget) else self.log_widget
 
     def open_selected(self) -> None:
         # Double-click bypasses the disabled button, so gate on its state too;
@@ -129,32 +122,6 @@ class ProofreadPanel(ttk.LabelFrame):
         status = proofread.video_status(video)
         if status.get("status") == "no_manifest":
             messagebox.showerror("Error", get_text("err_pf_need_transcribe"))
-            return
-        if status.get("status") == "untranslated":
-            if not messagebox.askyesno("Confirm", get_text("confirm_pf_translate_first")):
-                return
-            if hasattr(self.app, "_translation_api_configured") and not self.app._translation_api_configured():
-                messagebox.showerror("Error", get_text("err_no_translation_api_key"))
-                return
-            target_language = self.get_target_language()
-            source_correction = self.get_source_correction() if self.get_source_correction else None
-
-            def worker(_holder, _release_holder):
-                from tool_clonevoice import logic
-
-                return logic.run_translate(
-                    video,
-                    target_language=target_language,
-                    source_correction=source_correction,
-                    log=lambda m: self.app.log(self._log_widget(), m),
-                    stop_event=self.get_stop_event(),
-                )
-
-            def done(_result):
-                self.refresh()
-                self._open_dialog(video)
-
-            self.run_async(worker, done)
             return
         self._open_dialog(video)
 

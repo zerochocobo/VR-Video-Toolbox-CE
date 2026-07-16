@@ -6,9 +6,9 @@ import sys
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 
-from utils import i18n
+from utils import i18n, ui_theme
 from tool_clonevoice.gui_candidate_panel import CandidateBasisPanel
 from tool_clonevoice.gui_proofread import build_proofread_panel
 from tool_clonevoice.log_redirect import redirect_stdio
@@ -37,6 +37,7 @@ class ClonevoiceToolsApp:
         self.root = root
         self.on_return = on_return
         self.root.title(get_text("title"))
+        ui_theme.apply_theme(self.root)
 
         if getattr(sys, "frozen", False):
             base_dir = os.path.dirname(sys.executable)
@@ -76,43 +77,41 @@ class ClonevoiceToolsApp:
 
     # --- UI ---
     def _setup_ui(self):
-        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame = ttk.Frame(self.root)
         main_frame.pack(fill="both", expand=True)
 
-        header_frame = ttk.Frame(main_frame)
-        header_frame.pack(fill="x", pady=(0, 2))
-        ttk.Label(header_frame, text=get_text("title"), font=("Arial", 14, "bold")).pack(side="left")
-        if self.on_return:
-            ttk.Button(header_frame, text=get_text("btn_return"), command=self.on_return).pack(side="right")
-        ttk.Label(
+        # Full-height left rail: tool title on top, back-to-home pinned at the bottom
+        self.notebook = ui_theme.ToolShell(
             main_frame,
+            title=get_text("title"),
+            back_text=get_text("btn_return"),
+            on_back=self.on_return,
+        )
+        self.notebook.pack(fill="both", expand=True)
+
+        ttk.Label(
+            self.notebook.footer(),
             text=get_text("lbl_dlna_si_note"),
             font=("Arial", 9),
             foreground="dim gray",
-            wraplength=760,
+            wraplength=620,
             justify="left",
-        ).pack(fill="x", pady=(0, 10))
-
-        style = ttk.Style()
-        style.configure("TNotebook.Tab", padding=[12, 8], font=("Arial", 10, "bold"))
-
-        self.notebook = ttk.Notebook(main_frame)
-        self.notebook.pack(fill="both", expand=True)
+        ).pack(fill="x", padx=10, pady=(4, 8))
 
         self.tab_single_clone = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.tab_single_clone, text=get_text("tab_single_clone"))
+        self.notebook.add(self.tab_single_clone, text=get_text("tab_single_clone"), icon=ui_theme.TAB_ICONS["person"])
         self._setup_single_clone_tab(self.tab_single_clone)
 
         self.tab_multi_clone = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.tab_multi_clone, text=get_text("tab_multi_clone"))
+        self.notebook.add(self.tab_multi_clone, text=get_text("tab_multi_clone"), icon=ui_theme.TAB_ICONS["people"])
         self._setup_multi_clone_tab(self.tab_multi_clone)
 
         self.tab_clone = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.tab_clone, text=get_text("tab_clone"))
+        self.notebook.add(self.tab_clone, text=get_text("tab_clone"), icon=ui_theme.TAB_ICONS["auto"])
         self._setup_clone_tab(self.tab_clone)
 
         self.tab_mix = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.tab_mix, text=get_text("tab_mix_video_audio"))
+        self.notebook.add(self.tab_mix, text=get_text("tab_mix_video_audio"), icon=ui_theme.TAB_ICONS["volume"])
         self._setup_single_mix_tab(self.tab_mix)
 
     def _setup_clone_tab(self, frame):
@@ -164,7 +163,7 @@ class ClonevoiceToolsApp:
             get_text("opt_lang_en"): "en",
             get_text("opt_lang_zh"): "zh",
         }
-        self.src_lang_var = tk.StringVar(value=get_text("opt_lang_auto"))
+        self.src_lang_var = tk.StringVar(value=get_text("opt_lang_ja"))
         ttk.Combobox(row1, textvariable=self.src_lang_var, values=list(self._lang_map.keys()), state="readonly", width=14).pack(side="left", padx=(0, 16))
         ttk.Label(row1, text=get_text("lbl_model"), width=10).pack(side="left")
         self._model_map = {
@@ -355,7 +354,7 @@ class ClonevoiceToolsApp:
 
         log_frame = ttk.LabelFrame(frame, text=get_text("lbl_log"), padding=6)
         log_frame.pack(fill="both", expand=True, pady=(0, 2))
-        self.clone_log = tk.Text(log_frame, height=12, state="disabled")
+        self.clone_log = scrolledtext.ScrolledText(log_frame, height=12, state="disabled")
         self.clone_log.pack(fill="both", expand=True)
 
     def _setup_single_clone_tab(self, frame):
@@ -487,7 +486,7 @@ class ClonevoiceToolsApp:
         ttk.Label(single_clone_options_row, text=get_text("lbl_src_lang"), width=step1_label_width).pack(
             side="left", padx=(0, 6)
         )
-        self.single_clone_src_lang_var = tk.StringVar(value=get_text("opt_lang_auto"))
+        self.single_clone_src_lang_var = tk.StringVar(value=get_text("opt_lang_ja"))
         ttk.Combobox(
             single_clone_options_row,
             textvariable=self.single_clone_src_lang_var,
@@ -746,7 +745,7 @@ class ClonevoiceToolsApp:
 
         log_frame = ttk.LabelFrame(frame, text=get_text("lbl_log"), padding=6)
         log_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
-        self.single_clone_log = tk.Text(log_frame, height=8, state="disabled")
+        self.single_clone_log = scrolledtext.ScrolledText(log_frame, height=8, state="disabled")
         self.single_clone_log.pack(fill="both", expand=True)
 
         self.single_clone_action_buttons = [
@@ -915,7 +914,7 @@ class ClonevoiceToolsApp:
         lang_row = ttk.Frame(step1)
         lang_row.grid(row=2, column=0, columnspan=4, sticky="ew", pady=3)
         ttk.Label(lang_row, text=get_text("lbl_src_lang"), width=label_width).pack(side="left", padx=(0, 6))
-        self.multi_clone_src_lang_var = tk.StringVar(value=get_text("opt_lang_auto"))
+        self.multi_clone_src_lang_var = tk.StringVar(value=get_text("opt_lang_ja"))
         ttk.Combobox(
             lang_row,
             textvariable=self.multi_clone_src_lang_var,
@@ -1155,7 +1154,7 @@ class ClonevoiceToolsApp:
 
         log_frame = ttk.LabelFrame(frame, text=get_text("lbl_log"), padding=6)
         log_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
-        self.multi_clone_log = tk.Text(log_frame, height=8, state="disabled")
+        self.multi_clone_log = scrolledtext.ScrolledText(log_frame, height=8, state="disabled")
         self.multi_clone_log.pack(fill="both", expand=True)
 
         self.multi_clone_action_buttons = [
@@ -1308,7 +1307,7 @@ class ClonevoiceToolsApp:
         log_frame = ttk.LabelFrame(frame, text=get_text("lbl_log"), padding=6)
         log_frame.grid(row=6, column=0, columnspan=3, sticky="nsew")
         frame.rowconfigure(6, weight=1)
-        self.single_mix_log = tk.Text(log_frame, height=10, state="disabled")
+        self.single_mix_log = scrolledtext.ScrolledText(log_frame, height=10, state="disabled")
         self.single_mix_log.pack(fill="both", expand=True)
         self.mix_batch_dir_row.grid_remove()
 
@@ -3836,7 +3835,7 @@ class ClonevoiceToolsApp:
         def _log():
             text_widget.config(state="normal")
             text_widget.insert("end", message + "\n")
-            text_widget.see("end")
+            ui_theme.scroll_text_to_end(text_widget)
             text_widget.config(state="disabled")
             text_widget._last_was_progress = False
         self.root.after(0, _log)
@@ -3851,7 +3850,7 @@ class ClonevoiceToolsApp:
                 if is_progress and getattr(text_widget, "_last_was_progress", False):
                     text_widget.delete("end-2l linestart", "end-1l linestart")
                 text_widget.insert("end", text + "\n")
-                text_widget.see("end")
+                ui_theme.scroll_text_to_end(text_widget)
                 text_widget.config(state="disabled")
                 text_widget._last_was_progress = is_progress
             self.root.after(0, _do)

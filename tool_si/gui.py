@@ -7,10 +7,10 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from tool_si import logic
-from utils import app_config, i18n
+from utils import app_config, i18n, ui_theme
 
 
 def get_text(key: str) -> str:
@@ -32,6 +32,7 @@ class SimultaneousInterpretationApp:
         self.root = root
         self.on_return = on_return
         self.root.title(get_text("title"))
+        ui_theme.apply_theme(self.root)
 
         if getattr(sys, "frozen", False):
             base_dir = os.path.dirname(sys.executable)
@@ -57,27 +58,30 @@ class SimultaneousInterpretationApp:
         self._refresh_model_status()
 
     def _setup_ui(self):
-        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame = ttk.Frame(self.root)
         main_frame.pack(fill="both", expand=True)
 
-        header_frame = ttk.Frame(main_frame)
-        header_frame.pack(fill="x", pady=(0, 2))
-        ttk.Label(header_frame, text=get_text("title"), font=("Arial", 14, "bold")).pack(side="left")
-        if self.on_return:
-            ttk.Button(header_frame, text=get_text("btn_return"), command=self.on_return).pack(side="right")
-        ttk.Label(
+        # Full-height left rail: tool title on top, back-to-home pinned at the bottom
+        self.notebook = ui_theme.ToolShell(
             main_frame,
+            title=get_text("title"),
+            back_text=get_text("btn_return"),
+            on_back=self.on_return,
+        )
+        self.notebook.pack(fill="both", expand=True)
+
+        # Cross-tab widgets (note, model status, shared log) live in the shell footer
+        footer = self.notebook.footer(expand=True)
+        ttk.Label(
+            footer,
             text=get_text("lbl_dlna_si_note"),
             font=("Arial", 9),
             foreground="dim gray",
-            wraplength=760,
+            wraplength=600,
             justify="left",
-        ).pack(fill="x", pady=(0, 10))
+        ).pack(fill="x", padx=10, pady=(4, 6))
 
-        style = ttk.Style()
-        style.configure("TNotebook.Tab", padding=[12, 8], font=("Arial", 10, "bold"))
-
-        self.model_frame = ttk.LabelFrame(main_frame, text=get_text("grp_model"), padding=10)
+        self.model_frame = ttk.LabelFrame(footer, text=get_text("grp_model"), padding=10)
         self.model_status_var = tk.StringVar()
         ttk.Label(self.model_frame, textvariable=self.model_status_var).pack(side="left", fill="x", expand=True)
         self.btn_download_model = ttk.Button(
@@ -88,28 +92,26 @@ class SimultaneousInterpretationApp:
         self.btn_download_model.pack(side="right", padx=(8, 0))
         self._download_button_packed = True
 
-        self.notebook = ttk.Notebook(main_frame)
-        self.notebook.pack(fill="x", pady=(0, 8))
-
         single_tab = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(single_tab, text=get_text("tab_single"))
+        self.notebook.add(single_tab, text=get_text("tab_single"), icon=ui_theme.TAB_ICONS["mic"])
         self._setup_single_frame(single_tab)
 
         batch_tab = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(batch_tab, text=get_text("tab_batch"))
+        self.notebook.add(batch_tab, text=get_text("tab_batch"), icon=ui_theme.TAB_ICONS["folder"])
         self._setup_batch_frame(batch_tab)
 
         mix_tab = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(mix_tab, text=get_text("tab_mix_video_audio"))
+        self.notebook.add(mix_tab, text=get_text("tab_mix_video_audio"), icon=ui_theme.TAB_ICONS["volume"])
         self._setup_mix_frame(mix_tab)
 
         batch_mix_tab = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(batch_mix_tab, text=get_text("tab_batch_mix_video_audio"))
+        self.notebook.add(batch_mix_tab, text=get_text("tab_batch_mix_video_audio"), icon=ui_theme.TAB_ICONS["checklist"])
         self._setup_batch_mix_frame(batch_mix_tab)
 
-        log_frame = ttk.LabelFrame(main_frame, text=get_text("lbl_log"), padding=10)
-        log_frame.pack(fill="both", expand=True)
-        self.log_text = tk.Text(log_frame, height=12, state="disabled")
+        log_frame = ttk.LabelFrame(footer, text=get_text("lbl_log"), padding=10)
+        log_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self._log_frame = log_frame
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=12, state="disabled")
         self.log_text.pack(fill="both", expand=True)
 
     def _setup_single_frame(self, parent):
@@ -655,7 +657,7 @@ class SimultaneousInterpretationApp:
         def _log():
             self.log_text.config(state="normal")
             self.log_text.insert("end", str(message) + "\n")
-            self.log_text.see("end")
+            ui_theme.scroll_text_to_end(self.log_text)
             self.log_text.config(state="disabled")
 
         self.root.after(0, _log)
@@ -690,7 +692,7 @@ class SimultaneousInterpretationApp:
         else:
             self.model_status_var.set(get_text("model_missing").format(model_dir))
             if not self._model_frame_packed:
-                self.model_frame.pack(fill="x", pady=(0, 8), before=self.notebook)
+                self.model_frame.pack(fill="x", padx=10, pady=(0, 8), before=self._log_frame)
                 self._model_frame_packed = True
             if not self._download_button_packed:
                 self.btn_download_model.pack(side="right", padx=(8, 0))

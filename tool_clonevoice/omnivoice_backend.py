@@ -24,6 +24,23 @@ DEFAULT_GUIDANCE = 2.0
 DEFAULT_BATCH_SIZE = 6
 
 
+def _duck_spans_for_segments(segments: List[dict], text_field: str,
+                             skipped_speakers: set[str] | None = None) -> list[dict]:
+    """Return ducking spans only for lines that will actually be synthesized.
+
+    AI source correction and manual proofreading represent a deleted line by
+    clearing its active text field. Such a line must not suppress the original
+    voice in the generated ``.si.duck.wav``.
+    """
+    skipped = skipped_speakers or set()
+    return [
+        {"start": float(segment["start"]), "end": float(segment["end"])}
+        for segment in segments
+        if (segment.get(text_field) or "").strip()
+        and str(segment.get("speaker") or "") not in skipped
+    ]
+
+
 def model_dir(models_root: str) -> Path:
     return Path(models_root) / MODEL_DIR_NAME
 
@@ -1533,12 +1550,7 @@ def synthesize(
     out_path = si.default_si_audio_path(video_path)
     si.write_wav_mono(out_path, timeline, sr)
     log(f"[synth] wrote {out_path} ({timeline.size / sr:.1f}s; {n_clone} cloned, {n_noref} no-ref)")
-    duck_spans = [
-        {"start": float(s["start"]), "end": float(s["end"])}
-        for s in segments
-        if (s.get(text_field) or "").strip()
-        and str(s.get("speaker") or "") not in skipped_speakers
-    ]
+    duck_spans = _duck_spans_for_segments(segments, text_field, skipped_speakers)
     duck_duration = max(total_dur, timeline.size / float(sr))
     duck_path = si.default_si_duck_key_path(out_path)
     si.write_duck_key_wav(duck_path, duck_spans, duck_duration, sr)

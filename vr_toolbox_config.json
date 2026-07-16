@@ -1,8 +1,9 @@
 {
-  "engine": "lada",
+  "engine": "native_gpu",
   "custom_args_lada": "",
   "custom_args_jasna": "",
   "language": "zh",
+  "ui_theme": "light",
   "dlna_server_name": "VR Video Server",
   "dlna_port": 8099,
   "dlna_video_dirs": "G:\\Downloads|G:\\Downloads\\VR\\VR110|G:\\GIT\\debug\\VR_Video_Toolbox_NE\\videos|Y:\\",

@@ -23,6 +23,7 @@ _DEFAULTS = {
     'custom_args_lada': '',
     'custom_args_jasna': '',
     'language': '',
+    'ui_theme': 'light',
     'dlna_server_name': 'VR Video Server',
     'dlna_port': 8090,
     'dlna_video_dirs': '',
@@ -249,6 +250,17 @@ def set_language(language: str):
         normalized = get_system_language()
     data = _load()
     data['language'] = normalized
+    _save(data)
+
+
+def get_ui_theme() -> str:
+    value = str(_load().get('ui_theme', _DEFAULTS['ui_theme'])).strip().lower()
+    return value if value in {'light', 'dark'} else _DEFAULTS['ui_theme']
+
+
+def set_ui_theme(theme: str):
+    data = _load()
+    data['ui_theme'] = 'dark' if str(theme).strip().lower() == 'dark' else 'light'
     _save(data)
 
 

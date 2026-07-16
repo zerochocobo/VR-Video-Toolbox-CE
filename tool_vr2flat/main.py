@@ -6,7 +6,7 @@ import os
 import locale
 import time
 import sys
-from utils import app_config, i18n
+from utils import app_config, i18n, ui_theme
 
 
 # Import logic module - use try/except to handle both direct run and import from main
@@ -42,29 +42,24 @@ class VRMosaicApp:
         self.root = root
         self.on_return = on_return
         self.root.title(get_text('title'))
+        ui_theme.apply_theme(self.root)
         
         # Main Frame to hold everything
-        main_frame = ttk.Frame(root, padding="10")
+        main_frame = ttk.Frame(root)
         main_frame.pack(fill='both', expand=True)
 
-        # Header
-        header_frame = ttk.Frame(main_frame)
-        header_frame.pack(fill='x', pady=(0, 10))
-        
-        ttk.Label(header_frame, text=get_text('title'), font=('Arial', 14, 'bold')).pack(side='left')
-        
         if self.on_return:
-            ttk.Button(header_frame, text=get_text('btn_return'), command=self.on_return).pack(side='right')
-            
             # Clear any existing menu
             empty_menu = tk.Menu(self.root)
             self.root.config(menu=empty_menu)
 
-        
-        style = ttk.Style()
-        style.configure("TNotebook.Tab", padding=[12, 8], font=('Arial', 10, 'bold'))
-        
-        self.notebook = ttk.Notebook(main_frame)
+        # Full-height left rail: tool title on top, back-to-home pinned at the bottom
+        self.notebook = ui_theme.ToolShell(
+            main_frame,
+            title=get_text('title'),
+            back_text=get_text('btn_return'),
+            on_back=self.on_return,
+        )
         self.notebook.pack(expand=True, fill='both')
         
         self.create_extract_tab()
@@ -81,7 +76,7 @@ class VRMosaicApp:
     def log_to_widget(self, widget, message):
         def _do():
             widget.insert(tk.END, message + "\n")
-            widget.see(tk.END)
+            ui_theme.scroll_text_to_end(widget)
         self.root.after(0, _do)
 
     def log_to_all(self, message):
@@ -132,7 +127,7 @@ class VRMosaicApp:
     # --- Tab 1: Extract ---
     def create_extract_tab(self):
         tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text=get_text('tab_extract'))
+        self.notebook.add(tab, text=get_text('tab_extract'), icon=ui_theme.TAB_ICONS['extract'])
         
         vcmd = (self.root.register(self.validate_time_input), '%P')
         
@@ -239,7 +234,7 @@ class VRMosaicApp:
     # --- Tab 2: Locate ---
     def create_locate_tab(self):
         tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text=get_text('tab_locate'))
+        self.notebook.add(tab, text=get_text('tab_locate'), icon=ui_theme.TAB_ICONS['locate'])
         
         # Controls
         ctrl_frame = ttk.Frame(tab)
@@ -502,7 +497,7 @@ class VRMosaicApp:
     # --- Tab 3: Process ---
     def create_process_tab(self):
         tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text=get_text('tab_process'))
+        self.notebook.add(tab, text=get_text('tab_process'), icon=ui_theme.TAB_ICONS['process'])
         
         ttk.Label(tab, text=get_text('lbl_input')).grid(row=0, column=0, padx=5, pady=5, sticky='w')
         self.proc_input = tk.StringVar()

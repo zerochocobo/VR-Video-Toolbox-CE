@@ -13,14 +13,18 @@ class FakeSubtitleGenerator:
     def __init__(self) -> None:
         self.log_callback = None
         self.transcribed: list[tuple[str, str]] = []
+        self.vad_sensitivity = None
 
-    def transcribe(self, audio_path: str, output_path: str) -> None:
+    def set_vad_sensitivity(self, value: str) -> None:
+        self.vad_sensitivity = value
+
+    def transcribe(self, audio_path: str, output_path: str, **_kwargs) -> None:
         self.transcribed.append((audio_path, output_path))
 
 
 class FakeListenSubtitleGenerator(FakeSubtitleGenerator):
-    def transcribe(self, audio_path: str, output_path: str) -> None:
-        super().transcribe(audio_path, output_path)
+    def transcribe(self, audio_path: str, output_path: str, **kwargs) -> None:
+        super().transcribe(audio_path, output_path, **kwargs)
         Path(output_path).write_text(
             "1\n00:00:00,000 --> 00:00:01,000\nこんにちは\n",
             encoding="utf-8",
@@ -62,6 +66,7 @@ class ToolSubtitleSISidecarIgnoreTests(unittest.TestCase):
 
     def test_si_sidecar_media_detection(self) -> None:
         self.assertTrue(logic.is_si_sidecar_media_file("movie.si.wav"))
+        self.assertTrue(logic.is_si_sidecar_media_file("movie.si.duck.wav"))
         self.assertTrue(logic.is_si_sidecar_media_file("movie.SI.MP4"))
         self.assertFalse(logic.is_si_sidecar_media_file("movie.wav"))
         self.assertFalse(logic.is_si_sidecar_media_file("movie.mp4"))
@@ -70,11 +75,25 @@ class ToolSubtitleSISidecarIgnoreTests(unittest.TestCase):
         self.assertFalse(logic.is_generated_output_mp4("movie.mp4"))
 
         self.assertFalse(logic.is_supported_source_media_file("movie.si.wav"))
+        self.assertFalse(logic.is_supported_source_media_file("movie.si.duck.wav"))
         self.assertFalse(logic.is_supported_source_media_file("movie.si.mp4"))
         self.assertFalse(logic.is_supported_source_media_file("movie_SI.mp4"))
         self.assertFalse(logic.is_supported_source_media_file("movie_DUB.mp4"))
         self.assertTrue(logic.is_supported_source_media_file("movie.wav"))
         self.assertTrue(logic.is_supported_source_media_file("movie.mp4"))
+
+    def test_generated_work_paths_and_speaker_basis_wavs_are_not_source_media(self) -> None:
+        self.assertTrue(logic.is_generated_work_directory("movie_debug"))
+        self.assertTrue(logic.is_generated_work_directory("movie.CLONE"))
+        self.assertTrue(logic.is_generated_work_path(Path("root") / "movie.clone" / "candidate.wav"))
+        self.assertTrue(logic.is_speaker_basis_wav("SPEAKER1.wav"))
+        self.assertTrue(logic.is_speaker_basis_wav("speaker_02.basis.WAV"))
+        self.assertFalse(logic.is_speaker_basis_wav("movie.wav"))
+
+        self.assertFalse(logic.is_supported_source_media_file(Path("movie_debug") / "movie.wav"))
+        self.assertFalse(logic.is_supported_source_media_file(Path("movie.clone") / "preview.wav"))
+        self.assertFalse(logic.is_supported_source_media_file("SPEAKER1.wav"))
+        self.assertFalse(logic.is_supported_source_media_file("speaker_02.basis.WAV"))
 
     def test_batch_add_srt_ignores_si_mp4(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -106,6 +125,7 @@ class ToolSubtitleSISidecarIgnoreTests(unittest.TestCase):
             root = Path(tmp_dir)
             (root / "movie.wav").write_bytes(b"audio")
             (root / "movie.si.wav").write_bytes(b"si audio")
+            (root / "movie.si.duck.wav").write_bytes(b"duck key")
             (root / "clip.si.mp4").write_bytes(b"si video")
             (root / "movie_SI.mp4").write_bytes(b"si output")
             (root / "movie_DUB.mp4").write_bytes(b"dub output")
@@ -141,6 +161,81 @@ class ToolSubtitleSISidecarIgnoreTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual([Path(src).name for src, _dst in extracted], ["movie.wav"])
         self.assertEqual([Path(audio).name for audio, _srt in fake_generator.transcribed], ["movie.asr.wav"])
+
+    def test_batch_generate_srt_prunes_debug_clone_and_speaker_basis_audio(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "movie.wav").write_bytes(b"audio")
+            (root / "SPEAKER1.wav").write_bytes(b"basis")
+            (root / "speaker_02.basis.WAV").write_bytes(b"basis")
+            debug_dir = root / "movie_debug"
+            clone_dir = root / "movie.clone"
+            normal_dir = root / "normal"
+            debug_dir.mkdir()
+            clone_dir.mkdir()
+            normal_dir.mkdir()
+            (debug_dir / "movie.wav").write_bytes(b"debug audio")
+            (clone_dir / "candidate.wav").write_bytes(b"clone audio")
+            (normal_dir / "clip.wav").write_bytes(b"audio")
+            fake_generator = FakeSubtitleGenerator()
+            cache_key = ("large-v3", False)
+            old_cache = dict(logic._generator_cache)
+            logic._generator_cache.clear()
+            logic._generator_cache[cache_key] = fake_generator
+            extracted: list[str] = []
+
+            try:
+                with patch.object(logic, "check_ffmpeg", return_value=True), patch.object(
+                    logic, "check_model_files", return_value=True
+                ), patch.object(
+                    logic,
+                    "extract_audio",
+                    side_effect=lambda src, *_args, **_kwargs: extracted.append(src) or True,
+                ):
+                    ok = logic.batch_generate_srt(
+                        base_dir=str(root),
+                        search_subdirs=True,
+                        skip_if_exists=False,
+                        denoise_preset="none",
+                        model_key="large-v3",
+                        models_root=str(root),
+                        use_gpu=False,
+                        log_callback=lambda _message: None,
+                    )
+            finally:
+                logic._generator_cache.clear()
+                logic._generator_cache.update(old_cache)
+
+        self.assertTrue(ok)
+        self.assertEqual(sorted(Path(path).name for path in extracted), ["clip.wav", "movie.wav"])
+
+    def test_one_click_video_scan_prunes_debug_and_clone_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "movie.mp4").write_bytes(b"video")
+            debug_dir = root / "movie_debug"
+            clone_dir = root / "movie.clone"
+            normal_dir = root / "normal"
+            debug_dir.mkdir()
+            clone_dir.mkdir()
+            normal_dir.mkdir()
+            (debug_dir / "debug.mp4").write_bytes(b"debug video")
+            (clone_dir / "preview.mp4").write_bytes(b"clone video")
+            (normal_dir / "clip.mp4").write_bytes(b"video")
+
+            tasks = logic._collect_listen_translate_videos(
+                str(root),
+                search_subdirs=True,
+                log_callback=lambda _message: None,
+            )
+            direct_debug_tasks = logic._collect_listen_translate_videos(
+                str(debug_dir),
+                search_subdirs=False,
+                log_callback=lambda _message: None,
+            )
+
+        self.assertEqual(sorted(path.name for path in tasks or []), ["clip.mp4", "movie.mp4"])
+        self.assertEqual(direct_debug_tasks, [])
 
     def test_srt_to_ass_ignores_si_mp4_when_finding_video_resolution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

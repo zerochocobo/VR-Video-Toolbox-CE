@@ -5,8 +5,8 @@
     "temperature": 0.5,
     "max_retries": 3,
     "target_language": "Chinese",
-    "keep_original": true,
+    "keep_original": false,
     "adult_content": true,
-    "dubbing_optimized": true,
+    "dubbing_optimized": false,
     "source_correction": true
 }

@@ -4,7 +4,7 @@ import threading
 import os
 import locale
 import time
-from utils import app_config, encode_config, i18n
+from utils import app_config, encode_config, i18n, ui_theme
 
 # Import logic module - use try/except to handle both direct run and import from main
 try:
@@ -30,35 +30,27 @@ class VRMosaicOneClickApp:
         self.root = root
         self.on_return = on_return
         self.root.title(get_text('title'))
+        ui_theme.apply_theme(self.root)
         self._pre_extract_rows = []
         
         # Main Frame to hold everything
-        main_frame = ttk.Frame(root, padding="10")
+        main_frame = ttk.Frame(root)
         main_frame.pack(fill='both', expand=True)
 
-        # Header
-        header_frame = ttk.Frame(main_frame)
-        header_frame.pack(fill='x', pady=(0, 10))
-        
-        ttk.Label(header_frame, text=get_text('title'), font=('Arial', 14, 'bold')).pack(side='left')
-        
         if self.on_return:
-            ttk.Button(header_frame, text=get_text('btn_return'), command=self.on_return).pack(side='right')
-            
             # Clear any existing menu
             empty_menu = tk.Menu(self.root)
             self.root.config(menu=empty_menu)
 
-        
-        # Global quality/speed setting for NVENC presets, applied to GPU encoding in all tabs.
-        self.create_settings_bar(main_frame)
-
-        style = ttk.Style()
-        style.configure("TNotebook.Tab", padding=[12, 8], font=('Arial', 10, 'bold'))
-
-        self.notebook = ttk.Notebook(main_frame)
+        # Full-height left rail: tool title on top, back-to-home pinned at the bottom
+        self.notebook = ui_theme.ToolShell(
+            main_frame,
+            title=get_text('title'),
+            back_text=get_text('btn_return'),
+            on_back=self.on_return,
+        )
         self.notebook.pack(expand=True, fill='both')
-        
+
         self.create_single_auto_tab()
         self.create_single_eye_tab()
         self.create_batch_auto_tab()
@@ -100,12 +92,7 @@ class VRMosaicOneClickApp:
         return frame
 
     def _selected_encode_profile_key(self) -> str:
-        if hasattr(self, "encode_profile_var"):
-            return self._encode_profile_disp_to_key.get(
-                self.encode_profile_var.get(),
-                encode_config.DEFAULT_ENCODE_PROFILE,
-            )
-        return self._current_encode_profile() or "custom"
+        return encode_config.current_encode_profile_key() or "custom"
 
     def _refresh_pre_extract_visibility(self) -> None:
         hide = self._selected_encode_profile_key() == "highest_quality"
@@ -126,68 +113,10 @@ class VRMosaicOneClickApp:
         except (tk.TclError, TypeError, ValueError):
             return float(_DEFAULT_FINE_CONF)
 
-    def create_settings_bar(self, parent):
-        """User-facing GPU encode profile selector.
-
-        The UI intentionally exposes a few semantic profiles instead of raw
-        NVENC preset/AQ/multipass combinations. The concrete encoder kwargs are
-        still logged by gpu_engine.files for real-machine testing.
-        """
-        bar = ttk.Frame(parent)
-        bar.pack(fill='x', pady=(0, 8))
-
-        ttk.Label(bar, text=get_text('lbl_encode_profile')).pack(side='left', padx=(0, 5))
-
-        labels = {
-            "highest_quality": get_text('opt_encode_highest_quality'),
-            "balanced_high_quality": get_text('opt_encode_balanced_high_quality'),
-            "fast_quality": get_text('opt_encode_fast_quality'),
-            "ultra_fast_normal": get_text('opt_encode_ultra_fast_normal'),
-        }
-        opts = [(labels[key], key) for key in encode_config.get_profile_keys()]
-        cur = self._current_encode_profile()
-        if cur is None:
-            custom_label = get_text('opt_encode_custom')
-            opts.append((custom_label, "custom"))
-            cur = "custom"
-
-        self._encode_profile_disp_to_key = {d: v for d, v in opts}
-        self._encode_profile_key_to_disp = {v: d for d, v in opts}
-        self.encode_profile_var = tk.StringVar(value=self._encode_profile_key_to_disp[cur])
-        combo = ttk.Combobox(bar, textvariable=self.encode_profile_var, state='readonly',
-                             width=32, values=[d for d, _ in opts])
-        combo.pack(side='left')
-        combo.bind('<<ComboboxSelected>>', self._on_encode_profile_change)
-
-        ttk.Label(bar, text=get_text('hint_encode_profile'), foreground='gray').pack(side='left', padx=8)
-
-    def _current_encode_profile(self) -> str | None:
-        return encode_config.current_encode_profile_key()
-
-    def _apply_encode_profile(self, key: str) -> None:
-        encode_config.apply_encode_profile(key)
-
-    def _on_encode_profile_change(self, event=None):
-        key = self._encode_profile_disp_to_key.get(self.encode_profile_var.get(), encode_config.DEFAULT_ENCODE_PROFILE)
-        if key == "custom":
-            self._refresh_pre_extract_visibility()
-            return
-        self._apply_encode_profile(key)
-        self._refresh_pre_extract_visibility()
-        label = self._encode_profile_key_to_disp.get(key, key)
-        profile = encode_config.resolve_encode_settings(key)
-        self.log_to_all(get_text('log_encode_profile_set').format(
-            profile=label,
-            preset=profile.preset,
-            multipass=profile.multipass,
-            aq="on" if profile.aq else "off",
-            temporal_aq="on" if profile.temporal_aq else "off",
-        ))
-
     def log_to_widget(self, widget, message):
         def _do():
             widget.insert(tk.END, message + "\n")
-            widget.see(tk.END)
+            ui_theme.scroll_text_to_end(widget)
         self.root.after(0, _do)
 
     def log_to_all(self, message):
@@ -245,7 +174,7 @@ class VRMosaicOneClickApp:
     # --- Tab 1: Single File (Auto) ---
     def create_single_auto_tab(self):
         tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text=get_text('tab_s_auto'))
+        self.notebook.add(tab, text=get_text('tab_s_auto'), icon=ui_theme.TAB_ICONS['doc'])
         
         vcmd = (self.root.register(self.validate_time_input), '%P')
         
@@ -354,7 +283,7 @@ class VRMosaicOneClickApp:
     # --- Tab 2: Single File (One Eye) ---
     def create_single_eye_tab(self):
         tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text=get_text('tab_s_eye'))
+        self.notebook.add(tab, text=get_text('tab_s_eye'), icon=ui_theme.TAB_ICONS['eye'])
         
         vcmd = (self.root.register(self.validate_time_input), '%P')
         
@@ -471,7 +400,7 @@ class VRMosaicOneClickApp:
     # --- Tab 3: Batch (Auto) ---
     def create_batch_auto_tab(self):
         tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text=get_text('tab_b_auto'))
+        self.notebook.add(tab, text=get_text('tab_b_auto'), icon=ui_theme.TAB_ICONS['folder'])
         
         ttk.Label(tab, text=get_text('lbl_dir')).grid(row=0, column=0, padx=5, pady=5, sticky='w')
         self.b_auto_input = tk.StringVar()
@@ -556,7 +485,7 @@ class VRMosaicOneClickApp:
     # --- Tab 4: Batch (One Eye) ---
     def create_batch_eye_tab(self):
         tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text=get_text('tab_b_eye'))
+        self.notebook.add(tab, text=get_text('tab_b_eye'), icon=ui_theme.TAB_ICONS['folder_open'])
         
         ttk.Label(tab, text=get_text('lbl_dir')).grid(row=0, column=0, padx=5, pady=5, sticky='w')
         self.b_eye_input = tk.StringVar()
@@ -649,7 +578,7 @@ class VRMosaicOneClickApp:
     # --- Tab 5: Merge Tools ---
     def create_merge_tab(self):
         tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text=get_text('tab_merge'))
+        self.notebook.add(tab, text=get_text('tab_merge'), icon=ui_theme.TAB_ICONS['merge'])
         
         ttk.Label(tab, text=get_text('lbl_left')).grid(row=0, column=0, sticky='w')
         self.merge_l = tk.StringVar()

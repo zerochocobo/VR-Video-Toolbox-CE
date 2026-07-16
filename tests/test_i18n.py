@@ -79,6 +79,18 @@ class I18nTests(unittest.TestCase):
                 text = i18n.translate("one_click", key)
                 self.assertFalse(any(marker in text for marker in forbidden), (language, key, text))
 
+    def test_home_global_mosaic_settings_translations(self) -> None:
+        expected = {
+            "zh": ("全局去马赛克设置", "画质/速度："),
+            "en": ("Global Mosaic Removal Settings", "Quality / Speed:"),
+            "ja": ("グローバルモザイク除去設定", "画質 / 速度："),
+        }
+        for language, (group, label) in expected.items():
+            app_config._cache = {"language": language}
+            i18n.clear_cache()
+            self.assertEqual(i18n.translate("main", "grp_global_mosaic_settings"), group)
+            self.assertEqual(i18n.translate("main", "lbl_encode_profile"), label)
+
     def test_one_click_pre_extract_hint_translations(self) -> None:
         expected = {
             "zh": ("功能说明", "（本功能不要用在最高画质，视频马赛克位置稳定建议打开）"),

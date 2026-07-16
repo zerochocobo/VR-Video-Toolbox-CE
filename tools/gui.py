@@ -1,10 +1,10 @@
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, scrolledtext
 from PIL import Image, ImageTk
 import os
 import threading
 import time
-from utils import app_config, i18n
+from utils import app_config, i18n, ui_theme
 
 # Import logic module - use try/except to handle both direct run and import from main
 try:
@@ -27,6 +27,7 @@ class VRVideoToolsApp:
         self.root = root
         self.on_return = on_return
         self.root.title(get_text('title'))
+        ui_theme.apply_theme(self.root)
         # self.root.geometry("800x600") # Let it resize naturally or inherit
 
         self.setup_ui()
@@ -87,58 +88,51 @@ class VRVideoToolsApp:
 
     def setup_ui(self):
         # Main container
-        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame = ttk.Frame(self.root)
         main_frame.pack(fill='both', expand=True)
 
-        # Header
-        header_frame = ttk.Frame(main_frame)
-        header_frame.pack(fill='x', pady=(0, 10))
-        
-        ttk.Label(header_frame, text=get_text('title'), font=('Arial', 14, 'bold')).pack(side='left')
-        
-        if self.on_return:
-            ttk.Button(header_frame, text=get_text('btn_return'), command=self.on_return).pack(side='right')
-
-        # Tabs
-        style = ttk.Style()
-        style.configure("TNotebook.Tab", padding=[12, 8], font=('Arial', 10, 'bold'))
-
-        self.notebook = ttk.Notebook(main_frame)
+        # Full-height left rail: tool title on top, back-to-home pinned at the bottom
+        self.notebook = ui_theme.ToolShell(
+            main_frame,
+            title=get_text('title'),
+            back_text=get_text('btn_return'),
+            on_back=self.on_return,
+        )
         self.notebook.pack(fill='both', expand=True)
 
         # Tab 1: Screenshot
         self.tab_screenshot = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.tab_screenshot, text=get_text('tab_screenshot'))
+        self.notebook.add(self.tab_screenshot, text=get_text('tab_screenshot'), icon=ui_theme.TAB_ICONS['camera'])
         self.setup_screenshot_tab()
 
         # Tab 1.5: Keyframe Extraction
         self.tab_keyframe = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.tab_keyframe, text=get_text('tab_keyframe'))
+        self.notebook.add(self.tab_keyframe, text=get_text('tab_keyframe'), icon=ui_theme.TAB_ICONS['images'])
         self.setup_keyframe_tab()
 
         # Tab 2: Patcher
         self.tab_patcher = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.tab_patcher, text=get_text('tab_patcher'))
+        self.notebook.add(self.tab_patcher, text=get_text('tab_patcher'), icon=ui_theme.TAB_ICONS['wrench'])
         self.setup_patcher_tab()
 
         # Tab 3: Zoom View
         self.tab_zoom = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.tab_zoom, text=get_text('tab_zoom'))
+        self.notebook.add(self.tab_zoom, text=get_text('tab_zoom'), icon=ui_theme.TAB_ICONS['zoom'])
         self.setup_zoom_tab()
 
         # Tab 4: Merge Files
         self.tab_merge = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.tab_merge, text=get_text('tab_merge'))
+        self.notebook.add(self.tab_merge, text=get_text('tab_merge'), icon=ui_theme.TAB_ICONS['merge'])
         self.setup_merge_tab()
 
         # Tab 5: Quick Safe Cut
         self.tab_cut = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.tab_cut, text=get_text('tab_cut'))
+        self.notebook.add(self.tab_cut, text=get_text('tab_cut'), icon=ui_theme.TAB_ICONS['cut'])
         self.setup_cut_tab()
 
         # Tab 6: Batch Transcode
         self.tab_transcode = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.tab_transcode, text=get_text('tab_transcode'))
+        self.notebook.add(self.tab_transcode, text=get_text('tab_transcode'), icon=ui_theme.TAB_ICONS['transcode'])
         self.setup_transcode_tab()
 
         # Attach hover tooltips to all notebook tabs
@@ -186,7 +180,7 @@ class VRVideoToolsApp:
         def _do():
             text_widget.config(state='normal')
             text_widget.insert('end', message + "\n")
-            text_widget.see('end')
+            ui_theme.scroll_text_to_end(text_widget)
             text_widget.config(state='disabled')
         self.root.after(0, _do)
 
@@ -219,7 +213,7 @@ class VRVideoToolsApp:
         log_frame = ttk.LabelFrame(frame, text=get_text('lbl_log'), padding=10)
         log_frame.pack(fill='both', expand=True, pady=5)
         
-        self.ss_log = tk.Text(log_frame, height=10, state='disabled')
+        self.ss_log = scrolledtext.ScrolledText(log_frame, height=10, state='disabled')
         self.ss_log.pack(fill='both', expand=True)
 
     def browse_ss_video(self):
@@ -303,7 +297,7 @@ class VRVideoToolsApp:
         log_frame = ttk.LabelFrame(frame, text=get_text('lbl_log'), padding=10)
         log_frame.pack(fill='both', expand=True, pady=5)
         
-        self.patch_log = tk.Text(log_frame, height=10, state='disabled')
+        self.patch_log = scrolledtext.ScrolledText(log_frame, height=10, state='disabled')
         self.patch_log.pack(fill='both', expand=True)
 
     def browse_patch_main(self):
@@ -444,7 +438,7 @@ class VRVideoToolsApp:
         log_frame = ttk.LabelFrame(frame, text=get_text('lbl_log'), padding=10)
         log_frame.pack(fill='x', pady=5, side='bottom')
         
-        self.zoom_log = tk.Text(log_frame, height=4, state='disabled')
+        self.zoom_log = scrolledtext.ScrolledText(log_frame, height=4, state='disabled')
         self.zoom_log.pack(fill='both', expand=True)
 
         self.orig_img = None
@@ -650,7 +644,7 @@ class VRVideoToolsApp:
         log_frame = ttk.LabelFrame(frame, text=get_text('lbl_log'), padding=10)
         log_frame.pack(fill='x', pady=5, side='bottom')
         
-        self.merge_log = tk.Text(log_frame, height=8, state='disabled')
+        self.merge_log = scrolledtext.ScrolledText(log_frame, height=8, state='disabled')
         self.merge_log.pack(fill='both', expand=True)
 
     def add_merge_row(self):
@@ -806,7 +800,7 @@ class VRVideoToolsApp:
         log_frame = ttk.LabelFrame(frame, text=get_text('lbl_log'), padding=10)
         log_frame.pack(fill='x', pady=5, side='bottom')
         
-        self.cut_log = tk.Text(log_frame, height=15, state='disabled')
+        self.cut_log = scrolledtext.ScrolledText(log_frame, height=15, state='disabled')
         self.cut_log.pack(fill='both', expand=True)
 
     # --- Batch Transcode Tab ---
@@ -888,7 +882,7 @@ class VRVideoToolsApp:
         log_frame.grid(row=3, column=0, columnspan=2, padx=5, pady=5, sticky='nsew')
 
         frame.grid_rowconfigure(3, weight=1)
-        self.transcode_log = tk.Text(log_frame, height=14, state='disabled')
+        self.transcode_log = scrolledtext.ScrolledText(log_frame, height=14, state='disabled')
         self.transcode_log.pack(fill='both', expand=True)
 
     def setup_keyframe_tab(self):
@@ -957,7 +951,7 @@ class VRVideoToolsApp:
         
         frame.grid_rowconfigure(8, weight=1)
         
-        self.kf_log = tk.Text(log_label_frame, height=10, state='disabled')
+        self.kf_log = scrolledtext.ScrolledText(log_label_frame, height=10, state='disabled')
         self.kf_log.pack(fill='both', expand=True)
 
     def browse_kf_video(self):

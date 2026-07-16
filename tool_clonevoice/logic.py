@@ -125,13 +125,21 @@ def write_srt(path: str | Path, segments: list, text_key: str, speaker_prefix: b
 MAX_WORD_GAP = 2.0
 
 
+# Segment bounds may legitimately sit past the word extent: extend_entry_tails
+# pushes the end up to ~1.12s beyond the last word's early DTW stamp, and the
+# silence-valley clamp moves edges by its pad. Anything further out is the old
+# stray-timestamp bug and falls back to the word extent.
+WORD_EXTENT_SLACK = 1.3
+
+
 def _split_on_word_gaps(start: float, end: float, text: str, words: list, max_gap: float = MAX_WORD_GAP) -> list:
     """Split one segment into bursts separated by word gaps > ``max_gap``.
 
     ``words`` are ``{"w", "start", "end"}`` dicts. With no usable words the
     segment is returned unchanged; a single burst keeps the original (richer)
-    text but clamps its bounds to the real word extent; multiple bursts rebuild
-    each sub-text from the per-word tokens.
+    text and its energy-verified bounds (unless they stray wildly from the
+    word extent); multiple bursts rebuild each sub-text from the per-word
+    tokens.
     """
     if not words:
         return [{"start": start, "end": end, "text": text, "words": []}]
@@ -142,8 +150,14 @@ def _split_on_word_gaps(start: float, end: float, text: str, words: list, max_ga
         else:
             groups[-1].append(w)
     if len(groups) == 1:
-        return [{"start": float(words[0]["start"]), "end": float(words[-1]["end"]),
-                 "text": text, "words": words}]
+        # Do NOT clamp sane bounds to the word extent: the tail-extended end
+        # carries real trailing voice that DTW word stamps miss (SI_TEST_2
+        # lines 1/2/11 lost 0.3-0.4s of speech to the old clamp, audibly
+        # truncating the dub).
+        w_start, w_end = float(words[0]["start"]), float(words[-1]["end"])
+        keep_start = start if abs(start - w_start) <= WORD_EXTENT_SLACK else w_start
+        keep_end = end if abs(end - w_end) <= WORD_EXTENT_SLACK else w_end
+        return [{"start": keep_start, "end": keep_end, "text": text, "words": words}]
     subs = []
     for g in groups:
         t = "".join(x.get("w", "") for x in g).strip()

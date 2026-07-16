@@ -5,13 +5,19 @@ splitting + auditok fallback, wide-intake faster-whisper options, kotoba
 alignment-head repair, and the hallucination/repetition detectors — but adapted
 for dubbing instead of subtitles:
 
-  * language is configurable (tool_subtitle hard-codes Japanese);
+  * language is configurable (tool_subtitle hard-codes Japanese, and its
+    ``clean_text`` strips inner spaces — overridden here);
   * per-word timestamps are captured and offset-corrected (needed for the
     duration-aligned voice clone), not discarded;
+  * decoding reuses ``collect_segment_entries`` + ``extend_entry_tails``, so
+    the dub gets word anchoring, pause/silence-valley splitting, tail repair
+    and per-line acoustic stats identical to the subtitle pipeline;
   * filtering preserves the *true acoustic* start/end of each line. We must NOT
     apply tool_subtitle's readability-oriented duration remap
-    (``subtitle_duration_for_text``), which rewrites end times and would break
-    lip-sync / fit-to-duration in the dub.
+    (``subtitle_duration_for_text``) or its fragment merging, which rewrite
+    times for readability and would break lip-sync / fit-to-duration in the
+    dub; the acoustic hallucination checks (``acoustic_removal_reason``) DO
+    apply — an invented line would be synthesised out loud.
 
 Why this fixes the "漏句" (dropped lines) seen with the old whisperx path: the
 old path called ``faster_whisper.transcribe(vad_filter=True)`` once over the
@@ -45,6 +51,12 @@ class CloneTranscriber(subl.SubtitleGenerator):
         # faster-whisper wants None (not "") for auto-detect.
         self.language = language or None
 
+    @staticmethod
+    def clean_text(text: str) -> str:
+        # tool_subtitle's clean_text strips ALL spaces (Japanese-only); the dub
+        # source language is configurable, so inner spaces must survive.
+        return (text or "").strip()
+
     # --- scene splitting with graceful degradation ---------------------------
 
     def _split_chunks(self, audio_file: str):
@@ -66,6 +78,14 @@ class CloneTranscriber(subl.SubtitleGenerator):
     # --- chunked decode keeping word timestamps ------------------------------
 
     def transcribe_words(self, audio_file: str) -> dict:
+        """Chunked decode through the shared collect pipeline.
+
+        ``collect_segment_entries`` gives word anchoring, pause/silence-valley
+        splitting and the peak/coverage stats; ``extend_entry_tails`` repairs
+        the systematically-early DTW word ends. Both matter even more for
+        dubbing than for subtitles: a merged multi-utterance line or a
+        truncated tail breaks the duration-aligned voice clone.
+        """
         scene_mode = self.is_scene_split_enabled()
         asr_options = self.base_asr_options(scene_mode=scene_mode)
         # The duration-aligned dub needs per-word times; force them on regardless
@@ -73,6 +93,9 @@ class CloneTranscriber(subl.SubtitleGenerator):
         asr_options["word_timestamps"] = True
         decode_kwargs = {k: v for k, v in asr_options.items() if k != "vad_parameters"}
 
+        # Stale probs from a previous file must not feed this file's speech
+        # coverage checks; the whisperseg split path repopulates this.
+        self.last_speech_probs = None
         chunks = self._split_chunks(audio_file)
         total = len(chunks)
         self.log_callback(
@@ -105,34 +128,15 @@ class CloneTranscriber(subl.SubtitleGenerator):
             if detected_lang is None:
                 detected_lang = getattr(info, "language", None)
 
+            chunk_entries: list[dict] = []
             for segment in segments:
-                text = (segment.text or "").strip()
-                if not text:
-                    continue
-                words = [
-                    {"word": w.word, "start": float(w.start) + offset, "end": float(w.end) + offset}
-                    for w in (segment.words or [])
-                    if w.start is not None and w.end is not None
-                ]
-                seg_start = float(segment.start) + offset
-                seg_end = float(segment.end) + offset
-                # Re-anchor to word-level (DTW) times: on difficult audio the
-                # decoder stamps a line at the chunk start seconds before it was
-                # spoken, while word times stay on the audio. The dub's
-                # fit-to-duration depends on these boundaries being acoustic.
-                if words and words[-1]["end"] - words[0]["start"] >= 0.05:
-                    if abs(words[0]["start"] - seg_start) > 0.5:
-                        reanchored_far += 1
-                    seg_start = words[0]["start"]
-                    seg_end = words[-1]["end"]
-                raw.append({
-                    "start": seg_start,
-                    "end": seg_end,
-                    "text": text,
-                    "words": words,
-                    "avg_logprob": getattr(segment, "avg_logprob", None),
-                    "no_speech_prob": getattr(segment, "no_speech_prob", None),
-                })
+                entries, moved_far = self.collect_segment_entries(
+                    segment, offset, chunk_audio=chunk["array"]
+                )
+                reanchored_far += moved_far
+                chunk_entries.extend(entries)
+            self.extend_entry_tails(chunk_entries, chunk["array"], offset)
+            raw.extend(chunk_entries)
 
         if reanchored_far:
             self.log_callback(
@@ -156,7 +160,7 @@ class CloneTranscriber(subl.SubtitleGenerator):
         total_end = max((s["end"] for s in ordered), default=0.0)
 
         kept: list[dict] = []
-        removed_noise = removed_hall = removed_dup = compressed = 0
+        removed_noise = removed_hall = removed_dup = removed_acoustic = compressed = 0
         window = subl.DUPLICATE_LOOKBACK_SECONDS
 
         for item in ordered:
@@ -186,6 +190,17 @@ class CloneTranscriber(subl.SubtitleGenerator):
                 no_speech_prob=item.get("no_speech_prob"),
             ):
                 removed_hall += 1
+                continue
+            # Acoustic hallucination checks (peak/coverage stats from
+            # collect_segment_entries). Vital for dubbing: an invented line
+            # would be synthesised out loud over breathing or silence.
+            acoustic_reason = self.acoustic_removal_reason(item)
+            if acoustic_reason:
+                removed_acoustic += 1
+                self.log_callback(
+                    f"[seg] dropped [{acoustic_reason}] "
+                    f"{item['start']:.2f}-{item['end']:.2f} {text[:30]}"
+                )
                 continue
 
             # Near-duplicate against recent kept lines (overlapping chunks repeat
@@ -224,8 +239,8 @@ class CloneTranscriber(subl.SubtitleGenerator):
 
         self.log_callback(
             f"[seg] kept {len(kept)} lines "
-            f"(removed {removed_dup} dup, {removed_noise} noise, {removed_hall} hallucination; "
-            f"compressed {compressed} repetition lines)"
+            f"(removed {removed_dup} dup, {removed_noise} noise, {removed_hall} hallucination, "
+            f"{removed_acoustic} acoustic; compressed {compressed} repetition lines)"
         )
         return kept
 

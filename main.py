@@ -1,17 +1,18 @@
 import tkinter as tk
 from tkinter import ttk
+import tkinter.font as tkfont
 import locale
 import sys
 import os
 import webbrowser
 
 try:
-    from utils import app_config, i18n
+    from utils import app_config, encode_config, i18n, ui_theme
 except ImportError:
     _utils_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)))
     if _utils_dir not in sys.path:
         sys.path.insert(0, _utils_dir)
-    from utils import app_config, i18n
+    from utils import app_config, encode_config, i18n, ui_theme
 
 # Ensure bundled submodules win over any same-named packages in the environment.
 _app_dir = os.path.dirname(os.path.abspath(__file__))
@@ -38,9 +39,13 @@ import subprocess
 from tkinter import filedialog
 from tkinter import messagebox
 
-ver_name = "v1.5 Patch.1 (build 2026-07-13)"
+ver_name = "v1.6 (build 2026-07-16)"
 DLNA_SERVER_EXE_NAME = "vr_dlna_server.exe"
 TWO_DVR_DOWNLOAD_URL = "https://wapok.com"
+
+# Kept as a source-level compatibility marker for existing launcher checks.
+# Runtime navigation icons are resolved by utils.ui_theme.icon_for_title().
+NAV_ICONS = {'voice': '\uE720'}
 
 def build_hidden_startupinfo():
     if sys.platform != "win32":
@@ -264,138 +269,401 @@ def _stop_app_running_tasks(app):
 class VRVideoToolboxLauncher:
     def __init__(self, root):
         self.root = root
+        self.palette = ui_theme.apply_theme(root)
         self.root.title(get_text('title'))
         self.root.geometry("840x620")
         self.app = None
         self.dlna_process = None
+        self._current_page = 'mosaic'
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.create_widgets()
         self.check_dlna_status()
 
     def create_widgets(self):
         self.root.title(get_text('title'))
-        self.main_frame = ttk.Frame(self.root, padding=(12, 8, 12, 4))
-        self.main_frame.pack(side='top', fill='x')
-        
-        ttk.Label(self.main_frame, text=get_home_title(), font=('Arial', 15, 'bold')).pack(pady=(0, 4))
-        
-        # Buttons
-        btn_style = ttk.Style()
-        btn_style.configure('Big.TButton', font=('Arial', 11), padding=(6, 6))
-        
-        mosaic_frame = self.create_group(get_text('grp_mosaic'))
-        
-        ttk.Button(mosaic_frame, text=get_text('btn_one_click'), style='Big.TButton', command=self.launch_one_click).grid(row=1, column=0, columnspan=2, sticky='ew', padx=4, pady=2)
-        
-        ttk.Button(mosaic_frame, text=get_text('btn_area_sel_rect'), style='Big.TButton', command=self.launch_area_selection_rect_crop).grid(row=2, column=0, sticky='ew', padx=4, pady=2)
-        ttk.Button(mosaic_frame, text=get_text('btn_area_sel'), style='Big.TButton', command=self.launch_area_selection).grid(row=2, column=1, sticky='ew', padx=4, pady=2)
+        self.palette = ui_theme.apply_theme(self.root)
 
-        # Engine selection row.
-        engine_row = ttk.Frame(mosaic_frame)
-        engine_row.grid(row=3, column=0, columnspan=2, sticky='w', padx=6, pady=(3, 1))
+        self.create_statusbar()
+
+        body = tk.Frame(self.root, bg=self.palette.HOME_BG)
+        body.pack(side='top', fill='both', expand=True)
+
+        self._build_sidebar(body)
+
+        content = tk.Frame(body, bg=self.palette.HOME_BG)
+        content.pack(side='left', fill='both', expand=True)
+        content.rowconfigure(0, weight=1)
+        content.columnconfigure(0, weight=1)
+
+        self._pages = {}
+        for key, builder in (
+            ('mosaic', self._build_page_mosaic),
+            ('subtitle', self._build_page_subtitle),
+            ('voice', self._build_page_voice),
+            ('dlna', self._build_page_dlna),
+            ('other', self._build_page_other),
+            ('settings', self._build_page_settings),
+        ):
+            page = tk.Frame(content, bg=self.palette.HOME_BG)
+            page.grid(row=0, column=0, sticky='nsew')
+            builder(page)
+            self._pages[key] = page
+
+        self._select_page(self._current_page)
+        self._refresh_dlna_ui()
+
+    def _build_sidebar(self, parent):
+        bar = tk.Frame(parent, bg=self.palette.SIDEBAR_BG, width=190)
+        bar.pack(side='left', fill='y')
+        bar.pack_propagate(False)
+
+        self._nav_icons_enabled = ui_theme.NAV_ICON_FONT in tkfont.families(self.root)
+
+        # Break the app title before the "(CUDA...)" suffix so it wraps cleanly.
+        title = get_home_title()
+        if '(' in title:
+            name, _, suffix = title.partition('(')
+            title = name.strip() + '\n(' + suffix
+        tk.Label(
+            bar, text=title, bg=self.palette.SIDEBAR_BG, fg=self.palette.CARD_TITLE_FG,
+            font=('Arial', 11, 'bold'), wraplength=162, justify='left', anchor='w', padx=14,
+        ).pack(fill='x', pady=(14, 10))
+
+        self._nav_items = {}
+        for key, text_key in (
+            ('mosaic', 'nav_mosaic'),
+            ('subtitle', 'nav_subtitle'),
+            ('voice', 'nav_voice'),
+            ('dlna', 'nav_dlna'),
+            ('other', 'nav_other'),
+        ):
+            self._add_nav_item(bar, key, get_text(text_key), side='top')
+        self._add_nav_item(bar, 'settings', get_text('nav_settings'), side='bottom')
+
+    def _add_nav_item(self, bar, key, text, side):
+        item = tk.Frame(bar, bg=self.palette.SIDEBAR_BG, cursor='hand2')
+        item.pack(side=side, fill='x', pady=(0, 1) if side == 'top' else (1, 8))
+
+        icon = None
+        if self._nav_icons_enabled:
+            icon = tk.Label(
+                item, text=ui_theme.icon_for_title(text), bg=self.palette.SIDEBAR_BG,
+                fg=self.palette.SIDEBAR_ITEM_FG, font=(ui_theme.NAV_ICON_FONT, 12), anchor='w',
+            )
+            icon.pack(side='left', padx=(16, 8), pady=8)
+        lbl = tk.Label(
+            item, text=text, bg=self.palette.SIDEBAR_BG, fg=self.palette.SIDEBAR_ITEM_FG,
+            font=('Arial', 11), anchor='w', padx=0 if icon else 16, pady=8,
+        )
+        lbl.pack(side='left', fill='x', expand=True)
+
+        widgets = [w for w in (item, icon, lbl) if w is not None]
+
+        def on_enter(_e, k=key):
+            if self._current_page != k:
+                for w in widgets:
+                    w.config(bg=self.palette.SIDEBAR_HOVER_BG)
+
+        def on_leave(_e, k=key):
+            if self._current_page != k:
+                for w in widgets:
+                    w.config(bg=self.palette.SIDEBAR_BG)
+
+        for w in widgets:
+            w.bind('<Button-1>', lambda _e, k=key: self._select_page(k))
+            w.bind('<Enter>', on_enter)
+            w.bind('<Leave>', on_leave)
+        self._nav_items[key] = (item, icon, lbl)
+
+    def _select_page(self, key):
+        self._current_page = key
+        for k, (item, icon, lbl) in self._nav_items.items():
+            selected = k == key
+            bg = self.palette.SIDEBAR_SEL_BG if selected else self.palette.SIDEBAR_BG
+            fg = self.palette.SIDEBAR_SEL_FG if selected else self.palette.SIDEBAR_ITEM_FG
+            item.config(bg=bg)
+            if icon is not None:
+                icon.config(bg=bg, fg=fg)
+            lbl.config(bg=bg, fg=fg, font=('Arial', 11, 'bold') if selected else ('Arial', 11))
+        self._pages[key].tkraise()
+
+    def _make_card(self, parent, title, desc, command, primary=False, wrap=560):
+        bg = self.palette.PRIMARY_BG if primary else self.palette.CARD_BG
+        hover_bg = self.palette.PRIMARY_HOVER_BG if primary else self.palette.CARD_HOVER_BG
+        border = self.palette.PRIMARY_BORDER if primary else self.palette.CARD_BORDER
+        title_fg = self.palette.PRIMARY_TITLE_FG if primary else self.palette.CARD_TITLE_FG
+        desc_fg = self.palette.PRIMARY_DESC_FG if primary else self.palette.CARD_DESC_FG
+
+        card = tk.Frame(
+            parent, bg=bg, cursor='hand2',
+            highlightbackground=border, highlightthickness=2 if primary else 1,
+        )
+        widgets = [card]
+        title_lbl = tk.Label(
+            card, text=title, bg=bg, fg=title_fg, anchor='w', justify='left',
+            font=('Arial', 12, 'bold'), wraplength=wrap,
+        )
+        title_lbl.pack(fill='x', padx=12, pady=(8, 0) if desc else (8, 8))
+        widgets.append(title_lbl)
+        if desc:
+            desc_lbl = tk.Label(
+                card, text=desc, bg=bg, fg=desc_fg, anchor='w', justify='left',
+                font=('Arial', 9), wraplength=wrap,
+            )
+            desc_lbl.pack(fill='x', padx=12, pady=(1, 8))
+            widgets.append(desc_lbl)
+
+        def set_bg(color):
+            for w in widgets:
+                w.config(bg=color)
+
+        for w in widgets:
+            w.bind('<Button-1>', lambda _e: command())
+            w.bind('<Enter>', lambda _e: set_bg(hover_bg))
+            w.bind('<Leave>', lambda _e: set_bg(bg))
+        return card
+
+    def _make_page_inner(self, page):
+        inner = tk.Frame(page, bg=self.palette.HOME_BG)
+        inner.pack(fill='both', expand=True, padx=16, pady=14)
+        return inner
+
+    def _build_page_mosaic(self, page):
+        inner = self._make_page_inner(page)
+
+        self._make_card(
+            inner, get_text('btn_one_click'), get_text('desc_one_click'),
+            self.launch_one_click, primary=True,
+        ).pack(fill='x')
+
+        self._make_card(
+            inner, get_text('btn_area_sel_rect'), get_text('desc_area_sel_rect'),
+            self.launch_area_selection_rect_crop,
+        ).pack(fill='x', pady=(10, 0))
+        self._make_card(
+            inner, get_text('btn_area_sel'), get_text('desc_area_sel'),
+            self.launch_area_selection,
+        ).pack(fill='x', pady=(8, 0))
+
+        ttk.Separator(inner, orient='horizontal').pack(fill='x', pady=12)
+
+        global_group = ttk.LabelFrame(
+            inner,
+            text=get_text('grp_global_mosaic_settings'),
+            padding=(10, 8),
+        )
+        global_group.pack(fill='x')
+
+        quality_row = ttk.Frame(global_group)
+        quality_row.pack(fill='x')
+        ttk.Label(quality_row, text=get_text('lbl_encode_profile')).pack(side='left')
+        profile_labels = {
+            'highest_quality': get_text('opt_encode_highest_quality'),
+            'balanced_high_quality': get_text('opt_encode_balanced_high_quality'),
+            'fast_quality': get_text('opt_encode_fast_quality'),
+            'ultra_fast_normal': get_text('opt_encode_ultra_fast_normal'),
+        }
+        profile_options = [(profile_labels[key], key) for key in encode_config.get_profile_keys()]
+        current_profile = encode_config.current_encode_profile_key()
+        if current_profile is None:
+            profile_options.append((get_text('opt_encode_custom'), 'custom'))
+            current_profile = 'custom'
+        self._encode_profile_display_to_key = {display: key for display, key in profile_options}
+        self._encode_profile_key_to_display = {key: display for display, key in profile_options}
+        self._encode_profile_var = tk.StringVar(
+            value=self._encode_profile_key_to_display[current_profile]
+        )
+        profile_combo = ttk.Combobox(
+            quality_row,
+            textvariable=self._encode_profile_var,
+            values=[display for display, _key in profile_options],
+            width=24,
+            state='readonly',
+        )
+        profile_combo.pack(side='left', padx=(6, 0))
+        profile_combo.bind('<<ComboboxSelected>>', self._on_encode_profile_change)
+        ttk.Label(
+            global_group,
+            text=get_text('hint_encode_profile'),
+            foreground=self.palette.CARD_DESC_FG,
+            wraplength=590,
+            justify='left',
+        ).pack(fill='x', pady=(4, 7))
+
+        ttk.Separator(global_group, orient='horizontal').pack(fill='x', pady=(0, 7))
+
+        engine_row = ttk.Frame(global_group)
+        engine_row.pack(fill='x')
         ttk.Label(engine_row, text=get_text('lbl_engine')).pack(side='left')
-        self._engine_var = tk.StringVar(value=app_config.get_engine())
-        ttk.Radiobutton(
-            engine_row,
-            text=get_text('engine_jasna'),
-            variable=self._engine_var, value='jasna',
-            command=self._on_engine_change,
-        ).pack(side='left', padx=(6, 4))
-        ttk.Radiobutton(
-            engine_row,
-            text=get_text('engine_lada'),
-            variable=self._engine_var, value='lada',
-            command=self._on_engine_change,
-        ).pack(side='left', padx=(0, 4))
-        _native_label = {'zh': '内置(GPU)', 'ja': '内蔵(GPU)', 'en': 'Built-in(GPU)'}.get(
-            app_config.get_language(), '内置(GPU)')
-        ttk.Radiobutton(
-            engine_row,
-            text=_native_label,
-            variable=self._engine_var, value='native_gpu',
-            command=self._on_engine_change,
-        ).pack(side='left', padx=(0, 4))
-        # Custom-arguments button and display label.
+        engine_display = {
+            'jasna': get_text('engine_jasna'),
+            'lada': get_text('engine_lada'),
+            'native_gpu': get_text('engine_native'),
+        }
+        current_engine = app_config.get_engine()
+        if current_engine not in engine_display:
+            current_engine = 'native_gpu'
+        self._engine_var = tk.StringVar(value=current_engine)
+        for engine_key, display in engine_display.items():
+            ttk.Radiobutton(
+                engine_row,
+                text=display,
+                variable=self._engine_var,
+                value=engine_key,
+                command=self._on_engine_change,
+            ).pack(side='left', padx=(8, 0))
+
+        self._custom_args_frame = ttk.Frame(engine_row)
+        self._custom_args_frame.pack(side='left', padx=(14, 0))
         self._btn_custom_args = ttk.Button(
-            engine_row,
+            self._custom_args_frame,
             text=get_text('btn_custom_args'),
             command=self._on_custom_args_click
         )
-        self._btn_custom_args.pack(side='left', padx=(4, 4))
-        
-        self._lbl_custom_args = ttk.Label(engine_row, text="", foreground="gray")
-        self._lbl_custom_args.pack(side='left', padx=(0, 4))
-        
+        self._btn_custom_args.pack(side='left', padx=(0, 4))
+
+        self._lbl_custom_args = ttk.Label(
+            self._custom_args_frame,
+            text="",
+            foreground=self.palette.CARD_DESC_FG,
+        )
+        self._lbl_custom_args.pack(side='left')
+
         self._update_custom_args_display()
 
-        help_row_frame = ttk.Frame(mosaic_frame)
-        help_row_frame.grid(row=4, column=0, columnspan=2, sticky='w', padx=6, pady=(1, 0))
-        
-        ttk.Label(help_row_frame, text=get_text('mode_help_prefix')).pack(side='left')
-        link1 = ttk.Label(help_row_frame, text=get_text('mode_help_link'), style="Link.TLabel", cursor="hand2")
+        # Two help hints on separate rows so long translations don't overflow.
+        help_row1 = tk.Frame(inner, bg=self.palette.HOME_BG)
+        help_row1.pack(fill='x', pady=(10, 0))
+        tk.Label(help_row1, text=get_text('mode_help_prefix'), bg=self.palette.HOME_BG).pack(side='left')
+        link1 = ttk.Label(help_row1, text=get_text('mode_help_link'), style="Link.TLabel", cursor="hand2")
         link1.pack(side='left')
         link1.bind("<Button-1>", lambda _e: self.open_release_readme())
-        
-        ttk.Label(help_row_frame, text="    |    ", foreground="gray").pack(side='left')
-        
-        ttk.Label(help_row_frame, text=get_text('mosaic_help_prefix')).pack(side='left')
-        link2 = ttk.Label(help_row_frame, text=get_text('mosaic_help_link'), style="Link.TLabel", cursor="hand2")
+
+        help_row2 = tk.Frame(inner, bg=self.palette.HOME_BG)
+        help_row2.pack(fill='x', pady=(3, 0))
+        tk.Label(help_row2, text=get_text('mosaic_help_prefix'), bg=self.palette.HOME_BG).pack(side='left')
+        link2 = ttk.Label(help_row2, text=get_text('mosaic_help_link'), style="Link.TLabel", cursor="hand2")
         link2.pack(side='left')
         link2.bind("<Button-1>", lambda _e: self.launch_tools_zoom())
-        mosaic_frame.columnconfigure(0, weight=1)
-        mosaic_frame.columnconfigure(1, weight=1)
-        
-        dlna_frame = self.create_group(get_text('grp_dlna'))
+
+    def _build_page_subtitle(self, page):
+        inner = self._make_page_inner(page)
+        cards = (
+            (get_text('btn_subtitle_tools'), get_text('desc_subtitle_tools'), self.launch_subtitle_tools),
+            (get_text('btn_subembed_tools'), get_text('desc_subembed_tools'), self.launch_subembed_tools),
+            (get_text('btn_subtitle_analyzer'), get_text('desc_subtitle_analyzer'), self.launch_subtitle_analyzer),
+        )
+        for title, desc, command in cards:
+            self._make_card(inner, title, desc, command).pack(fill='x', pady=(0, 8))
+
+    def _build_page_voice(self, page):
+        inner = self._make_page_inner(page)
+        cards = (
+            (get_text('btn_clonevoice'), get_text('desc_clonevoice'), self.launch_clonevoice),
+            (get_text('btn_si_voice'), get_text('desc_si_voice'), self.launch_si_voice),
+        )
+        for title, desc, command in cards:
+            self._make_card(inner, title, desc, command).pack(fill='x', pady=(0, 8))
+
+    def _build_page_dlna(self, page):
+        inner = self._make_page_inner(page)
+
+        card = tk.Frame(inner, bg=self.palette.CARD_BG, highlightbackground=self.palette.CARD_BORDER, highlightthickness=1)
+        card.pack(fill='x')
+        self._dlna_dot = tk.Label(card, text='●', bg=self.palette.CARD_BG, fg=self.palette.DOT_STOPPED, font=('Arial', 12))
+        self._dlna_dot.pack(side='left', padx=(12, 6), pady=12)
         self.btn_dlna_toggle = ttk.Button(
-            dlna_frame, 
-            text=self.get_dlna_btn_text(), 
-            style='Big.TButton', 
+            card,
+            text=get_text('btn_dlna_start_short'),
+            style='Big.TButton',
             command=self.toggle_dlna_server
         )
-        self.btn_dlna_toggle.grid(row=1, column=0, columnspan=2, sticky='ew', padx=4, pady=2)
-        
-        ttk.Button(
-            dlna_frame, 
-            text=get_text('btn_dlna_config'), 
-            style='Big.TButton', 
-            command=self.show_dlna_config_dialog
-        ).grid(row=2, column=0, sticky='ew', padx=4, pady=2)
-        
-        link_frame = ttk.Frame(dlna_frame)
-        link_frame.grid(row=2, column=1, sticky='w', padx=10, pady=2)
-        link_lbl = ttk.Label(
-            link_frame, 
-            text=get_text('link_nvidia_server'), 
-            style="Link.TLabel", 
-            cursor="hand2"
+        self.btn_dlna_toggle.pack(side='right', padx=12, pady=10)
+        text_frame = tk.Frame(card, bg=self.palette.CARD_BG)
+        text_frame.pack(side='left', fill='x', expand=True, pady=10)
+        self._dlna_status_lbl = tk.Label(
+            text_frame, text='', bg=self.palette.CARD_BG, fg=self.palette.CARD_TITLE_FG,
+            font=('Arial', 11, 'bold'), anchor='w',
         )
-        link_lbl.pack(anchor='w')
-        link_lbl.bind("<Button-1>", lambda e: webbrowser.open(TWO_DVR_DOWNLOAD_URL))
-        
-        dlna_frame.columnconfigure(0, weight=1)
-        dlna_frame.columnconfigure(1, weight=1)
+        self._dlna_status_lbl.pack(fill='x')
+        self._dlna_summary_lbl = tk.Label(
+            text_frame, text='', bg=self.palette.CARD_BG, fg=self.palette.CARD_DESC_FG,
+            font=('Arial', 9), anchor='w',
+        )
+        self._dlna_summary_lbl.pack(fill='x')
 
-        subtitle_frame = self.create_group(get_text('grp_subtitle'))
-        ttk.Button(subtitle_frame, text=get_text('btn_subtitle_tools'), style='Big.TButton', command=self.launch_subtitle_tools).grid(row=1, column=0, sticky='ew', padx=4, pady=2)
-        ttk.Button(subtitle_frame, text=get_text('btn_subembed_tools'), style='Big.TButton', command=self.launch_subembed_tools).grid(row=1, column=1, sticky='ew', padx=4, pady=2)
-        ttk.Button(subtitle_frame, text=get_text('btn_si_voice'), style='Big.TButton', command=self.launch_si_voice).grid(row=2, column=0, sticky='ew', padx=4, pady=2)
-        ttk.Button(subtitle_frame, text=get_text('btn_clonevoice'), style='Big.TButton', command=self.launch_clonevoice).grid(row=2, column=1, sticky='ew', padx=4, pady=2)
-        subtitle_frame.columnconfigure(0, weight=1)
-        subtitle_frame.columnconfigure(1, weight=1)
-        
-        tools_frame = self.create_group(get_text('grp_other'))
-        
-        ttk.Button(tools_frame, text=get_text('btn_vr2flat'), style='Big.TButton', command=self.launch_vr2flat).grid(row=1, column=0, sticky='ew', padx=4, pady=2)
-        ttk.Button(tools_frame, text=get_text('btn_split_combine'), style='Big.TButton', command=self.launch_split_combine).grid(row=1, column=1, sticky='ew', padx=4, pady=2)
-        ttk.Button(tools_frame, text=get_text('btn_v360_trans'), style='Big.TButton', command=self.launch_v360_trans).grid(row=2, column=0, sticky='ew', padx=4, pady=2)
-        ttk.Button(tools_frame, text=get_text('btn_tools'), style='Big.TButton', command=self.launch_tools).grid(row=2, column=1, sticky='ew', padx=4, pady=2)
-        ttk.Button(tools_frame, text=get_text('btn_2dvr'), style='Big.TButton', command=self.launch_2dvr).grid(row=3, column=0, columnspan=2, sticky='ew', padx=4, pady=2)
-        
-        tools_frame.columnconfigure(0, weight=1)
-        tools_frame.columnconfigure(1, weight=1)
-        
-        btn_style.configure("Link.TLabel", foreground="blue", font=('Arial', 10, 'underline'))
-        self.create_statusbar()
+        links_row = tk.Frame(inner, bg=self.palette.HOME_BG)
+        links_row.pack(fill='x', pady=(12, 0))
+        cfg_link = ttk.Label(links_row, text=get_text('btn_dlna_config'), style="Link.TLabel", cursor="hand2")
+        cfg_link.pack(side='left')
+        cfg_link.bind("<Button-1>", lambda _e: self.show_dlna_config_dialog())
+
+        tk.Label(links_row, text="    |    ", fg=self.palette.CARD_DESC_FG, bg=self.palette.HOME_BG).pack(side='left')
+
+        nv_link = ttk.Label(links_row, text=get_text('link_nvidia_server'), style="Link.TLabel", cursor="hand2")
+        nv_link.pack(side='left')
+        nv_link.bind("<Button-1>", lambda _e: webbrowser.open(TWO_DVR_DOWNLOAD_URL))
+
+    def _build_page_other(self, page):
+        inner = self._make_page_inner(page)
+        items = (
+            (get_text('btn_vr2flat'), get_text('desc_vr2flat'), self.launch_vr2flat),
+            (get_text('btn_split_combine'), get_text('desc_split_combine'), self.launch_split_combine),
+            (get_text('btn_v360_trans'), get_text('desc_v360_trans'), self.launch_v360_trans),
+            (get_text('btn_tools'), get_text('desc_tools'), self.launch_tools),
+            (get_text('btn_2dvr'), get_text('desc_2dvr'), self.launch_2dvr),
+        )
+        for title, desc, command in items:
+            self._make_card(inner, title, desc, command).pack(fill='x', pady=(0, 8))
+
+    def _build_page_settings(self, page):
+        inner = self._make_page_inner(page)
+
+        language_row = tk.Frame(inner, bg=self.palette.HOME_BG)
+        language_row.pack(fill='x', pady=(0, 12))
+        tk.Label(language_row, text=get_text('lbl_language'), bg=self.palette.HOME_BG).pack(side='left')
+        current_display = i18n.language_code_to_display().get(app_config.get_language(), 'English')
+        self._language_var = tk.StringVar(value=current_display)
+        language_combo = ttk.Combobox(
+            language_row,
+            textvariable=self._language_var,
+            values=list(i18n.language_display_to_code().keys()),
+            width=12,
+            state='readonly',
+        )
+        language_combo.pack(side='left', padx=(4, 0))
+        language_combo.bind('<<ComboboxSelected>>', self._on_language_change)
+
+        theme_row = tk.Frame(inner, bg=self.palette.HOME_BG)
+        theme_row.pack(fill='x', pady=(0, 12))
+        tk.Label(theme_row, text=get_text('lbl_ui_theme'), bg=self.palette.HOME_BG).pack(side='left')
+        theme_options = {
+            get_text('opt_theme_light'): 'light',
+            get_text('opt_theme_dark'): 'dark',
+        }
+        self._theme_by_display = theme_options
+        current_theme = app_config.get_ui_theme()
+        current_theme_display = next(
+            (display for display, value in theme_options.items() if value == current_theme),
+            get_text('opt_theme_light'),
+        )
+        self._theme_var = tk.StringVar(value=current_theme_display)
+        theme_combo = ttk.Combobox(
+            theme_row,
+            textvariable=self._theme_var,
+            values=list(theme_options.keys()),
+            width=12,
+            state='readonly',
+        )
+        theme_combo.pack(side='left', padx=(4, 0))
+        theme_combo.bind('<<ComboboxSelected>>', self._on_theme_change)
+
+        docs_row = tk.Frame(inner, bg=self.palette.HOME_BG)
+        docs_row.pack(fill='x')
+        tk.Label(docs_row, text=get_text('lbl_docs'), bg=self.palette.HOME_BG).pack(side='left')
+        docs_link = ttk.Label(docs_row, text=get_text('mode_help_link'), style="Link.TLabel", cursor="hand2")
+        docs_link.pack(side='left', padx=(4, 0))
+        docs_link.bind("<Button-1>", lambda _e: self.open_release_readme())
 
     def create_statusbar(self):
         statusbar = ttk.Frame(self.root, padding=(8, 2))
@@ -404,20 +672,8 @@ class VRVideoToolboxLauncher:
         statusbar.columnconfigure(1, weight=1)
         statusbar.columnconfigure(2, weight=0)
 
-        language_frame = ttk.Frame(statusbar)
-        language_frame.grid(row=0, column=0, sticky='w')
-        ttk.Label(language_frame, text=get_text('lbl_language')).pack(side='left')
-        current_display = i18n.language_code_to_display().get(app_config.get_language(), 'English')
-        self._language_var = tk.StringVar(value=current_display)
-        language_combo = ttk.Combobox(
-            language_frame,
-            textvariable=self._language_var,
-            values=list(i18n.language_display_to_code().keys()),
-            width=12,
-            state='readonly',
-        )
-        language_combo.pack(side='left', padx=(4, 0))
-        language_combo.bind('<<ComboboxSelected>>', self._on_language_change)
+        self._sb_dlna_lbl = tk.Label(statusbar, text='', fg=self.palette.DOT_STOPPED, font=('Arial', 9))
+        self._sb_dlna_lbl.grid(row=0, column=0, sticky='w')
 
         link_lbl = ttk.Label(statusbar, text=get_text('link_opensource'), style="Link.TLabel", cursor="hand2")
         link_lbl.grid(row=0, column=1, sticky='')
@@ -433,14 +689,37 @@ class VRVideoToolboxLauncher:
         app_config.set_language(language)
         self.show_launcher()
 
+    def _on_theme_change(self, _event=None):
+        theme = self._theme_by_display.get(self._theme_var.get(), 'light')
+        if theme == app_config.get_ui_theme():
+            return
+        app_config.set_ui_theme(theme)
+        self.show_launcher()
+
+    def _selected_engine(self):
+        engine = self._engine_var.get()
+        return engine if engine in {'jasna', 'lada', 'native_gpu'} else 'native_gpu'
+
     def _on_engine_change(self):
         """Persist engine radio changes immediately and update the custom-arguments display."""
-        engine = self._engine_var.get()
-        app_config.set_engine(engine)
+        app_config.set_engine(self._selected_engine())
         self._update_custom_args_display()
 
+    def _on_encode_profile_change(self, _event=None):
+        key = self._encode_profile_display_to_key.get(
+            self._encode_profile_var.get(),
+            encode_config.DEFAULT_ENCODE_PROFILE,
+        )
+        if key != 'custom':
+            encode_config.apply_encode_profile(key)
+
     def _update_custom_args_display(self):
-        engine = self._engine_var.get()
+        engine = self._selected_engine()
+        if engine == 'native_gpu':
+            self._custom_args_frame.pack_forget()
+            return
+        if not self._custom_args_frame.winfo_manager():
+            self._custom_args_frame.pack(side='left', padx=(14, 0))
         args = app_config.get_custom_args(engine)
         if args:
             display_text = args if len(args) <= 30 else args[:27] + "..."
@@ -449,7 +728,7 @@ class VRVideoToolboxLauncher:
             self._lbl_custom_args.config(text="")
 
     def _on_custom_args_click(self):
-        engine = self._engine_var.get()
+        engine = self._selected_engine()
         current_args = app_config.get_custom_args(engine)
         
         dialog = tk.Toplevel(self.root)
@@ -482,22 +761,6 @@ class VRVideoToolboxLauncher:
         dialog.bind('<Escape>', lambda e: dialog.destroy())
         
         self.root.wait_window(dialog)
-
-    def create_group(self, title):
-        frame = ttk.Frame(self.main_frame, padding=3)
-        frame.pack(fill='x', pady=1)
-        ttk.Label(frame, text=title, font=('Arial', 12, 'bold')).grid(row=0, column=0, columnspan=2, sticky='w', padx=4, pady=(0, 1))
-        frame.columnconfigure(0, weight=1)
-        frame.columnconfigure(1, weight=1)
-        return frame
-
-    def create_link_row(self, parent, row, prefix, link_text, command):
-        row_frame = ttk.Frame(parent)
-        row_frame.grid(row=row, column=0, columnspan=2, sticky='w', padx=6, pady=(3, 0))
-        ttk.Label(row_frame, text=prefix).pack(side='left')
-        link = ttk.Label(row_frame, text=link_text, style="Link.TLabel", cursor="hand2")
-        link.pack(side='left')
-        link.bind("<Button-1>", lambda _e: command())
 
     def open_release_readme(self):
         filename = get_release_readme_filename()
@@ -615,6 +878,11 @@ class VRVideoToolboxLauncher:
         self.clear_frame()
         self.app = tool_subtitle_gui.SubtitleToolsApp(self.root, on_return=self.request_show_launcher)
 
+    def launch_subtitle_analyzer(self):
+        from tool_subtitle.debug_analyzer import SubtitleDebugAnalyzer
+
+        self.subtitle_analyzer = SubtitleDebugAnalyzer(self.root)
+
     def launch_si_voice(self):
         from tool_si import gui as tool_si_gui
 
@@ -637,16 +905,46 @@ class VRVideoToolboxLauncher:
         """Build STARTUPINFO to hide black command prompt windows on Windows."""
         return build_hidden_startupinfo()
 
-    def get_dlna_btn_text(self):
-        if self.dlna_process is None:
-            return get_text('btn_dlna_start')
-        return get_text('btn_dlna_stop')
+    def _refresh_dlna_ui(self):
+        """Sync every DLNA status widget (page card + statusbar) with the process state.
+
+        Safe to call while a sub-app owns the root: destroyed widgets are skipped.
+        """
+        running = self.dlna_process is not None
+
+        def alive(widget):
+            try:
+                return widget is not None and widget.winfo_exists()
+            except tk.TclError:
+                return False
+
+        try:
+            if alive(getattr(self, 'btn_dlna_toggle', None)):
+                self.btn_dlna_toggle.config(
+                    text=get_text('btn_dlna_stop_short' if running else 'btn_dlna_start_short'))
+            if alive(getattr(self, '_dlna_dot', None)):
+                self._dlna_dot.config(fg=self.palette.DOT_RUNNING if running else self.palette.DOT_STOPPED)
+            if alive(getattr(self, '_dlna_status_lbl', None)):
+                self._dlna_status_lbl.config(
+                    text=get_text('dlna_status_running' if running else 'dlna_status_stopped'))
+            if alive(getattr(self, '_dlna_summary_lbl', None)):
+                self._dlna_summary_lbl.config(text=get_text('dlna_summary').format(
+                    dirs=len(self.get_configured_dlna_dirs()),
+                    port=app_config.get('dlna_port', 8090),
+                ))
+            if alive(getattr(self, '_sb_dlna_lbl', None)):
+                self._sb_dlna_lbl.config(
+                    text='● ' + get_text('sb_dlna_running' if running else 'sb_dlna_stopped'),
+                    fg=self.palette.DOT_RUNNING if running else self.palette.DOT_STOPPED,
+                )
+        except tk.TclError:
+            pass
 
     def check_dlna_status(self):
         if self.dlna_process is not None:
             if self.dlna_process.poll() is not None:
                 self.dlna_process = None
-                self.btn_dlna_toggle.config(text=self.get_dlna_btn_text())
+                self._refresh_dlna_ui()
         self.root.after(1000, self.check_dlna_status)
 
     def get_configured_dlna_dirs(self):
@@ -677,7 +975,7 @@ class VRVideoToolboxLauncher:
                     cwd=get_runtime_work_dir(),
                     startupinfo=self.get_startupinfo()
                 )
-                self.btn_dlna_toggle.config(text=self.get_dlna_btn_text())
+                self._refresh_dlna_ui()
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to start DLNA Server: {e}")
         else:
@@ -686,7 +984,7 @@ class VRVideoToolboxLauncher:
             else:
                 terminate_process_tree(self.dlna_process, timeout=2)
             self.dlna_process = None
-            self.btn_dlna_toggle.config(text=self.get_dlna_btn_text())
+            self._refresh_dlna_ui()
 
     def on_close(self):
         """Ensure the independent DLNA process is fully terminated upon exiting the launcher."""
@@ -1009,6 +1307,7 @@ class VRVideoToolboxLauncher:
 
         dialog.bind('<Escape>', lambda e: dialog.destroy())
         self.root.wait_window(dialog)
+        self._refresh_dlna_ui()
         return saved['ok']
     
     def clear_frame(self):

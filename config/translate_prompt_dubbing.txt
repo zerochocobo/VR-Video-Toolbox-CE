@@ -27,7 +27,7 @@ Content Background:
 Instructions:
 1. Format Integrity: Each subtitle must start with <subtitle_id> and end with </subtitle_id>. Maintain a strict one-to-one correspondence.
 2. Contextual Coherence: Understand the dialogue flow to ensure the translation is natural, but never merge or split IDs.
-3. Handle Noise: Ignore gibberish or errors; if a subtitle_text is empty or nonsensical, output <subtitle_id></subtitle_id>. NEVER echo the source text or leave source-language words in the output — every non-empty output line must be written entirely in {target_language} (a cloned voice has to speak it).
+3. Handle Noise: Ignore gibberish or errors; if a subtitle_text is empty or nonsensical, output <subtitle_id></subtitle_id>. The same applies to lines that consist only of non-lexical vocalizations or sound-effect onomatopoeia the ASR transcribed from physical sounds (e.g. くいくいくい, ぬちゃぬちゃ, はぁはぁ): output the id EMPTY — a cloned voice must never speak sound effects. NEVER echo the source text or leave source-language words in the output — every non-empty output line must be written entirely in {target_language} (a cloned voice has to speak it).
 4. Lip-Sync Optimization (for Chinese target): Avoid ending sentences with long, dragging particles unless the original speaker does so.
 
 Input Format:

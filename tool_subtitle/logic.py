@@ -178,6 +178,10 @@ HALLUCINATION_PHRASES = {
     "チャンネル登録と高評価をお願いします",
     "チャンネル登録お願いします",
     "最後まで見ていただきありがとうございました",
+    "次の動画でお会いしましょう",
+    "また次の動画でお会いしましょう",
+    "次の動画で会いましょう",
+    "次回の動画でお会いしましょう",
     "字幕by",
     "字幕バイ",
 }
@@ -187,6 +191,10 @@ SHORT_HALLUCINATION_PHRASES = {
     "おわり",
     "終わり",
     "バイバイ",
+    # Sleep-scene breathing is persistently transcribed as goodnight lines
+    # (mdvr-433 #3: six of seven were invented). The short-phrase guard keeps
+    # a confidently decoded real goodnight.
+    "おやすみなさい",
 }
 HARD_HALLUCINATION_NORMS = {
     re.sub(r"[、。！？!?….\s]+", "", phrase).lower()
@@ -227,6 +235,89 @@ WHISPERSEG_MIN_CHUNK_SECONDS = 2.0
 ENABLE_RMS_SPEECH_GATE = True
 RMS_SPEECH_MIN_DB = -50.0
 
+# Splitting decoded segments at intra-segment pauses (mdvr-433 debug,
+# 2026-07-14): the decoder can merge two utterances separated by >1s of
+# silence into a single segment, and DTW word alignment can absorb that
+# pause into the first word after it (通 stamped 21.1-22.9s while speech
+# resumed at 22.5s), so the pause never shows up as an inter-word gap.
+# Energy-trimming the silent lead of long words re-exposes the pause; the
+# segment is then split at inter-word gaps so one subtitle line never spans
+# a long silence.
+WORD_PAUSE_SPLIT_SECONDS = 0.7
+WORD_TIGHTEN_MIN_WORD_SECONDS = 1.0
+WORD_TIGHTEN_SILENCE_DB = -45.0
+WORD_TIGHTEN_MIN_LEAD_SECONDS = 0.4
+WORD_TIGHTEN_ONSET_PAD_SECONDS = 0.1
+
+# Acoustic hallucination checks in postprocess (2026-07-14). Two classes:
+# a line whose whole span never rises above a floor far below every VAD gate
+# is decoder invention over silence; a line whose span barely overlaps
+# WhisperSeg speech probability is invention over non-speech sound (moans,
+# music) and is removed only when the decoder itself was unsure (AND with
+# low confidence), so quiet-but-confident whispers survive. Lines without
+# word-anchored times get the silence check only under the same AND guard,
+# because a mis-stamped decoder span can cover real silence.
+HALLUCINATION_SILENCE_PEAK_DB = -55.0
+HALLUCINATION_SILENCE_FLOOR_MARGIN_DB = 5.0
+HALLUCINATION_SILENCE_PEAK_DB_NO_GATE = -60.0
+HALLUCINATION_MIN_SPEECH_COVERAGE = 0.25
+HALLUCINATION_LOW_CONFIDENCE_LOGPROB = -0.70
+HALLUCINATION_LOW_CONFIDENCE_NO_SPEECH = 0.50
+
+# DTW word-end stamps land 0.3-0.8s before the audible end of an utterance
+# (mdvr-433 entries 13/14: subtitles ended at 44.56/47.56 while speech ran to
+# 45.3/48.25). Extend a word-anchored end through contiguous voiced frames,
+# capped, never into the next line.
+TAIL_EXTEND_MAX_SECONDS = 1.0
+TAIL_EXTEND_VOICED_DB = -45.0
+TAIL_EXTEND_RELEASE_PAD_SECONDS = 0.12
+TAIL_EXTEND_GUARD_SECONDS = 0.05
+# Speech has short intra-word energy dips (glottal stops: 60ms at -50dB inside
+# はいありがとうございます, mdvr-433 44.78-44.84s) that must not end the
+# extension scan; only a silence run longer than this hangover does.
+TAIL_EXTEND_MAX_SILENCE_RUN_SECONDS = 0.18
+
+# DTW can distribute a long pause across several word boundaries so that no
+# single inter-word gap or over-long word reveals it (mdvr-433 #3 entry 13:
+# one 12.5s line covering four utterances with 0.9-1.5s silences between).
+# Energy is authoritative: split entries at internal silence runs, assigning
+# words to sides by midpoint and clamping the edges to the run boundaries.
+ENTRY_SPLIT_MIN_SILENCE_SECONDS = 0.8
+ENTRY_SPLIT_SILENCE_DB = -45.0
+ENTRY_SPLIT_EDGE_PAD_SECONDS = 0.12
+
+# A line that Whisper itself doubts (high no_speech) whose loudest frame sits
+# far below any real dialogue peak is invention over near-silence. Calibrated
+# on mdvr-433 1/2/3: every real line peaked >= -42dB, while 次の動画で…/ご視聴…
+# hallucinations and moan transcriptions sat at ns>=0.65 with peaks <= -48dB.
+HALLUCINATION_QUIET_NO_SPEECH = 0.65
+HALLUCINATION_QUIET_PEAK_DB = -48.0
+# Graduated second stage: when Whisper is nearly certain there is no speech
+# (ns>0.82) even a breathing-level peak (-38dB) cannot vouch for the line
+# (mdvr-433 #2 entry 18: 視聴ありがとうございました ns=0.86 pk=-41 survived
+# the -48dB floor). Every observed real line with a peak that quiet had ns
+# well below this bar.
+HALLUCINATION_QUIET_STRONG_NO_SPEECH = 0.82
+HALLUCINATION_QUIET_STRONG_PEAK_DB = -38.0
+
+# Breathing tracked as words stretches a stock phrase over many seconds
+# (mdvr-433 #3: おやすみなさい spanning 11s at 0.6 chars/sec). A word-anchored
+# line lasting several times its reading time while Whisper doubts the speech
+# is invention; real slow speech gets split at >=0.8s silences first.
+HALLUCINATION_SPARSE_NO_SPEECH = 0.40
+HALLUCINATION_SPARSE_FACTOR = 3.0
+HALLUCINATION_SPARSE_MIN_SECONDS = 4.0
+
+# The decoder often emits one sentence as several adjacent segments
+# (通常コースで | よろしかったですか? with a zero gap), which reads as
+# fragmented subtitles. Merge consecutive lines back together when the gap is
+# tiny and the combined text stays a readable single line; real pauses
+# (> WORD_PAUSE_SPLIT_SECONDS) are never bridged.
+MERGE_MAX_GAP_SECONDS = 0.30
+MERGE_MAX_CHARS = 24
+MERGE_MAX_DURATION_SECONDS = 8.0
+MERGE_SENTENCE_FINAL_CHARS = ("?", "？", "!", "！", "。")
+
 # VAD sensitivity presets (how quiet a sound still counts as speech).
 # "standard" reproduces the historical constants above. Higher levels lower the
 # WhisperSeg gate, widen the speech padding, and relax/disable the RMS energy
@@ -266,8 +357,9 @@ PROFILE_CONFIGS = {
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv"}
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus"}
-SI_SIDECAR_MEDIA_SUFFIXES = (".si.wav", ".si.mp4")
+SI_SIDECAR_MEDIA_SUFFIXES = (".si.wav", ".si.duck.wav", ".si.mp4")
 GENERATED_MP4_SUFFIXES = ("_si.mp4", "_dub.mp4")
+GENERATED_WORK_DIR_SUFFIXES = ("_debug", ".clone")
 
 # --- Utility Functions ---
 
@@ -279,10 +371,25 @@ def is_generated_output_mp4(path: str | os.PathLike[str]) -> bool:
     return Path(path).name.lower().endswith(GENERATED_MP4_SUFFIXES)
 
 
+def is_generated_work_directory(path: str | os.PathLike[str]) -> bool:
+    return Path(path).name.lower().endswith(GENERATED_WORK_DIR_SUFFIXES)
+
+
+def is_generated_work_path(path: str | os.PathLike[str]) -> bool:
+    return any(is_generated_work_directory(part) for part in Path(path).parts)
+
+
+def is_speaker_basis_wav(path: str | os.PathLike[str]) -> bool:
+    candidate = Path(path)
+    return candidate.suffix.lower() == ".wav" and candidate.stem.lower().startswith("speaker")
+
+
 def is_supported_source_media_file(path: str | os.PathLike[str]) -> bool:
     candidate = Path(path)
     return (
         candidate.suffix.lower() in (VIDEO_EXTENSIONS | AUDIO_EXTENSIONS)
+        and not is_generated_work_path(candidate)
+        and not is_speaker_basis_wav(candidate)
         and not is_si_sidecar_media_file(candidate)
         and not is_generated_output_mp4(candidate)
     )
@@ -290,10 +397,24 @@ def is_supported_source_media_file(path: str | os.PathLike[str]) -> bool:
 
 def is_subtitle_video_candidate(path: str | os.PathLike[str]) -> bool:
     candidate = Path(path)
-    if is_si_sidecar_media_file(candidate) or is_generated_output_mp4(candidate):
+    if (
+        is_generated_work_path(candidate)
+        or is_si_sidecar_media_file(candidate)
+        or is_generated_output_mp4(candidate)
+    ):
         return False
     name = candidate.name.lower()
     return candidate.suffix.lower() in VIDEO_EXTENSIONS and not name.endswith("_srt.mkv")
+
+
+def _walk_user_media_directories(base_dir: str | os.PathLike[str]):
+    """Walk user media while pruning generated debug/clone work directories."""
+    for root, dirs, files in os.walk(base_dir):
+        if is_generated_work_path(root):
+            dirs[:] = []
+            continue
+        dirs[:] = [name for name in dirs if not is_generated_work_directory(name)]
+        yield Path(root), files
 
 def check_ffmpeg():
     return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
@@ -757,6 +878,7 @@ class SubtitleGenerator:
         self.whisperseg_feature_extractor = None
         self.last_raw_segments = []
         self.last_chunks = []
+        self.last_speech_probs = None
         self.set_vad_sensitivity("standard")
 
     def set_vad_sensitivity(self, preset_name: str):
@@ -1104,7 +1226,8 @@ class SubtitleGenerator:
         return sep_pattern.sub(collapse, s)
 
     @staticmethod
-    def subtitle_duration_for_text(text: str, current_duration: float) -> float:
+    def subtitle_duration_for_text(text: str, current_duration: float,
+                                   allow_shrink: bool = True) -> float:
         text_len = len(SubtitleGenerator.normalize_for_duplicate(text))
         if text_len <= 0:
             return current_duration
@@ -1112,7 +1235,8 @@ class SubtitleGenerator:
         target = text_len / 5.2 + 0.8
         max_duration = max(1.4, min(7.5, target))
         min_duration = min(max_duration, max(0.7, min(1.4, text_len / 12.0 + 0.35)))
-        return max(min_duration, min(current_duration, max_duration))
+        capped = min(current_duration, max_duration) if allow_shrink else current_duration
+        return max(min_duration, capped)
 
     def load_whisperseg_session(self):
         if self.whisperseg_session is not None:
@@ -1303,6 +1427,8 @@ class SubtitleGenerator:
             audio = np.asarray(audio).reshape(-1)
 
         probs = self.whisperseg_speech_probs(audio, sampling_rate=16000)
+        # Kept for postprocess: per-line speech coverage (hallucination check).
+        self.last_speech_probs = probs
         global_segments = self.frame_probs_to_segments(
             probs,
             len(audio),
@@ -1397,6 +1523,8 @@ class SubtitleGenerator:
             audio = np.asarray(audio).reshape(-1)
 
         probs = self.whisperseg_speech_probs(audio, sampling_rate=16000)
+        # Kept for postprocess: per-line speech coverage (hallucination check).
+        self.last_speech_probs = probs
         speech_regions = self.frame_probs_to_segments(
             probs,
             len(audio),
@@ -1497,28 +1625,264 @@ class SubtitleGenerator:
         return self.split_audio(audio_path, chunk_seconds)
 
     @staticmethod
-    def reanchor_segment_times(segment) -> tuple[float, float, bool]:
-        """Chunk-relative (start, end, anchored?) for a decoded segment.
+    def tighten_word_start(start: float, end: float, audio,
+                           sampling_rate: int = 16000) -> float:
+        """Move a word's start time past leading silence inside [start, end).
+
+        DTW word alignment can absorb an inter-utterance pause into the word
+        that follows it, so the pause never appears as an inter-word gap (see
+        WORD_PAUSE_SPLIT_SECONDS). Only long words are examined, and the start
+        only ever moves forward, keeping a small onset pad.
+        """
+        if audio is None or end - start < WORD_TIGHTEN_MIN_WORD_SECONDS:
+            return start
+        frame = max(1, int(sampling_rate * 0.02))
+        lo = max(0, int(start * sampling_rate))
+        hi = min(len(audio), int(end * sampling_rate))
+        span = np.asarray(audio[lo:hi], dtype=np.float64)
+        frames = len(span) // frame
+        if frames < 2:
+            return start
+        rms = np.sqrt((span[: frames * frame].reshape(frames, frame) ** 2).mean(axis=1))
+        voiced = np.nonzero(20 * np.log10(rms + 1e-9) >= WORD_TIGHTEN_SILENCE_DB)[0]
+        if len(voiced) == 0:
+            return start
+        lead = voiced[0] * frame / sampling_rate
+        if lead < WORD_TIGHTEN_MIN_LEAD_SECONDS:
+            return start
+        return start + lead - WORD_TIGHTEN_ONSET_PAD_SECONDS
+
+    @staticmethod
+    def span_peak_db(audio, start: float, end: float,
+                     sampling_rate: int = 16000):
+        """Loudest 20ms RMS frame (dBFS) inside [start, end), or None."""
+        if audio is None:
+            return None
+        frame = max(1, int(sampling_rate * 0.02))
+        lo = max(0, int(start * sampling_rate))
+        hi = min(len(audio), int(end * sampling_rate))
+        span = np.asarray(audio[lo:hi], dtype=np.float64)
+        frames = len(span) // frame
+        if frames < 1:
+            return None
+        rms = np.sqrt((span[: frames * frame].reshape(frames, frame) ** 2).mean(axis=1))
+        return float(20 * np.log10(rms.max() + 1e-9))
+
+    def span_speech_coverage(self, start: float, end: float):
+        """Fraction of WhisperSeg 20ms frames >= vad_neg_threshold in the
+        absolute time span [start, end), or None when no global probs exist
+        (fixed/auditok-only chunking, whole-file mode)."""
+        probs = getattr(self, "last_speech_probs", None)
+        if probs is None or len(probs) == 0:
+            return None
+        lo = max(0, int(start / 0.02))
+        hi = min(len(probs), int(np.ceil(end / 0.02)))
+        if hi <= lo:
+            return None
+        return float((probs[lo:hi] >= self.vad_neg_threshold).mean())
+
+    @staticmethod
+    def extend_entry_tails(entries: list, audio, offset: float,
+                           sampling_rate: int = 16000) -> None:
+        """Extend word-anchored ends through trailing voiced audio, in place.
+
+        DTW word-end stamps are systematically early while the voice is still
+        decaying (see TAIL_EXTEND_MAX_SECONDS). Walk 20ms frames past each
+        entry's end while they stay voiced, capped and stopped short of the
+        next entry; entries keep their order and never overlap.
+        """
+        if audio is None or not entries:
+            return
+        frame = max(1, int(sampling_rate * 0.02))
+        chunk_end = offset + len(audio) / sampling_rate
+        ordered = sorted(entries, key=lambda e: (e["start"], e["end"]))
+        for index, entry in enumerate(ordered):
+            if not entry.get("anchored"):
+                continue
+            next_start = (
+                ordered[index + 1]["start"] - TAIL_EXTEND_GUARD_SECONDS
+                if index + 1 < len(ordered) else chunk_end
+            )
+            limit = min(entry["end"] + TAIL_EXTEND_MAX_SECONDS, next_start, chunk_end)
+            if limit <= entry["end"]:
+                continue
+            pos = max(0, int((entry["end"] - offset) * sampling_rate))
+            end_pos = min(len(audio), int((limit - offset) * sampling_rate))
+            new_end = entry["end"]
+            silence_run = 0.0
+            while pos + frame <= end_pos:
+                rms = float(np.sqrt(np.mean(np.square(
+                    np.asarray(audio[pos:pos + frame], dtype=np.float64)))))
+                pos += frame
+                if 20 * np.log10(rms + 1e-9) < TAIL_EXTEND_VOICED_DB:
+                    # Ride through short intra-word dips (glottal stops);
+                    # only a real silence run ends the scan.
+                    silence_run += frame / sampling_rate
+                    if silence_run > TAIL_EXTEND_MAX_SILENCE_RUN_SECONDS:
+                        break
+                    continue
+                silence_run = 0.0
+                new_end = offset + pos / sampling_rate
+            if new_end > entry["end"]:
+                entry["end"] = min(new_end + TAIL_EXTEND_RELEASE_PAD_SECONDS, limit)
+
+    @staticmethod
+    def find_silence_runs(audio, start: float, end: float,
+                          sampling_rate: int = 16000) -> list:
+        """Contiguous sub-ENTRY_SPLIT_SILENCE_DB runs >= the minimum length
+        inside [start, end) of chunk-relative audio, as (start, end) seconds."""
+        frame = max(1, int(sampling_rate * 0.02))
+        lo = max(0, int(start * sampling_rate))
+        hi = min(len(audio), int(end * sampling_rate))
+        span = np.asarray(audio[lo:hi], dtype=np.float64)
+        frames = len(span) // frame
+        if frames < 1:
+            return []
+        rms = np.sqrt((span[: frames * frame].reshape(frames, frame) ** 2).mean(axis=1))
+        silent = 20 * np.log10(rms + 1e-9) < ENTRY_SPLIT_SILENCE_DB
+        frame_sec = frame / sampling_rate
+        runs = []
+        run_start = None
+        for index, is_silent in enumerate(silent):
+            if is_silent:
+                if run_start is None:
+                    run_start = index
+                continue
+            if run_start is not None:
+                if (index - run_start) * frame_sec >= ENTRY_SPLIT_MIN_SILENCE_SECONDS:
+                    runs.append((start + run_start * frame_sec, start + index * frame_sec))
+                run_start = None
+        if run_start is not None and (frames - run_start) * frame_sec >= ENTRY_SPLIT_MIN_SILENCE_SECONDS:
+            runs.append((start + run_start * frame_sec, start + frames * frame_sec))
+        return runs
+
+    def split_group_on_silence(self, group: list, chunk_audio,
+                               sampling_rate: int = 16000) -> list:
+        """Split one word group at long internal silences, energy-first.
+
+        DTW can distribute a pause across several word boundaries so that no
+        inter-word gap or over-long word reveals it (see
+        ENTRY_SPLIT_MIN_SILENCE_SECONDS). Words go to the side their midpoint
+        falls on; piece edges are clamped to the silence run boundaries.
+        Returns a list of (words, start, end) pieces.
+        """
+        start, end = group[0][0], group[-1][1]
+        default = [(group, start, end)]
+        if chunk_audio is None or len(group) < 2:
+            return default
+        runs = self.find_silence_runs(chunk_audio, start, end, sampling_rate)
+        if not runs:
+            return default
+        centers = [(run_start + run_end) / 2 for run_start, run_end in runs]
+        buckets: list[list] = [[] for _ in range(len(runs) + 1)]
+        for word in group:
+            midpoint = (word[0] + word[1]) / 2
+            buckets[sum(1 for center in centers if center < midpoint)].append(word)
+        pieces = []
+        for index, bucket in enumerate(buckets):
+            if not bucket:
+                continue
+            piece_start = bucket[0][0]
+            piece_end = bucket[-1][1]
+            if index > 0:
+                piece_start = max(piece_start, runs[index - 1][1] - ENTRY_SPLIT_EDGE_PAD_SECONDS)
+            if index < len(runs):
+                piece_end = min(piece_end, runs[index][0] + ENTRY_SPLIT_EDGE_PAD_SECONDS)
+            if piece_end - piece_start >= 0.1:
+                pieces.append((bucket, piece_start, piece_end))
+        return pieces or default
+
+    def collect_segment_entries(self, segment, offset: float, chunk_audio=None,
+                                sampling_rate: int = 16000) -> tuple[list, int]:
+        """Convert one decoded segment into raw subtitle dict(s), absolute times.
 
         Prefers word-level times (DTW alignment) over the decoder's segment
         times: on difficult audio (quiet lines, climax loops) the decoder often
         stamps a line several seconds early, at the chunk start, while the word
         timestamps stay anchored to the audio (debug session 2026-07-09).
-        Falls back to the segment times when words are missing or degenerate.
+        Word-anchored segments are additionally split at intra-segment pauses
+        (inter-word gap > WORD_PAUSE_SPLIT_SECONDS, after tighten_word_start)
+        so one subtitle line never spans a long silence. Returns
+        ``(entries, moved_far)`` where moved_far counts anchors that moved the
+        start by more than 0.5s from the decoder's own stamp.
         """
-        words = getattr(segment, "words", None) or []
-        times = [
-            (float(w.start), float(w.end))
-            for w in words
+        clean_text = self.clean_text(segment.text)
+        if not clean_text:
+            return [], 0
+        base = {
+            "avg_logprob": getattr(segment, "avg_logprob", None),
+            "no_speech_prob": getattr(segment, "no_speech_prob", None),
+        }
+
+        def annotate(entries: list) -> list:
+            # Acoustic evidence for the postprocess hallucination checks;
+            # entry times are absolute, chunk_audio is chunk-relative.
+            for entry in entries:
+                entry["peak_db"] = self.span_peak_db(
+                    chunk_audio, entry["start"] - offset, entry["end"] - offset, sampling_rate
+                )
+                entry["speech_coverage"] = self.span_speech_coverage(entry["start"], entry["end"])
+            return entries
+
+        words = [
+            (float(w.start), float(w.end), w.word)
+            for w in (getattr(segment, "words", None) or [])
             if w.start is not None and w.end is not None
         ]
-        if not times:
-            return float(segment.start), float(segment.end), False
-        w_start = times[0][0]
-        w_end = times[-1][1]
-        if w_end - w_start < 0.05:
-            return float(segment.start), float(segment.end), False
-        return w_start, w_end, True
+        def word_dicts(piece_words: list) -> list:
+            # Absolute-time word list; kept on every entry so duration-aligned
+            # consumers (tool_clonevoice dubbing) get per-word timing for free.
+            return [
+                {"word": text, "start": offset + start, "end": offset + end}
+                for start, end, text in piece_words
+            ]
+
+        if not words or words[-1][1] - words[0][0] < 0.05:
+            return annotate([{
+                "start": offset + float(segment.start),
+                "end": offset + float(segment.end),
+                "text": clean_text,
+                "anchored": False,
+                "words": word_dicts(words),
+                **base,
+            }]), 0
+
+        moved_far = 1 if abs(words[0][0] - float(segment.start)) > 0.5 else 0
+        groups: list[list[tuple[float, float, str]]] = []
+        for word_start, word_end, word_text in words:
+            word_start = self.tighten_word_start(word_start, word_end, chunk_audio, sampling_rate)
+            if groups and word_start - groups[-1][-1][1] <= WORD_PAUSE_SPLIT_SECONDS:
+                groups[-1].append((word_start, word_end, word_text))
+            else:
+                groups.append([(word_start, word_end, word_text)])
+
+        pieces = []
+        for group in groups:
+            pieces.extend(self.split_group_on_silence(group, chunk_audio, sampling_rate))
+
+        entries = []
+        for piece_words, piece_start, piece_end in pieces:
+            text = clean_text if len(pieces) == 1 else self.clean_text("".join(w[2] for w in piece_words))
+            if not text:
+                continue
+            entries.append({
+                "start": offset + piece_start,
+                "end": offset + piece_end,
+                "text": text,
+                "anchored": True,
+                "words": word_dicts(piece_words),
+                **base,
+            })
+        if not entries:
+            entries = [{
+                "start": offset + words[0][0],
+                "end": offset + words[-1][1],
+                "text": clean_text,
+                "anchored": True,
+                "words": word_dicts(words),
+                **base,
+            }]
+        return annotate(entries), moved_far
 
     @staticmethod
     def is_known_hallucination(
@@ -1544,11 +1908,80 @@ class SubtitleGenerator:
                 return True
             if phrase in norm and (duration <= 8.0 or is_low_confidence or near_edge):
                 return True
+            # The decoder sometimes drops the leading character(s) of a stock
+            # outro (視聴ありがとうございました, mdvr-433 #2 entry 18); a norm
+            # that is nearly the whole phrase is the same hallucination.
+            if len(norm) >= max(6, len(phrase) - 2) and norm in phrase:
+                return True
 
         if norm in SHORT_HALLUCINATION_NORMS:
             return duration <= 2.6 and (is_low_confidence or near_edge)
 
         return False
+
+    def silence_floor_db(self) -> float:
+        """Silence floor for the no_audio_energy check: stay well below the VAD
+        RMS gate for the active sensitivity so a line the VAD would keep can
+        never be killed for quietness alone."""
+        rms_gate_db = getattr(self, "vad_rms_gate_db", RMS_SPEECH_MIN_DB)
+        if rms_gate_db is None:
+            return HALLUCINATION_SILENCE_PEAK_DB_NO_GATE
+        return min(
+            HALLUCINATION_SILENCE_PEAK_DB,
+            rms_gate_db - HALLUCINATION_SILENCE_FLOOR_MARGIN_DB,
+        )
+
+    def acoustic_removal_reason(self, item: dict):
+        """Acoustic hallucination verdict for one line, or None to keep it.
+
+        Shared by tool_subtitle postprocess and tool_clonevoice's dubbing
+        filter. Expects the peak_db / speech_coverage stats attached by
+        collect_segment_entries; lines without stats are never removed here.
+        """
+        avg_logprob = item.get("avg_logprob")
+        no_speech_prob = item.get("no_speech_prob")
+        low_confidence = (
+            (avg_logprob is not None and avg_logprob < HALLUCINATION_LOW_CONFIDENCE_LOGPROB)
+            or (no_speech_prob is not None and no_speech_prob > HALLUCINATION_LOW_CONFIDENCE_NO_SPEECH)
+        )
+        peak_db = item.get("peak_db")
+        if (
+            peak_db is not None
+            and peak_db < self.silence_floor_db()
+            and (item.get("anchored", False) or low_confidence)
+        ):
+            return "no_audio_energy"
+        if (
+            peak_db is not None
+            and no_speech_prob is not None
+            and (
+                (no_speech_prob > HALLUCINATION_QUIET_NO_SPEECH
+                 and peak_db < HALLUCINATION_QUIET_PEAK_DB)
+                or (no_speech_prob > HALLUCINATION_QUIET_STRONG_NO_SPEECH
+                    and peak_db < HALLUCINATION_QUIET_STRONG_PEAK_DB)
+            )
+        ):
+            return "quiet_no_speech"
+        norm = SubtitleGenerator.normalize_for_duplicate(item.get("text", ""))
+        duration = item["end"] - item["start"]
+        if (
+            item.get("anchored", False)
+            and no_speech_prob is not None
+            and no_speech_prob > HALLUCINATION_SPARSE_NO_SPEECH
+            and duration > max(
+                HALLUCINATION_SPARSE_MIN_SECONDS,
+                HALLUCINATION_SPARSE_FACTOR * (len(norm) / 5.2 + 0.8),
+            )
+        ):
+            return "sparse_text"
+        coverage = item.get("speech_coverage")
+        if (
+            coverage is not None
+            and coverage < HALLUCINATION_MIN_SPEECH_COVERAGE
+            and low_confidence
+        ):
+            return "low_speech_coverage"
+        return None
 
     def postprocess_segments(self, raw_segments: list, scene_mode: bool = False,
                              removal_log: list | None = None) -> list:
@@ -1557,6 +1990,7 @@ class SubtitleGenerator:
         removed_noise = 0
         removed_hallucinations = 0
         removed_low_confidence = 0
+        removed_acoustic: dict[str, int] = {}
         compressed_repetitions = 0
         total_end = max((item.get("end", 0.0) for item in raw_segments), default=0.0)
         duplicate_window = 10.0 if scene_mode else DUPLICATE_LOOKBACK_SECONDS
@@ -1633,10 +2067,20 @@ class SubtitleGenerator:
                 log_removal("low_confidence", item)
                 continue
 
+            acoustic_reason = self.acoustic_removal_reason(item)
+            if acoustic_reason:
+                removed_acoustic[acoustic_reason] = removed_acoustic.get(acoustic_reason, 0) + 1
+                log_removal(acoustic_reason, item)
+                continue
+
             if duration > 0:
+                # The reading-speed cap may only shrink decoder-timed lines; a
+                # word-anchored end is acoustic evidence, and cutting it drops
+                # real trailing speech (mdvr-433 entry 3 lost its last 2s).
                 item["end"] = item["start"] + SubtitleGenerator.subtitle_duration_for_text(
                     text,
                     duration,
+                    allow_shrink=not item.get("anchored", False),
                 )
 
             duplicate_index = find_duplicate_index(item, norm)
@@ -1669,10 +2113,43 @@ class SubtitleGenerator:
             "Postprocess removed "
             f"{removed_duplicates} duplicates, {removed_noise} noisy/repeated lines, "
             f"{removed_hallucinations} known hallucinations, "
-            f"{removed_low_confidence} low-confidence silence lines; "
+            f"{removed_low_confidence} low-confidence silence lines, "
+            f"{sum(removed_acoustic.values())} acoustic hallucinations "
+            f"({removed_acoustic or 'none'}, silence floor {self.silence_floor_db():.0f}dB); "
             f"compressed {compressed_repetitions} repetition lines"
         )
-        return filtered
+        return self.merge_adjacent_fragments(filtered)
+
+    def merge_adjacent_fragments(self, lines: list) -> list:
+        """Merge decoder-fragmented sentences back into single lines.
+
+        Kotoba often emits one sentence as several adjacent segments with a
+        zero gap (通常コースで | よろしかったですか?). Only near-contiguous
+        neighbours are merged, and only while the combined text stays a
+        readable single line, so real pauses and full sentences (final
+        punctuation) keep their own line.
+        """
+        merged: list = []
+        merged_count = 0
+        for item in lines:
+            if merged:
+                previous = merged[-1]
+                gap = item["start"] - previous["end"]
+                combined_text = previous["text"] + item["text"]
+                if (
+                    gap <= MERGE_MAX_GAP_SECONDS
+                    and not previous["text"].endswith(MERGE_SENTENCE_FINAL_CHARS)
+                    and len(SubtitleGenerator.normalize_for_duplicate(combined_text)) <= MERGE_MAX_CHARS
+                    and item["end"] - previous["start"] <= MERGE_MAX_DURATION_SECONDS
+                ):
+                    previous["text"] = combined_text
+                    previous["end"] = max(previous["end"], item["end"])
+                    merged_count += 1
+                    continue
+            merged.append(item)
+        if merged_count:
+            self.log_callback(f"Merged {merged_count} adjacent sentence fragments")
+        return merged
 
     @staticmethod
     def is_scene_split_enabled() -> bool:
@@ -1696,6 +2173,9 @@ class SubtitleGenerator:
         profile = PROFILE_CONFIGS[profile_name]
         raw_segments = []
         self.last_chunks = []
+        # Stale probs from a previous file must not feed this file's speech
+        # coverage checks; the whisperseg split paths repopulate this.
+        self.last_speech_probs = None
         reanchored_far = 0
         scene_mode = self.is_scene_split_enabled()
         asr_options = self.base_asr_options(scene_mode=scene_mode)
@@ -1734,21 +2214,15 @@ class SubtitleGenerator:
                     },
                 )
 
+                vad_entries = []
                 for segment in segments:
-                    clean_text = self.clean_text(segment.text)
-                    if not clean_text:
-                        continue
-
-                    rel_start, rel_end, anchored = self.reanchor_segment_times(segment)
-                    if anchored and abs(rel_start - float(segment.start)) > 0.5:
-                        reanchored_far += 1
-                    raw_segments.append({
-                        "start": rel_start + offset,
-                        "end": rel_end + offset,
-                        "text": clean_text,
-                        "avg_logprob": getattr(segment, "avg_logprob", None),
-                        "no_speech_prob": getattr(segment, "no_speech_prob", None),
-                    })
+                    entries, moved_far = self.collect_segment_entries(
+                        segment, offset, chunk_audio=vad_segment["array"]
+                    )
+                    reanchored_far += moved_far
+                    vad_entries.extend(entries)
+                self.extend_entry_tails(vad_entries, vad_segment["array"], offset)
+                raw_segments.extend(vad_entries)
         elif TRANSCRIBE_MODE == "chunked":
             chunks = self.split_audio_for_profile(audio_file, chunk_seconds, profile_name)
             self.last_chunks = [
@@ -1780,21 +2254,15 @@ class SubtitleGenerator:
                     },
                 )
 
+                chunk_entries = []
                 for segment in segments:
-                    clean_text = self.clean_text(segment.text)
-                    if not clean_text:
-                        continue
-                    rel_start, rel_end, anchored = self.reanchor_segment_times(segment)
-                    if anchored and abs(rel_start - float(segment.start)) > 0.5:
-                        reanchored_far += 1
-
-                    raw_segments.append({
-                        "start": rel_start + offset,
-                        "end": rel_end + offset,
-                        "text": clean_text,
-                        "avg_logprob": getattr(segment, "avg_logprob", None),
-                        "no_speech_prob": getattr(segment, "no_speech_prob", None),
-                    })
+                    entries, moved_far = self.collect_segment_entries(
+                        segment, offset, chunk_audio=chunk["array"]
+                    )
+                    reanchored_far += moved_far
+                    chunk_entries.extend(entries)
+                self.extend_entry_tails(chunk_entries, chunk["array"], offset)
+                raw_segments.extend(chunk_entries)
         else:
             segments, info = self.model.transcribe(
                 audio_file,
@@ -1820,26 +2288,20 @@ class SubtitleGenerator:
             )
 
             for segment in segments:
-                clean_text = self.clean_text(segment.text)
-                if not clean_text:
-                    continue
-
-                rel_start, rel_end, anchored = self.reanchor_segment_times(segment)
-                if anchored and abs(rel_start - float(segment.start)) > 0.5:
-                    reanchored_far += 1
-                raw_segments.append({
-                    "start": rel_start,
-                    "end": rel_end,
-                    "text": clean_text,
-                    "avg_logprob": getattr(segment, "avg_logprob", None),
-                    "no_speech_prob": getattr(segment, "no_speech_prob", None),
-                })
+                entries, moved_far = self.collect_segment_entries(segment, 0.0)
+                reanchored_far += moved_far
+                raw_segments.extend(entries)
 
         if reanchored_far:
             self.log_callback(
                 f"Word-anchored timestamps moved {reanchored_far} segment(s) by more than 0.5s"
             )
-        self.last_raw_segments = sorted(raw_segments, key=lambda seg: (seg["start"], seg["end"]))
+        # Copies, not references: postprocess mutates these dicts in place
+        # (duration cap, overlap trimming) and .raw.srt must keep showing the
+        # decoder output, not the postprocessed times.
+        self.last_raw_segments = [
+            dict(item) for item in sorted(raw_segments, key=lambda seg: (seg["start"], seg["end"]))
+        ]
         return self.postprocess_segments(raw_segments, scene_mode=scene_mode, removal_log=removal_log)
     @staticmethod
     def write_srt(segments: list, output_file: str):
@@ -1871,7 +2333,9 @@ class SubtitleGenerator:
         """Debug files for auditing dropped speech (enabled by the GUI checkbox),
         written into a per-video ``<stem>_debug`` folder next to the output SRT.
 
-        .raw.srt     decoder output before postprocess, with confidence values;
+        .raw.srt     decoder output before postprocess (word-anchored and
+                     pause-split, see collect_segment_entries), with
+                     confidence values;
         .vad.srt     each ASR chunk as one entry — shows exactly which time
                      ranges the VAD sent to the decoder (a missing interval here
                      means VAD miss; present here but absent in .raw.srt means
@@ -1885,12 +2349,16 @@ class SubtitleGenerator:
         for item in self.last_raw_segments:
             lp = item.get("avg_logprob")
             ns = item.get("no_speech_prob")
+            pk = item.get("peak_db")
+            cov = item.get("speech_coverage")
             lp_text = f"{lp:.2f}" if lp is not None else "n/a"
             ns_text = f"{ns:.2f}" if ns is not None else "n/a"
+            pk_text = f"{pk:.0f}" if pk is not None else "n/a"
+            cov_text = f"{cov:.2f}" if cov is not None else "n/a"
             raw_entries.append({
                 "start": item["start"],
                 "end": item["end"],
-                "text": f"{item['text']} {{lp={lp_text} ns={ns_text}}}",
+                "text": f"{item['text']} {{lp={lp_text} ns={ns_text} pk={pk_text} cov={cov_text}}}",
             })
         self.write_srt(raw_entries, f"{base}.raw.srt")
 
@@ -1920,6 +2388,13 @@ class SubtitleGenerator:
             f".removed.srt ({len(removed_entries)} removed)"
         )
 
+    def retain_debug_audio(self, audio_file: str, output_file: str) -> str:
+        """Move the ASR WAV into the per-video debug directory."""
+        destination = f"{self.debug_base_path(output_file)}.wav"
+        os.replace(audio_file, destination)
+        self.log_callback(f"Debug WAV saved: {destination}")
+        return destination
+
     def transcribe(self, audio_file: str, output_file: str, debug_files: bool = False):
         start_time = time.time()
 
@@ -1941,32 +2416,27 @@ class SubtitleGenerator:
         self.log_callback(f"Saved SRT: {output_file} | Time elapsed: {elapsed:.2f}s")
 
         try:
-            os.remove(audio_file)
+            if debug_files:
+                self.retain_debug_audio(audio_file, output_file)
+            else:
+                os.remove(audio_file)
         except Exception as e:
-            self.log_callback(f"Failed to delete temp audio file: {e}")
+            self.log_callback(f"Failed to finalize temp audio file: {e}")
 
         return output_file
 
 def extract_audio(video_path: str, audio_path: str, denoise_preset: str, log_callback, stop_event):
     if stop_event and stop_event.is_set():
         return False
-        
+
     log_callback(f"Converting video to audio: {os.path.basename(video_path)}")
-    
     ffmpeg_opts = '-hide_banner -loglevel warning -y -vn -ar 16000 -ac 1 -b:a 128k -f wav'
-    
     if denoise_preset and denoise_preset in DENOISE_FILTERS and DENOISE_FILTERS[denoise_preset]:
         filter_str = DENOISE_FILTERS[denoise_preset]
         log_callback(f"Audio DSP preset: {denoise_preset}")
         ffmpeg_opts += f' -af {filter_str}'
-        
     FFmpeg = _ensure_ffmpy3()
-    ff = FFmpeg(
-        executable="ffmpeg",
-        inputs={video_path: None},
-        outputs={audio_path: ffmpeg_opts} 
-    )
-    
+    ff = FFmpeg(executable="ffmpeg", inputs={video_path: None}, outputs={audio_path: ffmpeg_opts})
     try:
         run_process(ff.cmd, log_callback, stop_event=stop_event)
         return True
@@ -1974,6 +2444,35 @@ def extract_audio(video_path: str, audio_path: str, denoise_preset: str, log_cal
         log_callback(f"Error extracting audio: {e}")
         return False
 
+
+def analysis_wav_path(media_path: str | os.PathLike[str]) -> Path:
+    """Return the shared WAV cache used by debug and standalone analysis."""
+    media = Path(media_path)
+    return media.parent / f"{media.stem}_debug" / f"{media.stem}.wav"
+
+
+def generate_analysis_wav(media_path: str | os.PathLike[str], log_callback,
+                          stop_event=None) -> str | None:
+    """Extract a 16 kHz mono PCM WAV without loading any ASR model."""
+    destination = analysis_wav_path(media_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f"{destination.stem}.part.wav")
+    try:
+        if temporary.exists():
+            temporary.unlink()
+        if not extract_audio(str(media_path), str(temporary), "none", log_callback, stop_event):
+            return None
+        if stop_event and stop_event.is_set():
+            return None
+        os.replace(temporary, destination)
+        log_callback(f"Analysis WAV saved: {destination}")
+        return str(destination)
+    finally:
+        if temporary.exists():
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
 def warn_noisy_high_sensitivity(denoise_preset: str, vad_sensitivity: str, log_callback):
     """Warn when high/max VAD sensitivity runs without denoise.
 
@@ -2044,16 +2543,18 @@ def batch_generate_srt(base_dir: str, search_subdirs: bool, skip_if_exists: bool
     tasks = []
     
     if search_subdirs:
-        for root, _, files in os.walk(base_dir):
+        for root, files in _walk_user_media_directories(base_dir):
             for file in files:
-                if is_supported_source_media_file(file):
-                    tasks.append(Path(root) / file)
+                filepath = root / file
+                if is_supported_source_media_file(filepath):
+                    tasks.append(filepath)
     else:
         try:
-            for file in os.listdir(base_dir):
-                filepath = Path(base_dir) / file
-                if filepath.is_file() and is_supported_source_media_file(filepath):
-                    tasks.append(filepath)
+            if not is_generated_work_path(base_dir):
+                for file in os.listdir(base_dir):
+                    filepath = Path(base_dir) / file
+                    if filepath.is_file() and is_supported_source_media_file(filepath):
+                        tasks.append(filepath)
         except Exception as e:
             log_callback(f"Error reading directory: {e}")
             return False
@@ -2662,17 +3163,18 @@ def batch_translate_srt(base_dir: str, search_subdirs: bool, skip_if_exists: boo
 def _collect_listen_translate_videos(base_dir: str, search_subdirs: bool, log_callback) -> list[Path] | None:
     tasks = []
     if search_subdirs:
-        for root, _, files in os.walk(base_dir):
+        for root, files in _walk_user_media_directories(base_dir):
             for file in files:
-                filepath = Path(root) / file
+                filepath = root / file
                 if filepath.is_file() and is_subtitle_video_candidate(filepath):
                     tasks.append(filepath)
     else:
         try:
-            for file in os.listdir(base_dir):
-                filepath = Path(base_dir) / file
-                if filepath.is_file() and is_subtitle_video_candidate(filepath):
-                    tasks.append(filepath)
+            if not is_generated_work_path(base_dir):
+                for file in os.listdir(base_dir):
+                    filepath = Path(base_dir) / file
+                    if filepath.is_file() and is_subtitle_video_candidate(filepath):
+                        tasks.append(filepath)
         except Exception as e:
             log_callback(f"Error reading directory: {e}")
             return None

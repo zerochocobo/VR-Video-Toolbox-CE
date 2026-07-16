@@ -7,7 +7,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from PIL import Image, ImageTk
-from utils import app_config, i18n
+from utils import app_config, i18n, ui_theme
 
 try:
     from . import logic
@@ -31,24 +31,25 @@ class VRSubtitleEmbedApp:
         self.root = root
         self.on_return = on_return
         self.root.title(get_text("title"))
+        ui_theme.apply_theme(self.root)
         self.video_info = None
         self.current_process = None
         self.current_process_2d = None
         self.stop_requested = False
         self.stop_2d_requested = False
 
-        main_frame = ttk.Frame(root, padding="10")
+        main_frame = ttk.Frame(root)
         main_frame.pack(fill="both", expand=True)
-        header = ttk.Frame(main_frame)
-        header.pack(fill="x", pady=(0, 8))
-        ttk.Label(header, text=get_text("title"), font=("Arial", 14, "bold")).pack(side="left")
         if on_return:
-            ttk.Button(header, text=get_text("btn_return"), command=on_return).pack(side="right")
             self.root.config(menu=tk.Menu(self.root))
 
-        style = ttk.Style()
-        style.configure("TNotebook.Tab", padding=[12, 8], font=("Arial", 10, "bold"))
-        self.notebook = ttk.Notebook(main_frame)
+        # Full-height left rail: tool title on top, back-to-home pinned at the bottom
+        self.notebook = ui_theme.ToolShell(
+            main_frame,
+            title=get_text("title"),
+            back_text=get_text("btn_return"),
+            on_back=on_return,
+        )
         self.notebook.pack(fill="both", expand=True)
 
         self.create_preview_tab()
@@ -61,7 +62,7 @@ class VRSubtitleEmbedApp:
 
     def create_preview_tab(self):
         tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text=get_text("tab_preview"))
+        self.notebook.add(tab, text=get_text("tab_preview"), icon=ui_theme.TAB_ICONS["preview"])
 
         top = ttk.Frame(tab)
         top.pack(fill="x", padx=6, pady=4)
@@ -189,7 +190,7 @@ class VRSubtitleEmbedApp:
 
     def create_process_tab(self):
         tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text=get_text("tab_process"))
+        self.notebook.add(tab, text=get_text("tab_process"), icon=ui_theme.TAB_ICONS["video"])
 
         self.proc_video_var = tk.StringVar()
         self.proc_ass_var = tk.StringVar()
@@ -314,7 +315,7 @@ class VRSubtitleEmbedApp:
 
     def create_2d_tab(self):
         tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text=get_text("tab_2d"))
+        self.notebook.add(tab, text=get_text("tab_2d"), icon=ui_theme.TAB_ICONS["frame"])
 
         self.flat_video_var = tk.StringVar()
         self.flat_subtitle_var = tk.StringVar()
@@ -764,7 +765,7 @@ class VRSubtitleEmbedApp:
 
     def _append_log(self, widget, message):
         widget.insert(tk.END, str(message) + "\n")
-        widget.see(tk.END)
+        ui_theme.scroll_text_to_end(widget)
 
 
 class ImageZoomWindow:
