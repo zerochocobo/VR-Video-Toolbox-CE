@@ -24,6 +24,7 @@ reference
 runtime_cache
 debug_output
 videos
+tool_pinyin_wav_generator
 !/models/
 /models/*
 !/models/*.txt

@@ -270,6 +270,20 @@ def get(key: str, default=None):
     return _load().get(key, default)
 
 
+def get_bool(key: str, default: bool = False) -> bool:
+    """Boolean config lookup that understands string values.
+
+    JSON-edited configs often hold "false"/"0"/"off" strings, which plain
+    bool() would treat as True.
+    """
+    value = get(key, None)
+    if value is None:
+        return bool(default)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no", "off"}
+    return bool(value)
+
+
 def set(key: str, value):
     if _is_code_default_only_key(key):
         return

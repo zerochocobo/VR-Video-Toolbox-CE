@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
+from gpu_engine.native_mosaic import fisheye_delta
+
 
 _FALSE_VALUES = {"", "0", "false", "no", "off"}
 _DEFAULT_GPU_FRAME_SOURCE_MIN_PIXELS = 0
@@ -1157,6 +1159,66 @@ class NativeMosaicEngine:
             cp.cuda.get_current_stream().synchronize()
         return y_plane, uv_plane
 
+    def _iter_fisheye_delta_reference_frames(
+        self,
+        input_path,
+        *,
+        crop_mode: str,
+        start_sec: float | None,
+        end_sec: float | None,
+        fov: float = 180.0,
+    ):
+        """Second source decode for fisheye delta write-back.
+
+        Yields (source_heq_bgr, source_fisheye_bgr) torch pairs per frame.  The
+        fisheye variant repeats the exact remap/convert op sequence of the
+        restorer's frame source (_iter_gpu_bgr_frames*, to_fisheye=True), so
+        pixels the restorer passed through cancel to a zero delta bit-exactly.
+        """
+        from gpu_engine import nv12_kernels, probe, v360_lut
+        from gpu_engine.pynv_io import PyNvThreadedSerialDecoder
+
+        meta = probe.probe_video(input_path)
+        bd = 10 if meta.bit_depth > 8 else 8
+        fps = meta.source_fps or 30.0
+        start_idx = max(0, int(round((start_sec or 0.0) * fps)))
+        end_idx = int(round(end_sec * fps)) if end_sec is not None else None
+        dec = PyNvThreadedSerialDecoder(Path(input_path), bit_depth=bd, start_frame=start_idx)
+        try:
+            total = len(dec)
+            stop_idx = min(end_idx if end_idx is not None else total, total)
+            info = dec.info
+            if crop_mode == "sbs":
+                eye_w, eye_h = info.width // 2, info.height
+            else:
+                _cx, _cy, eye_w, eye_h = self._crop_region(crop_mode, info.width, info.height)
+            lut_y = v360_lut.make_lut("heq2fisheye", eye_w, eye_h, fov)
+            lut_c = v360_lut.make_lut("heq2fisheye", eye_w // 2, eye_h // 2, fov)
+            for i in range(start_idx, stop_idx):
+                frame = dec.frame_at(i)
+                y_plane, uv_plane = frame.y_uv_cupy()
+                if crop_mode == "sbs":
+                    y_src = y_plane[:, :eye_w * 2]
+                    uv_src = uv_plane[:, :eye_w, :]
+                    ly = nv12_kernels.remap_y(y_plane[:, :eye_w], lut_y, eye_w, eye_h)
+                    ry = nv12_kernels.remap_y(y_plane[:, eye_w:eye_w * 2], lut_y, eye_w, eye_h)
+                    luv = nv12_kernels.remap_uv(uv_plane[:, :eye_w // 2, :], lut_c, eye_w // 2, eye_h // 2)
+                    ruv = nv12_kernels.remap_uv(uv_plane[:, eye_w // 2:eye_w, :], lut_c, eye_w // 2, eye_h // 2)
+                    fish_y = nv12_kernels.hstack_planes(ly, ry)
+                    fish_uv = nv12_kernels.hstack_planes(luv, ruv)
+                else:
+                    x, y0, _w, _h = self._crop_region(crop_mode, info.width, info.height)
+                    y_src = y_plane[y0:y0 + eye_h, x:x + eye_w]
+                    uv_src = uv_plane[y0 // 2:(y0 + eye_h) // 2, x // 2:(x + eye_w) // 2, :]
+                    fish_y = nv12_kernels.remap_y(y_src, lut_y, eye_w, eye_h)
+                    fish_uv = nv12_kernels.remap_uv(uv_src, lut_c, eye_w // 2, eye_h // 2)
+                yield (
+                    self._planes_to_torch_bgr(y_src, uv_src, bit_depth=bd),
+                    self._planes_to_torch_bgr(fish_y, fish_uv, bit_depth=bd),
+                )
+        finally:
+            dec.stop()
+
     def _prepare_restored_nv12_sbs(self, bgr_frame, *, from_fisheye: bool, eye_w: int, eye_h: int):
         import cupy as cp
         from gpu_engine import nv12_kernels, v360_lut
@@ -1226,6 +1288,20 @@ class NativeMosaicEngine:
         raw_path = _media_temp_path(output_path, "native_stream")
 
         sbs_mode = len(eye_modes) == 2
+        use_delta = bool(use_fisheye) and fisheye_delta.enabled()
+        reference_frames = None
+        if use_delta:
+            reference_frames = self._iter_fisheye_delta_reference_frames(
+                input_path,
+                crop_mode="sbs" if sbs_mode else eye_modes[0],
+                start_sec=start_sec,
+                end_sec=end_sec,
+            )
+            if log_callback:
+                log_callback(
+                    "[native-stream] fisheye delta write-back: untouched pixels keep "
+                    "the source projection; only restored regions are reprojected"
+                )
         if sbs_mode:
             iters = [
                 self.iter_restored_gpu_frames(
@@ -1273,18 +1349,27 @@ class NativeMosaicEngine:
                     if cancel_token is not None and getattr(cancel_token, "cancelled", False):
                         raise OperationCancelled("cancelled by user")
                     try:
-                        if sbs_mode:
-                            frame = next(iters[0])[0]
-                            y_plane, uv_plane = self._prepare_restored_nv12_sbs(
-                                frame, from_fisheye=use_fisheye, eye_w=eye_w, eye_h=eye_h
-                            )
-                        else:
-                            frame = next(iters[0])[0]
-                            y_plane, uv_plane = self._prepare_restored_nv12(
-                                frame, from_fisheye=use_fisheye, out_w=eye_w, out_h=eye_h
-                            )
+                        frame = next(iters[0])[0]
                     except StopIteration:
                         break
+                    if use_delta:
+                        from gpu_engine.native_mosaic import _gpu_ops
+
+                        _gpu_ops.wait_decode_event(frame)
+                        source_heq, source_fish = fisheye_delta.next_reference(reference_frames)
+                        frame = fisheye_delta.apply_delta_frame(
+                            self.torch, self.device, source_heq, source_fish,
+                            frame.to(device=self.device), sbs=sbs_mode,
+                        )
+                    output_from_fisheye = use_fisheye and not use_delta
+                    if sbs_mode:
+                        y_plane, uv_plane = self._prepare_restored_nv12_sbs(
+                            frame, from_fisheye=output_from_fisheye, eye_w=eye_w, eye_h=eye_h
+                        )
+                    else:
+                        y_plane, uv_plane = self._prepare_restored_nv12(
+                            frame, from_fisheye=output_from_fisheye, out_w=eye_w, out_h=eye_h
+                        )
                     app = _pack_planes(y_plane, uv_plane, 8)
                     sink.feed(app, force_idr=(written == 0))
                     written += 1
@@ -1301,6 +1386,10 @@ class NativeMosaicEngine:
         finally:
             for it in iters:
                 close = getattr(it, "close", None)
+                if callable(close):
+                    close()
+            if reference_frames is not None:
+                close = getattr(reference_frames, "close", None)
                 if callable(close):
                     close()
             runtime.free_memory_pool()

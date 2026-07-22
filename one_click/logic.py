@@ -268,6 +268,23 @@ def _log_final_bitrate_summary(final_output: str | Path,
         log_callback(f"[bitrate] final mp4 self-check failed: {type(exc).__name__}: {exc}")
 
 
+def _tag_vr_spatial_metadata(source_file, final_output, log_callback=None) -> None:
+    """Best-effort: stamp st3d/sv3d VR180 atoms onto a finished SBS output.
+
+    Never raises; a failure leaves the output untouched and only logs.
+    """
+    try:
+        if not app_config.get_bool("vr_spatial_metadata", True):
+            return
+        if not final_output or not os.path.isfile(final_output):
+            return
+        from utils import vr_spatial
+        vr_spatial.tag_sbs_output(source_file, final_output, log_callback=log_callback)
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[vr-meta] injection skipped: {type(exc).__name__}: {exc}")
+
+
 def _nvenc_vbr_or_cq_args(target_kbps: int | None, max_kbps: int | None = None) -> list[str]:
     args = encode_config.build_ffmpeg_nvenc_base_args()
     if target_kbps and target_kbps > 0:
@@ -1171,6 +1188,54 @@ def _source_scan_supported(source_scan, log_callback=None) -> bool:
     if not source_scan:
         return False
     return True
+
+
+def _resolve_use_fisheye(input_file, use_fisheye, *, start_time=None, end_time=None,
+                         release_detector_after=False,
+                         log_callback=None, process_callback=None) -> bool:
+    """Resolve the fisheye mode: booleans pass through; "auto" probes the video.
+
+    Auto samples frames, detects mosaic ROIs and measures in which projection
+    the mosaic grid is more regular (see utils/fisheye_probe.py).  An
+    uncertain or failed probe defaults to no conversion.
+    """
+    if not (isinstance(use_fisheye, str) and use_fisheye.strip().lower() == "auto"):
+        return bool(use_fisheye)
+    try:
+        from gpu_engine.files import CancelToken
+        from utils import fisheye_probe
+
+        if log_callback:
+            log_callback("[fisheye-auto] probing which projection the mosaic was applied in ...")
+        token = CancelToken()
+        if process_callback:
+            process_callback(token)
+        verdict = fisheye_probe.probe_video(
+            input_file,
+            start_s=_time_to_sec(start_time),
+            end_s=_time_to_sec(end_time),
+            log_callback=log_callback,
+            cancel_token=token,
+        )
+        return bool(verdict.use_fisheye)
+    except OperationCancelled:
+        raise
+    except Exception as exc:
+        if log_callback:
+            log_callback(
+                f"[fisheye-auto] probe failed ({type(exc).__name__}: {exc}); "
+                "defaulting to no conversion"
+            )
+        return False
+    finally:
+        if release_detector_after:
+            # Neither pre-extract nor source-scan will reuse the detector in
+            # this run; return its VRAM before the heavy restoration stages.
+            try:
+                from utils import mosaic_prescan
+                mosaic_prescan.release_detector(log_callback)
+            except Exception:
+                pass
 
 
 def _clone_segment(seg, *, seg_id: int, start_s: float | None = None,
@@ -3029,6 +3094,9 @@ def run_single_file_pipeline(input_file, start_time, end_time, use_fisheye, keep
             return
 
         original_bitrate = get_video_bitrate(input_file, log_callback)
+        # Keep the untouched user input around: VR spatial atoms are read from
+        # it after the preclip swap replaces input_file with a remuxed copy.
+        source_media_file = input_file
         eye_intermediate_bitrate = _resolve_sbs_eye_intermediate_bitrate(
             input_file,
             original_bitrate,
@@ -3051,6 +3119,13 @@ def run_single_file_pipeline(input_file, start_time, end_time, use_fisheye, keep
             start_time = None
             end_time = None
 
+        use_fisheye = _resolve_use_fisheye(
+            input_file, use_fisheye,
+            start_time=start_time, end_time=end_time,
+            release_detector_after=not (pre_extract_enabled or source_scan_enabled),
+            log_callback=log_callback, process_callback=process_callback,
+        )
+
         if source_scan_enabled:
             result = _run_source_scan_branch(
                 input_file,
@@ -3067,8 +3142,10 @@ def run_single_file_pipeline(input_file, start_time, end_time, use_fisheye, keep
                 fine_conf=fine_conf,
             )
             if result in {PreExtractResult.OK, PreExtractResult.NO_MOSAIC}:
-                if log_callback and result == PreExtractResult.OK:
-                    log_callback(f"Done! Output: {file_final}")
+                if result == PreExtractResult.OK:
+                    _tag_vr_spatial_metadata(source_media_file, file_final, log_callback)
+                    if log_callback:
+                        log_callback(f"Done! Output: {file_final}")
                 _release_pre_extract_detector_if_needed(pre_extract_enabled or source_scan_enabled, log_callback)
                 cleanup_success_artifacts = True
                 return
@@ -3081,6 +3158,7 @@ def run_single_file_pipeline(input_file, start_time, end_time, use_fisheye, keep
             input_file, file_final, start_time, end_time, use_fisheye,
             original_bitrate, keep_original_bitrate, log_callback, process_callback,
         ):
+            _tag_vr_spatial_metadata(source_media_file, file_final, log_callback)
             _log_final_bitrate_summary(file_final, original_bitrate, log_callback)
             if log_callback: log_callback(f"Done! Output: {file_final}")
             cleanup_success_artifacts = True
@@ -3130,10 +3208,11 @@ def run_single_file_pipeline(input_file, start_time, end_time, use_fisheye, keep
                     if os.path.exists(f): os.remove(f)
         
         _release_pre_extract_detector_if_needed(pre_extract_enabled or source_scan_enabled, log_callback)
+        _tag_vr_spatial_metadata(source_media_file, file_final, log_callback)
         _log_final_bitrate_summary(file_final, original_bitrate, log_callback)
         if log_callback: log_callback(f"Done! Output: {file_final}")
         cleanup_success_artifacts = True
-        
+
     except Exception as e:
         _release_pre_extract_detector_if_needed(pre_extract_enabled or source_scan_enabled, log_callback)
         if log_callback: log_callback(f"Error: {e}")
@@ -3205,6 +3284,13 @@ def run_single_eye_pipeline(input_file, eye_mode, start_time, end_time, use_fish
         if preclip_path is not None:
             start_time = None
             end_time = None
+
+        use_fisheye = _resolve_use_fisheye(
+            input_file, use_fisheye,
+            start_time=start_time, end_time=end_time,
+            release_detector_after=not (pre_extract_enabled or source_scan_enabled),
+            log_callback=log_callback, process_callback=process_callback,
+        )
 
         if source_scan_enabled:
             result = _run_source_scan_branch(
@@ -3358,12 +3444,18 @@ def run_batch_pipeline(directory, use_fisheye, keep_original_bitrate=False, log_
                 keep_original_bitrate,
                 log_callback=log_callback,
             )
+            # Per-file resolution: keep the "auto" request intact for the next file.
+            file_use_fisheye = _resolve_use_fisheye(
+                input_file, use_fisheye,
+                release_detector_after=not (pre_extract_enabled or source_scan_enabled),
+                log_callback=log_callback, process_callback=process_callback,
+            )
 
             if source_scan_enabled:
                 result = _run_source_scan_branch(
                     input_file,
                     file_final,
-                    use_fisheye=use_fisheye,
+                    use_fisheye=file_use_fisheye,
                     pre_extract_inner=pre_extract,
                     keep_intermediate=False,
                     keep_original_bitrate=keep_original_bitrate,
@@ -3373,8 +3465,10 @@ def run_batch_pipeline(directory, use_fisheye, keep_original_bitrate=False, log_
                     fine_conf=fine_conf,
                 )
                 if result in {PreExtractResult.OK, PreExtractResult.NO_MOSAIC}:
-                    if log_callback and result == PreExtractResult.OK:
-                        log_callback(f"Done! Output: {file_final}")
+                    if result == PreExtractResult.OK:
+                        _tag_vr_spatial_metadata(input_file, file_final, log_callback)
+                        if log_callback:
+                            log_callback(f"Done! Output: {file_final}")
                     cleanup_success_artifacts = True
                     continue
                 if result == PreExtractResult.CANCELLED:
@@ -3383,15 +3477,16 @@ def run_batch_pipeline(directory, use_fisheye, keep_original_bitrate=False, log_
                     log_callback("[source-scan] falling back to the normal OneClick path")
 
             if _native_stream_allowed(False) and _run_native_sbs_stream(
-                input_file, file_final, None, None, use_fisheye,
+                input_file, file_final, None, None, file_use_fisheye,
                 original_bitrate, keep_original_bitrate, log_callback, process_callback,
             ):
+                _tag_vr_spatial_metadata(input_file, file_final, log_callback)
                 _log_final_bitrate_summary(file_final, original_bitrate, log_callback)
                 if log_callback: log_callback(f"Done! Output: {file_final}")
                 cleanup_success_artifacts = True
                 continue
-            
-            if use_fisheye:
+
+            if file_use_fisheye:
                 # Optimized fisheye pipeline: 4 commands instead of 8
                 # Check existing fisheye restored files for smart resume
                 skip_l = os.path.exists(file_l_fish_restored)
@@ -3454,9 +3549,10 @@ def run_batch_pipeline(directory, use_fisheye, keep_original_bitrate=False, log_
                 cleanup_list = [file_l, file_r, file_l_restored, file_r_restored]
                 for f in cleanup_list:
                     if os.path.exists(f): os.remove(f)
+            _tag_vr_spatial_metadata(input_file, file_final, log_callback)
             _log_final_bitrate_summary(file_final, original_bitrate, log_callback)
             cleanup_success_artifacts = True
-                
+
         except OperationCancelled:
             if log_callback:
                 log_callback("Cancelled by user")
@@ -3518,12 +3614,18 @@ def run_batch_eye_pipeline(directory, eye_mode, use_fisheye, keep_original_bitra
             split_bitrate_bps, split_max_bps = _single_eye_split_vbr_bps(original_bitrate)
             split_bitrate_kbps = _bitrate_bps_to_kbps(split_bitrate_bps)
             split_max_kbps = _bitrate_bps_to_kbps(split_max_bps)
+            # Per-file resolution: keep the "auto" request intact for the next file.
+            file_use_fisheye = _resolve_use_fisheye(
+                input_file, use_fisheye,
+                release_detector_after=not (pre_extract_enabled or source_scan_enabled),
+                log_callback=log_callback, process_callback=process_callback,
+            )
 
             if source_scan_enabled:
                 result = _run_source_scan_branch(
                     input_file,
                     file_final,
-                    use_fisheye=use_fisheye,
+                    use_fisheye=file_use_fisheye,
                     pre_extract_inner=pre_extract,
                     keep_intermediate=False,
                     keep_original_bitrate=keep_original_bitrate,
@@ -3544,7 +3646,7 @@ def run_batch_eye_pipeline(directory, eye_mode, use_fisheye, keep_original_bitra
                     log_callback("[source-scan] falling back to the normal OneClick path")
 
             if _native_stream_allowed(False) and _run_native_single_eye_stream(
-                input_file, file_final, eye_mode, None, None, use_fisheye,
+                input_file, file_final, eye_mode, None, None, file_use_fisheye,
                 original_bitrate, keep_original_bitrate, log_callback, process_callback,
             ):
                 _log_final_bitrate_summary(file_final, final_bitrate_bps, log_callback)
@@ -3552,7 +3654,7 @@ def run_batch_eye_pipeline(directory, eye_mode, use_fisheye, keep_original_bitra
                 cleanup_success_artifacts = True
                 continue
 
-            if use_fisheye:
+            if file_use_fisheye:
                 # Crop + VR->Fisheye in one pass.
                 if not os.path.exists(file_cut_fish):
                     split_video_fisheye(
@@ -3626,6 +3728,7 @@ def run_merge_tool(left_file, right_file, keep_original_bitrate=True, log_callba
                 target_original_bitrate = b_left * 2
 
         merge_videos(left_file, right_file, output_file, target_original_bitrate, keep_original_bitrate, log_callback, process_callback)
+        _tag_vr_spatial_metadata(left_file, output_file, log_callback)
         _log_final_bitrate_summary(output_file, target_original_bitrate, log_callback)
         if log_callback: log_callback(f"Done! Output: {output_file}")
         

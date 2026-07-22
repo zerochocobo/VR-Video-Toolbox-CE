@@ -173,6 +173,69 @@ def load_rows(video: str | Path) -> dict[str, Any]:
     }
 
 
+def merge_adjacent_rows(
+    rows: list[dict[str, Any]],
+    *,
+    max_duration: float = 5.0,
+    max_gap_ms: float = 300.0,
+    same_speaker: bool = True,
+    selected_seg_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    """Merge eligible adjacent subtitle rows in place.
+
+    Rows are considered in timeline order. Reference-only rows are barriers;
+    they are never merged or removed. The first segment keeps its id, while
+    ``_merged_ids`` records subsequent ids for manifest cleanup on save.
+    Text fields are concatenated directly, as requested.
+    """
+    max_duration = max(0.01, float(max_duration))
+    max_gap = max(0.0, float(max_gap_ms)) / 1000.0
+    merged_count = 0
+    merged_pairs: list[tuple[Any, Any]] = []
+    removed_count = 0
+    i = 0
+    while i < len(rows) - 1:
+        current = rows[i]
+        nxt = rows[i + 1]
+        if current.get("kind") != "seg" or nxt.get("kind") != "seg":
+            i += 1
+            continue
+        # Do not combine empty subtitle text. Empty lines are often deliberate
+        # deletions from proofreading and must remain independently reviewable.
+        if not (current.get("tgt_text") or "").strip() or not (nxt.get("tgt_text") or "").strip():
+            i += 1
+            continue
+        if selected_seg_ids is not None and not (
+            str(current.get("seg_id")) in selected_seg_ids or str(nxt.get("seg_id")) in selected_seg_ids
+        ):
+            i += 1
+            continue
+        gap = float(nxt.get("start") or 0.0) - float(current.get("end") or 0.0)
+        duration = float(nxt.get("end") or 0.0) - float(current.get("start") or 0.0)
+        if gap < -0.001 or gap > max_gap or duration > max_duration:
+            i += 1
+            continue
+        if same_speaker and (current.get("speaker") or "") != (nxt.get("speaker") or ""):
+            i += 1
+            continue
+        current["end"] = nxt.get("end")
+        current["time"] = _fmt_time(current.get("start"), current.get("end"))
+        for field in ("src_text", "tgt_text", "original_tgt_text", "ref_text"):
+            current[field] = (current.get(field) or "") + (nxt.get(field) or "")
+        if nxt.get("ref_start") is not None:
+            current["ref_start"] = current.get("ref_start") if current.get("ref_start") is not None else nxt.get("ref_start")
+            current["ref_end"] = nxt.get("ref_end")
+            current["ref_time"] = _fmt_time(current.get("ref_start"), current.get("ref_end"))
+        merged_ids = current.setdefault("_merged_ids", [])
+        if nxt.get("seg_id") is not None:
+            merged_ids.append(nxt.get("seg_id"))
+        merged_pairs.append((current.get("seg_id"), nxt.get("seg_id")))
+        rows.pop(i + 1)
+        merged_count += 1
+        removed_count += 1
+    return {"merged_count": merged_count, "removed_count": removed_count, "merged_pairs": merged_pairs}
+
+
 def _int_id_set(values) -> set[int]:
     ids: set[int] = set()
     for item in values or []:
@@ -214,11 +277,19 @@ def save_rows(video: str | Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
         new_text = (row.get("tgt_text") or "").strip()
         old_text = (row.get("original_tgt_text") or "").strip()
         seg["tgt_text"] = new_text
+        if row.get("start") is not None:
+            seg["start"] = float(row.get("start"))
+        if row.get("end") is not None:
+            seg["end"] = float(row.get("end"))
+        if row.get("src_text") is not None:
+            seg["src_text"] = row.get("src_text") or ""
         try:
             seg_id_int = int(seg_id)
         except Exception:
             seg_id_int = None
         if seg_id_int is not None:
+            if row.get("_merged_ids"):
+                edited_ids.append(seg_id_int)
             # A deliberately emptied line (now, or carried over from an earlier
             # proofread) must not look "untranslated" to ensure_translated,
             # otherwise export would re-translate the whole video and wipe edits.
@@ -226,6 +297,16 @@ def save_rows(video: str | Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
                 cleared_ids.add(seg_id_int)
             if new_text != old_text:
                 edited_ids.append(seg_id_int)
+
+    # Remove segments absorbed by a merge, after copying the merged timing and
+    # text into the surviving first segment.
+    merged_ids: set[str] = set()
+    for row in rows:
+        for merged_id in row.get("_merged_ids", []) or []:
+            merged_ids.add(str(merged_id))
+    if merged_ids:
+        manifest["segments"] = [seg for seg in segments if str(seg.get("id")) not in merged_ids]
+        segments = manifest["segments"]
 
     proofread = manifest.get("proofread") if isinstance(manifest.get("proofread"), dict) else {}
     all_edited = sorted(_int_id_set(proofread.get("edited_ids")).union(edited_ids))
@@ -241,6 +322,9 @@ def save_rows(video: str | Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
     logic.save_manifest(video, manifest)
     if translated.is_file() and not original.exists():
         shutil.copyfile(translated, original)
+    # Keep the source subtitle timeline in sync as well: merged segments carry
+    # concatenated source text and a widened time span in the manifest.
+    logic.write_srt(cdir / "source.srt", segments, "src_text", speaker_prefix=True)
     logic.write_srt(translated, segments, "tgt_text", speaker_prefix=True)
     return {
         "edited_count": len(all_edited),

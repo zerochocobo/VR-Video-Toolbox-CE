@@ -2,6 +2,18 @@
 
 ## English
 
+### 2026-07-22
+
+- New/UI: Added configurable adjacent-subtitle merging to Clone Translation Dubbing proofreading. Users can set maximum merged duration and subtitle gap, restrict merging to the same speaker, choose all eligible rows or selected rows and neighbors, review exact merge pairs in a clickable preview, and inspect subtitle duration and inter-subtitle gap columns.
+- Fix: Empty proofread translations are excluded from merging, merged rows are tracked as modifications, and saving keeps the manifest, source subtitles, and translated subtitles synchronized.
+
+### 2026-07-18
+
+- New: OneClick now preserves or safely reconstructs MP4 `st3d`/`sv3d` VR spatial metadata for final SBS outputs, with paired stereo/projection validation, faststart offset updates, atomic replacement, and a configuration switch.
+- Optimization: Native GPU fisheye restoration now supports delta write-back against the original equirectangular frame, preserving unchanged pixels and avoiding unnecessary double resampling; the legacy path remains available through a configuration switch.
+- New: Added automatic fisheye-source detection based on sampled mosaic projection evidence, with safe fallback to no conversion when evidence is uncertain or probing fails.
+- Fix: Added robust parsing for boolean configuration values so strings such as `false`, `0`, `no`, and `off` no longer incorrectly enable features.
+
 ### 2026-07-16
 
 - UI: Reorganized the homepage mosaic controls into a global settings group. Quality/speed now lives above three visible Jasna, Lada, and built-in GPU radio choices instead of in the OneClick footer.
@@ -242,6 +254,18 @@
 - Major optimization: GPU-accelerated VR split/merge, fisheye/equirectangular conversion, VR-to-flat projection, and OneClick geometry stages.
 
 ## 中文
+
+### 2026-07-22
+
+- 新功能/UI：克隆翻译配音的字幕校对新增可配置“合并相邻字幕”功能，可设置合并后最大总时长和字幕间隔、限制为同一说话人，并支持全量合并或“选中行及其相邻字幕”局部合并；合并前可在可点击列表中查看具体字幕对，字幕表还新增时长和字幕间隔列。
+- 修复：空白校对译文不会参与合并；合并动作会正确计入修改记录；保存时同步维护 manifest、源字幕和译文字幕的时间轴与行数。
+
+### 2026-07-18
+
+- 新功能：OneClick 最终 SBS 输出现在会保留或安全重建 MP4 的 `st3d`/`sv3d` VR 空间元数据，增加立体布局与投影成对校验、faststart 偏移修正、原子替换和配置开关。
+- 优化：native GPU 鱼眼复原新增基于原始等距帧的差值回写，仅对实际修复区域进行逆投影，未变化区域避免二次重采样；同时保留配置开关以回退旧路径。
+- 新功能：新增基于采样帧马赛克投影证据的鱼眼来源自动判断；证据不足或探针异常时安全回退为不转换鱼眼。
+- 修复：新增稳健的配置布尔值解析，`false`、`0`、`no`、`off` 等字符串不会再被错误当作开启。
 
 ### 2026-07-16
 

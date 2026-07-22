@@ -203,6 +203,8 @@ class ProofreadDialog(tk.Toplevel):
         if self.has_reference:
             columns.extend(["ref_time", "ref_text"])
         columns.append("time")
+        columns.append("duration")
+        columns.append("gap")
         if self.show_speaker:
             columns.append("speaker")
         columns.extend(["src", "tgt"])
@@ -214,12 +216,14 @@ class ProofreadDialog(tk.Toplevel):
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
         columns = self._columns()
-        self.tree = ttk.Treeview(frame, columns=columns, show="headings", height=8)
+        self.tree = ttk.Treeview(frame, columns=columns, show="headings", height=8, selectmode="extended")
         widths = {
             "num": 52,
             "ref_time": 160,
             "ref_text": 230,
             "time": 160,
+            "duration": 72,
+            "gap": 72,
             "speaker": 96,
             "src": 260,
             "tgt": 300,
@@ -274,16 +278,123 @@ class ProofreadDialog(tk.Toplevel):
     def _build_actions(self) -> None:
         actions = ttk.Frame(self)
         actions.grid(row=3, column=0, sticky="ew", padx=8, pady=(4, 8))
-        actions.columnconfigure(1, weight=1)
+        actions.columnconfigure(2, weight=1)
+        self.btn_merge = ttk.Button(actions, text=get_text("btn_pf_merge"), command=self.open_merge_dialog)
+        self.btn_merge.grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.btn_apply_all = ttk.Button(actions, text=get_text("btn_apply_ref_all"), command=self.apply_ref_all)
-        self.btn_apply_all.grid(row=0, column=0, sticky="w")
+        self.btn_apply_all.grid(row=0, column=1, sticky="w")
         if not self.has_reference:
             self.btn_apply_all.grid_remove()
         self.modified_var = tk.StringVar()
-        ttk.Label(actions, textvariable=self.modified_var, foreground="dim gray").grid(row=0, column=1, sticky="e", padx=8)
-        ttk.Button(actions, text=get_text("btn_pf_save"), command=self.save).grid(row=0, column=2, sticky="e", padx=(0, 6))
-        ttk.Button(actions, text=get_text("btn_cancel"), command=self.cancel).grid(row=0, column=3, sticky="e")
+        ttk.Label(actions, textvariable=self.modified_var, foreground="dim gray").grid(row=0, column=2, sticky="e", padx=8)
+        ttk.Button(actions, text=get_text("btn_pf_save"), command=self.save).grid(row=0, column=3, sticky="e", padx=(0, 6))
+        ttk.Button(actions, text=get_text("btn_cancel"), command=self.cancel).grid(row=0, column=4, sticky="e")
         self._refresh_modified_count()
+
+    def open_merge_dialog(self) -> None:
+        self._commit_editor()
+        dialog = tk.Toplevel(self)
+        dialog.title(get_text("dlg_pf_merge_title"))
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        frame = ttk.Frame(dialog, padding=12)
+        frame.grid(sticky="nsew")
+        ttk.Label(frame, text=get_text("msg_pf_merge_hint"), wraplength=520, justify="left").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 10)
+        )
+        ttk.Label(frame, text=get_text("lbl_pf_merge_scope")).grid(row=1, column=0, sticky="w", pady=3)
+        scope = tk.StringVar(value=get_text("opt_pf_merge_all"))
+        ttk.Combobox(
+            frame,
+            textvariable=scope,
+            state="readonly",
+            width=28,
+            values=[get_text("opt_pf_merge_all"), get_text("opt_pf_merge_selected")],
+        ).grid(row=1, column=1, sticky="w")
+        ttk.Label(frame, text=get_text("lbl_pf_merge_duration")).grid(row=2, column=0, sticky="w", pady=3)
+        duration = tk.DoubleVar(value=5.0)
+        ttk.Spinbox(frame, from_=0.5, to=60.0, increment=0.5, width=8, textvariable=duration).grid(row=2, column=1, sticky="w")
+        ttk.Label(frame, text=get_text("lbl_pf_merge_gap")).grid(row=3, column=0, sticky="w", pady=3)
+        gap = tk.IntVar(value=300)
+        ttk.Spinbox(frame, from_=0, to=5000, increment=50, width=8, textvariable=gap).grid(row=3, column=1, sticky="w")
+        same_speaker = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frame, text=get_text("lbl_pf_merge_same_speaker"), variable=same_speaker).grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(5, 3)
+        )
+        result_var = tk.StringVar()
+        ttk.Label(frame, textvariable=result_var, foreground="dim gray").grid(row=5, column=0, columnspan=2, sticky="w", pady=5)
+        details = tk.Listbox(frame, height=6, width=68, exportselection=False)
+        details.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(0, 5))
+        pair_ids: list[tuple[object, object]] = []
+
+        def inspect_pair(_event=None):
+            if not pair_ids or not details.curselection():
+                return
+            _first_id, second_id = pair_ids[details.curselection()[0]]
+            # Scroll to the trailing row so the preceding row remains visible
+            # immediately above it in the tree rather than being covered by
+            # the viewport edge.
+            self._focus_seg_id(second_id)
+            self.lift()
+
+        def preview(*_args):
+            try:
+                test_rows = [dict(row) for row in self.rows]
+                selected = None if scope.get() == get_text("opt_pf_merge_all") else self._selected_seg_ids()
+                result = proofread.merge_adjacent_rows(
+                    test_rows,
+                    max_duration=duration.get(),
+                    max_gap_ms=gap.get(),
+                    same_speaker=same_speaker.get(),
+                    selected_seg_ids=selected,
+                )
+                result_var.set(get_text("msg_pf_merge_preview").format(result.get("merged_count", 0)))
+                pairs = result.get("merged_pairs") or []
+                pair_ids[:] = pairs
+                details.delete(0, "end")
+                if pairs:
+                    for first_id, second_id in pairs:
+                        details.insert("end", get_text("fmt_pf_merge_pair").format(first_id, second_id))
+                else:
+                    details.insert("end", get_text("msg_pf_merge_none"))
+            except (tk.TclError, ValueError):
+                result_var.set("")
+
+        duration.trace_add("write", preview)
+        gap.trace_add("write", preview)
+        same_speaker.trace_add("write", preview)
+        scope.trace_add("write", preview)
+        details.bind("<Double-1>", inspect_pair)
+        details.bind("<Return>", inspect_pair)
+        details.bind("<<ListboxSelect>>", inspect_pair)
+        preview()
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=7, column=0, columnspan=2, sticky="e", pady=(8, 0))
+
+        def apply():
+            try:
+                selected = None if scope.get() == get_text("opt_pf_merge_all") else self._selected_seg_ids()
+                result = proofread.merge_adjacent_rows(
+                    self.rows,
+                    max_duration=duration.get(),
+                    max_gap_ms=gap.get(),
+                    same_speaker=same_speaker.get(),
+                    selected_seg_ids=selected,
+                )
+            except (tk.TclError, ValueError):
+                return
+            self._populate_tree()
+            self._refresh_modified_count()
+            if self.rows:
+                iid = str(min(int(self.current_iid or 0), len(self.rows) - 1))
+                self.tree.selection_set(iid)
+                self._load_row(iid)
+            dialog.destroy()
+            if result.get("merged_count", 0):
+                messagebox.showinfo("Info", get_text("msg_pf_merge_done").format(result["merged_count"]), parent=self)
+
+        ttk.Button(buttons, text=get_text("btn_pf_merge_apply"), command=apply).pack(side="right", padx=(6, 0))
+        ttk.Button(buttons, text=get_text("btn_cancel"), command=dialog.destroy).pack(side="right")
 
     def _populate_tree(self) -> None:
         for iid in self.tree.get_children():
@@ -300,6 +411,8 @@ class ProofreadDialog(tk.Toplevel):
                 values["ref_time"] = row.get("ref_time", "")
                 values["ref_text"] = _short(row.get("ref_text", ""))
             values["time"] = row.get("time", "")
+            values["duration"] = self._format_duration(row)
+            values["gap"] = self._format_gap(index)
             if self.show_speaker:
                 values["speaker"] = row.get("speaker", "")
             values["src"] = _short(row.get("src_text", ""))
@@ -375,6 +488,8 @@ class ProofreadDialog(tk.Toplevel):
         values = {
             "num": self.tree.set(iid, "num") if "num" in self._columns() else "",
             "time": row.get("time", ""),
+            "duration": self._format_duration(row),
+            "gap": self._format_gap(int(iid)),
             "src": _short(row.get("src_text", "")),
             "tgt": _short(row.get("tgt_text", "")),
         }
@@ -393,17 +508,65 @@ class ProofreadDialog(tk.Toplevel):
         tags = []
         if row.get("kind") == "ref_only":
             tags.append("ref_only")
-        if row.get("kind") == "seg" and (row.get("tgt_text") or "").strip() != (row.get("original_tgt_text") or "").strip():
+        if row.get("kind") == "seg" and (
+            (row.get("tgt_text") or "").strip() != (row.get("original_tgt_text") or "").strip()
+            or row.get("_merged_ids")
+        ):
             tags.append("modified")
         self.tree.item(iid, tags=tags)
+
+    @staticmethod
+    def _format_duration(row: dict) -> str:
+        try:
+            duration = max(0.0, float(row.get("end") or 0.0) - float(row.get("start") or 0.0))
+            return f"{duration:.2f}s"
+        except (TypeError, ValueError):
+            return ""
+
+    def _format_gap(self, index: int) -> str:
+        try:
+            row = self.rows[index]
+            if row.get("kind") != "seg":
+                return ""
+            previous = next(
+                (candidate for candidate in reversed(self.rows[:index]) if candidate.get("kind") == "seg"),
+                None,
+            )
+            if previous is None:
+                return "—"
+            gap = float(row.get("start") or 0.0) - float(previous.get("end") or 0.0)
+            return f"{gap:.1f}s"
+        except (IndexError, TypeError, ValueError):
+            return ""
+
+    def _focus_seg_id(self, seg_id) -> None:
+        for iid in self.tree.get_children():
+            row = self._row(iid)
+            if row and str(row.get("seg_id")) == str(seg_id):
+                self.tree.selection_set(iid)
+                self.tree.focus(iid)
+                self.tree.see(iid)
+                self._load_row(iid)
+                return
 
     def _modified_count(self) -> int:
         return sum(
             1
             for row in self.rows
             if row.get("kind") == "seg"
-            and (row.get("tgt_text") or "").strip() != (row.get("original_tgt_text") or "").strip()
+            and (
+                (row.get("tgt_text") or "").strip() != (row.get("original_tgt_text") or "").strip()
+                or bool(row.get("_merged_ids"))
+            )
         )
+
+    def _selected_seg_ids(self) -> set[str]:
+        ids: set[str] = set()
+        for iid in self.tree.selection():
+            row = self._row(iid)
+            if row and row.get("kind") == "seg" and row.get("seg_id") is not None:
+                ids.add(str(row["seg_id"]))
+        return ids
 
     def _refresh_modified_count(self) -> None:
         self.modified_var.set(get_text("msg_pf_modified_count").format(self._modified_count()))
