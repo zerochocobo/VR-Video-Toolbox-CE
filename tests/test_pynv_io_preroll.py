@@ -185,6 +185,91 @@ class PyNvThreadedDecoderPrerollTests(unittest.TestCase):
             finally:
                 dec.stop()
 
+    def test_decoder_restarts_when_first_batch_overshoots_target(self) -> None:
+        # ThreadedDecoder delivers its first frame start_frame+2 (observed on some
+        # 8K HEVC streams). When the preroll keyframe lands so close to the target
+        # that +2 skips past it, forward-only decode can never reach the target and
+        # the decoder must restart from an earlier frame.
+        target_frame = 2401  # keyframe at 2400 -> preroll 2400, +2 lands at 2402 > target
+        created_start_frames: list[int] = []
+
+        class FakeDecodedFrame:
+            def __init__(self, index: int):
+                self.index = int(index)
+
+            def getPTS(self) -> int:
+                return self.index * 1001
+
+        class FakeMeta:
+            width = 8192
+            height = 4096
+            average_fps = 60000 / 1001
+            duration = 246.279
+            codec_name = "hevc"
+            bitrate = 33000000
+            num_frames = 14762
+
+        class FakeSimpleDecoder:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def get_stream_metadata(self):
+                return FakeMeta()
+
+            def __len__(self):
+                return 14762
+
+            def __getitem__(self, index):
+                return FakeDecodedFrame(index)
+
+            def get_index_from_time_in_seconds(self, seconds: float) -> int:
+                # keyframe exactly at the target so preroll can't back off on its own
+                return {0.0: 0, 40.033: 2400, 45.038: 2700}[round(float(seconds), 3)]
+
+            def stop(self):
+                pass
+
+        class FakeThreadedDecoder:
+            def __init__(self, _path, _buffer_size, **kwargs):
+                start = int(kwargs["start_frame"])
+                created_start_frames.append(start)
+                self.next_index = start + 2  # constant +2 overshoot
+
+            def get_batch_frames(self, batch_size: int):
+                batch = [FakeDecodedFrame(self.next_index + off) for off in range(int(batch_size))]
+                self.next_index += int(batch_size)
+                return batch
+
+            def end(self):
+                pass
+
+        fake_nvc = types.SimpleNamespace(
+            SimpleDecoder=FakeSimpleDecoder,
+            ThreadedDecoder=FakeThreadedDecoder,
+            OutputColorType=types.SimpleNamespace(NATIVE=object()),
+        )
+
+        with (
+            patch.dict(sys.modules, {"PyNvVideoCodec": fake_nvc}),
+            patch("gpu_engine.pynv_io._keyframe_times_for_path", return_value=(0.0, 40.033, 45.038)),
+            patch(
+                "gpu_engine.pynv_io.GpuNv12Frame.from_decoded_frame",
+                side_effect=lambda frame, _w, _h: types.SimpleNamespace(index=frame.index, pts=frame.getPTS()),
+            ),
+        ):
+            dec = pynv_io.PyNvThreadedSerialDecoder(Path("clip.mp4"), start_frame=target_frame, batch_size=8)
+            try:
+                frame = dec.frame_at(target_frame)
+                self.assertEqual(frame.index, target_frame)
+                self.assertEqual(frame.pts, target_frame * 1001)
+                self.assertGreater(dec._seek_retries, 0)
+                # the restart must have used an earlier start_frame than the first try
+                self.assertLess(created_start_frames[-1], created_start_frames[0])
+                # subsequent frames stay correct and monotonic
+                self.assertEqual(dec.frame_at(target_frame + 1).index, target_frame + 1)
+            finally:
+                dec.stop()
+
     def test_decoder_accepts_threaded_pts_shifted_by_container_origin(self) -> None:
         origin_delta = 2970
         target_frame = 1770

@@ -592,16 +592,18 @@ class PyNvThreadedSerialDecoder:
                     self._len,
                     index_at_time=probe.index_at_time,
                 )
-                if self._decode_start_frame < self.start_frame:
-                    probe_end = min(self._len, self._decode_start_frame + 32)
-                    for frame_idx in range(self._decode_start_frame, probe_end):
-                        try:
-                            preroll_frame = probe.frame_at(frame_idx)
-                            pts_value = int(getattr(preroll_frame, "pts", -1))
-                        except Exception:
-                            continue
-                        if pts_value >= 0:
-                            self._preroll_pts_to_frame.setdefault(pts_value, frame_idx)
+                # Always begin at least one frame before the target and always
+                # build the pts->frame map: the ThreadedDecoder can deliver its
+                # first frame a few frames AFTER start_frame on some streams, and
+                # the map is what lets calibration detect and recover from that
+                # overshoot instead of decoding the wrong frame.
+                if self._decode_start_frame >= self.start_frame:
+                    self._decode_start_frame = max(0, self.start_frame - 1)
+                self._extend_preroll_map(
+                    probe,
+                    self._decode_start_frame,
+                    min(self._len, self.start_frame + 8),
+                )
         finally:
             probe.stop()
         self._decoder = nvc.ThreadedDecoder(
@@ -619,6 +621,7 @@ class PyNvThreadedSerialDecoder:
         self._ended = False
         self._first_frame_verified = (self.start_frame == 0)
         self._initial_batch_calibrated = False
+        self._seek_retries = 0
 
     def __len__(self) -> int:
         return self._len
@@ -642,6 +645,8 @@ class PyNvThreadedSerialDecoder:
                     raise RuntimeError(f"ThreadedDecoder returned no frames at idx={self._next_source_idx}")
                 self._batch = list(batch)
                 self._calibrate_initial_batch()
+                if self._maybe_restart_for_overshoot(target):
+                    continue
             current = self._batch_start_idx + self._batch_pos
             raw = self._batch[self._batch_pos]
             self._batch_pos += 1
@@ -658,6 +663,68 @@ class PyNvThreadedSerialDecoder:
                 self._verify_first_frame_pts(frame)
                 self._first_frame_verified = True
             return frame
+
+    _MAX_SEEK_RETRIES = 6
+
+    def _extend_preroll_map(self, probe, lo: int, hi: int) -> None:
+        """Populate pts->frame map for [lo, hi) using a random-access probe."""
+        for frame_idx in range(max(0, int(lo)), max(0, int(hi))):
+            try:
+                preroll_frame = probe.frame_at(frame_idx)
+                pts_value = int(getattr(preroll_frame, "pts", -1))
+            except Exception:
+                continue
+            if pts_value >= 0:
+                self._preroll_pts_to_frame.setdefault(pts_value, frame_idx)
+
+    def _maybe_restart_for_overshoot(self, target: int) -> bool:
+        """Restart the decoder earlier when the initial batch overshot the target.
+
+        The PyNv ThreadedDecoder can deliver its first frame a few frames AFTER
+        the requested start_frame (observed +2 on some 8K HEVC streams). When
+        that lands past the target, forward-only decoding can never reach it, so
+        we back off by the measured overshoot (plus margin) and try again.
+        """
+        if self._batch_start_idx <= target:
+            return False
+        if self._decode_start_frame <= 0 or self._seek_retries >= self._MAX_SEEK_RETRIES:
+            return False
+        overshoot = self._batch_start_idx - target
+        new_start = max(0, self._decode_start_frame - overshoot - 4)
+        if new_start >= self._decode_start_frame:
+            return False
+        self._seek_retries += 1
+        self._restart_decode_from(new_start, target)
+        return True
+
+    def _restart_decode_from(self, new_start: int, target: int) -> None:
+        import PyNvVideoCodec as nvc
+
+        end = getattr(self._decoder, "end", None)
+        if callable(end):
+            try:
+                end()
+            except Exception:
+                pass
+        self._decode_start_frame = int(new_start)
+        probe = PyNvSimpleDecoder(self.src, gpu_id=self.gpu_id, bit_depth=self.bit_depth)
+        try:
+            self._extend_preroll_map(probe, new_start, min(self._len, int(target) + 8))
+        finally:
+            probe.stop()
+        self._decoder = nvc.ThreadedDecoder(
+            str(self.src),
+            self.buffer_size,
+            gpu_id=self.gpu_id,
+            use_device_memory=True,
+            output_color_type=nvc.OutputColorType.NATIVE,
+            start_frame=self._decode_start_frame,
+        )
+        self._batch = []
+        self._batch_pos = 0
+        self._batch_start_idx = self._decode_start_frame
+        self._next_source_idx = self._decode_start_frame
+        self._initial_batch_calibrated = False
 
     def _calibrate_initial_batch(self) -> None:
         if self._initial_batch_calibrated:

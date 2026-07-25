@@ -2642,16 +2642,29 @@ The following subtitles are raw speech-recognition (ASR) output in {source_langu
 numbered in playback order. Correct recognition errors (homophones, wrong particles,
 wrong or inconsistent person names, garbled words) using the surrounding lines as
 context. Do NOT translate — output must stay in the same language as the input.
-If a line is already correct or unrecoverable, return it unchanged.
+Output Mode: SPARSE_CHANGES_ONLY.
+Return ONLY subtitles that need a correction or deletion. Omit every unchanged or
+unrecoverable subtitle entirely; an omitted id means "keep the original text".
 If a line consists ONLY of non-lexical vocalizations or fillers (moans, sighs,
 laughter, hums — e.g. あ, ああー, ん, うん, 嗯, はぁ, ふふ, あはは), output its
 tag EMPTY like <id></id> to mark it for removal; keep meaningful short lines
 (はい, え?, だめ). Also output an EMPTY tag for hallucinated stock phrases that
 appear abruptly with no contextual support (ご視聴ありがとうございました,
 おやすみなさい, またお会いしましょう and similar closing/greeting lines).
-Keep the XML tags <id>...</id> intact and one-to-one; never leave an id out.
+Keep the XML tags <id>...</id> intact. Never include explanations, summaries, the
+original text, or unchanged ids. Wrap the answer in START and END markers. If nothing
+needs changing, return START and END with no subtitle tags between them.
 
 {subtitles}
+"""
+
+_CORRECT_SPARSE_OUTPUT_OVERRIDE = """
+
+IMPORTANT OUTPUT OVERRIDE — SPARSE_CHANGES_ONLY:
+Regardless of any earlier instruction or example, return ONLY corrected or deleted
+subtitle ids. Omit unchanged and unrecoverable ids; omission means keep the original.
+Use an empty tag for deletion. Never return original/unchanged text or explanations.
+Wrap the answer in START and END markers; if there are no changes, put no tags between them.
 """
 
 def get_config_dir():
@@ -2836,6 +2849,17 @@ def _load_correct_prompt_template(adult_content: bool = True) -> str:
     if not adult_content:
         template = _strip_adult_background(template)
 
+    # Existing installations keep their customized config file during upgrades.
+    # Append an explicit override to legacy full-output prompts so they gain the
+    # completion-token saving without requiring users to replace that file.
+    if "SPARSE_CHANGES_ONLY" not in template:
+        stripped = template.rstrip()
+        if stripped.endswith("/no_think"):
+            stripped = stripped[:-len("/no_think")].rstrip()
+            template = stripped + _CORRECT_SPARSE_OUTPUT_OVERRIDE + "\n/no_think\n"
+        else:
+            template = stripped + _CORRECT_SPARSE_OUTPUT_OVERRIDE
+
     return template
 
 def _build_prompt(tagged_text: str, template: str, placeholders: dict) -> str:
@@ -2861,7 +2885,8 @@ def _with_context(missing_ids: list, pool: dict, before: int = 2, after: int = 1
     return {sid: pool[sid] for sid in order if sid in keep}
 
 def _llm_chunk_pass(client: LLMClient, chunk: dict, template: str, placeholders: dict,
-                    max_retries: int, log_callback, stop_event) -> dict:
+                    max_retries: int, log_callback, stop_event,
+                    sparse_output: bool = False) -> dict:
     tagged, mapping = sequential_ids(chunk)
     results = {}
 
@@ -2873,7 +2898,23 @@ def _llm_chunk_pass(client: LLMClient, chunk: dict, template: str, placeholders:
             response = client.complete(prompt)
             # Accumulate across attempts: a retry response only contains the
             # re-sent lines and must not wipe earlier successful ones.
-            results.update(deobfuscate_ids(response, mapping))
+            parsed = deobfuscate_ids(response, mapping)
+            results.update(parsed)
+            # Sparse protocols intentionally omit unchanged entries. Changed
+            # tags or explicit empty START/END markers are therefore complete,
+            # not a reason to retry or split the chunk.
+            if sparse_output:
+                has_empty_markers = bool(
+                    re.search(r"\bSTART\b", response, re.IGNORECASE)
+                    and re.search(r"\bEND\b", response, re.IGNORECASE)
+                )
+                if parsed or has_empty_markers:
+                    break
+                log_callback(
+                    f"  [WARN] Sparse response had no subtitle tags or START/END markers "
+                    f"(attempt {attempt})."
+                )
+                continue
         except Exception as exc:
             log_callback(f"  [WARN] Chunk LLM error (attempt {attempt}): {exc}")
             if attempt == max_retries:
@@ -2894,7 +2935,7 @@ def _llm_chunk_pass(client: LLMClient, chunk: dict, template: str, placeholders:
 
 def _run_entries_llm(client: LLMClient, entries: dict, template: str, placeholders: dict,
                      tokens_per_chunk: int, max_retries: int, log_callback, stop_event,
-                     label: str = "Translating") -> dict:
+                     label: str = "Translating", sparse_output: bool = False) -> dict:
     """Run one LLM pass over all entries, returning {sid: response_text}."""
     chunks = split_into_chunks(entries, tokens_per_chunk)
     log_callback(f"[INFO] Total chunks: {len(chunks)}")
@@ -2907,9 +2948,12 @@ def _run_entries_llm(client: LLMClient, entries: dict, template: str, placeholde
             break
 
         log_callback(f"[INFO] {label} chunk {idx + 1}/{len(chunks)} ({len(chunk)} entries)...")
-        result = _llm_chunk_pass(client, chunk, template, placeholders, max_retries, log_callback, stop_event)
+        result = _llm_chunk_pass(
+            client, chunk, template, placeholders, max_retries, log_callback,
+            stop_event, sparse_output=sparse_output,
+        )
 
-        if not result and len(chunk) > 1:
+        if not sparse_output and not result and len(chunk) > 1:
             mid = len(chunk) // 2
             items = list(chunk.items())
             for half_label, half in [("first", dict(items[:mid])), ("second", dict(items[mid:]))]:
@@ -3035,6 +3079,7 @@ def correct_entries(client: LLMClient, entries: dict, source_language: str,
         {"source_language": source_language or "Japanese"},
         tokens_per_chunk, max_retries, log_callback, stop_event,
         label="Proofreading source",
+        sparse_output=True,
     )
 
     changed = 0
