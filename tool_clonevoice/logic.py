@@ -376,9 +376,7 @@ def run_translate(
     if not api_key:
         raise RuntimeError("No translation API key provided or saved.")
 
-    client = sl.LLMClient(
-        cfg.get("api_base_url", ""), api_key, cfg.get("model_name", ""), temperature=temperature
-    )
+    client = sl.make_llm_client(cfg, api_key, temperature=temperature)
 
     segments = manifest.get("segments", [])
     entries = {
@@ -470,6 +468,7 @@ def run_translate(
     save_manifest(video, manifest)
     write_srt(clone_dir(video) / "translated.srt", segments, "tgt_text", speaker_prefix=True)
     log(f"[translate] {translated}/{len(entries)} translated -> {manifest_path(video)}")
+    sl.log_llm_usage(client, log, header="API token usage")
     log(f"[srt] translated subtitles -> {clone_dir(video) / 'translated.srt'}")
     return manifest
 

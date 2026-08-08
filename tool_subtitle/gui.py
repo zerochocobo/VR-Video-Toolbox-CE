@@ -684,7 +684,10 @@ class SubtitleToolsApp:
             
         def test_task():
             try:
-                client = logic.LLMClient(api_url, api_key, model_name, temperature=0.5)
+                # Connectivity check only: a bad key/URL must fail fast instead
+                # of inheriting the long translation timeout.
+                client = logic.LLMClient(api_url, api_key, model_name, temperature=0.5,
+                                         request_timeout=logic.API_TEST_TIMEOUT)
                 response = client.complete("Say 'Hello' or '你好' only, nothing else.")
                 
                 # Save the key to keyring only after the test succeeds.

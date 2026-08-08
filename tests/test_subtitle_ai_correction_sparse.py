@@ -51,6 +51,40 @@ def test_source_correction_treats_empty_sparse_response_as_no_changes(monkeypatc
     assert deleted == set()
 
 
+def test_source_correction_accepts_natural_language_no_change_response(monkeypatch):
+    monkeypatch.setattr(logic, "_load_correct_prompt_template", lambda _adult: logic.DEFAULT_CORRECT_PROMPT)
+    client = FakeClient(["修正はありません。"])
+    entries = _entries()
+    messages = []
+
+    changed, deleted = logic.correct_entries(
+        client, entries, "Japanese", 10000, True, 3, messages.append, None,
+    )
+
+    assert len(client.prompts) == 1
+    assert entries == _entries()
+    assert changed == 0
+    assert deleted == set()
+    assert any("reported no changes" in message for message in messages)
+
+
+def test_source_correction_still_retries_ambiguous_untagged_response(monkeypatch):
+    monkeypatch.setattr(logic, "_load_correct_prompt_template", lambda _adult: logic.DEFAULT_CORRECT_PROMPT)
+    client = FakeClient(["字幕を確認しました。", "START\n\nEND"])
+    entries = _entries()
+    messages = []
+
+    changed, deleted = logic.correct_entries(
+        client, entries, "Japanese", 10000, True, 2, messages.append, None,
+    )
+
+    assert len(client.prompts) == 2
+    assert entries == _entries()
+    assert changed == 0
+    assert deleted == set()
+    assert any("unsupported response format" in message for message in messages)
+
+
 def test_translation_chunk_still_retries_missing_ids():
     client = FakeClient(["<1>甲</1>", "<1>甲</1>\n<2>乙</2>"])
     messages = []

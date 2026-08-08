@@ -4193,7 +4193,10 @@ class ClonevoiceToolsApp:
 
             def work():
                 try:
-                    client = tsl.LLMClient(url_var.get().strip(), api_key, model_var.get().strip(), temperature=0.3)
+                    # Connectivity check only: a bad key/URL must fail fast
+                    # instead of inheriting the long translation timeout.
+                    client = tsl.LLMClient(url_var.get().strip(), api_key, model_var.get().strip(),
+                                           temperature=0.3, request_timeout=tsl.API_TEST_TIMEOUT)
                     client.complete("Reply with OK.")
                     if keyring:
                         keyring.set_password("VR_Video_Toolbox", "deepseek_api_key", api_key)

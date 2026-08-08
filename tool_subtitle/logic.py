@@ -2622,7 +2622,13 @@ DEFAULT_TRANS_CONFIG = {
     "keep_original": True,
     "adult_content": True,
     "dubbing_optimized": False,
-    "source_correction": True
+    "source_correction": True,
+    # DeepSeek V4 defaults to thinking mode at effort "high", which is what made
+    # a single 168-line chunk crawl. Thinking still helps on garbled ASR, so keep
+    # it on but pin the effort to "low" instead of inheriting the server default.
+    "enable_thinking": True,
+    "reasoning_effort": "low",
+    "request_timeout": 900
 }
 
 DEFAULT_PROMPT = """\
@@ -2717,8 +2723,64 @@ def save_trans_config(new_config):
         print(f"Error saving trans config: {e}")
         return False
 
+class UsageStats:
+    """Token/latency counters for one workload phase (proofread, translate...)."""
+
+    def __init__(self, label: str):
+        self.label = label
+        self.calls = 0
+        self.input_tokens = 0
+        self.cached_input_tokens = 0
+        self.output_tokens = 0
+        self.reasoning_tokens = 0
+        self.seconds = 0.0
+
+    def add(self, usage: dict, seconds: float):
+        self.calls += 1
+        self.seconds += seconds
+        self.input_tokens += usage.get("prompt_tokens", 0) or 0
+        self.cached_input_tokens += usage.get("prompt_cache_hit_tokens", 0) or 0
+        self.output_tokens += usage.get("completion_tokens", 0) or 0
+        details = usage.get("completion_tokens_details") or {}
+        self.reasoning_tokens += details.get("reasoning_tokens", 0) or 0
+
+    def summary(self) -> str:
+        parts = [
+            f"{self.label}: {self.calls} calls",
+            f"input {self.input_tokens}",
+        ]
+        if self.cached_input_tokens:
+            parts.append(f"(cache hit {self.cached_input_tokens})")
+        parts.append(f"output {self.output_tokens}")
+        if self.reasoning_tokens:
+            parts.append(f"(reasoning {self.reasoning_tokens})")
+        parts.append(f"{self.seconds:.1f}s")
+        return ", ".join(parts)
+
+
+# DeepSeek V4 runs with thinking mode ENABLED at effort "high" by default, which
+# makes a plain chat/completions call spend minutes on chain-of-thought before a
+# single subtitle tag comes back. We keep thinking on (it does help on garbled
+# ASR) but always send the effort explicitly so we never inherit "high".
+# Note: thinking mode silently ignores temperature/top_p/penalties.
+# https://api-docs.deepseek.com/guides/thinking_mode/
+_THINKING_CAPABLE_HINTS = ("deepseek", "kimi", "qwen", "glm", "minimax")
+
+# The "test API" buttons only prove the key/URL reach the provider. They must
+# fail fast instead of inheriting the translation timeout, which would leave the
+# dialog spinning for a quarter of an hour on a wrong key.
+API_TEST_TIMEOUT = 30
+
+
+def _supports_thinking_field(base_url: str, model: str) -> bool:
+    probe = f"{base_url} {model}".lower()
+    return any(hint in probe for hint in _THINKING_CAPABLE_HINTS)
+
+
 class LLMClient:
-    def __init__(self, base_url: str, api_key: str, model: str, temperature: float = 0.5):
+    def __init__(self, base_url: str, api_key: str, model: str, temperature: float = 0.5,
+                 enable_thinking: bool = True, reasoning_effort: str = "low",
+                 request_timeout: int = 900):
         self.url = f"{base_url.rstrip('/')}/chat/completions"
         self.headers = {
             "Content-Type": "application/json",
@@ -2726,8 +2788,23 @@ class LLMClient:
         }
         self.model = model
         self.temperature = temperature
+        self.enable_thinking = bool(enable_thinking)
+        self.reasoning_effort = (reasoning_effort or "").strip()
+        self.request_timeout = int(request_timeout)
+        # Only providers that understand the field get it; a strict
+        # OpenAI-compatible gateway would reject the unknown key.
+        self.send_thinking_field = _supports_thinking_field(base_url, model)
         self.input_tokens = 0
         self.output_tokens = 0
+        self.reasoning_tokens = 0
+        self.phase_stats: dict[str, UsageStats] = {}
+        self._phase = "LLM"
+
+    def set_phase(self, label: str):
+        self._phase = label or "LLM"
+
+    def _stats(self) -> UsageStats:
+        return self.phase_stats.setdefault(self._phase, UsageStats(self._phase))
 
     def complete(self, prompt: str) -> str:
         import requests
@@ -2737,13 +2814,70 @@ class LLMClient:
             "messages": [{"role": "system", "content": prompt}],
             "temperature": self.temperature,
         }
-        resp = requests.post(self.url, headers=self.headers, json=payload, timeout=120)
+        if self.send_thinking_field:
+            payload["thinking"] = {"type": "enabled" if self.enable_thinking else "disabled"}
+            if self.enable_thinking and self.reasoning_effort:
+                payload["reasoning_effort"] = self.reasoning_effort
+
+        started = time.time()
+        resp = requests.post(self.url, headers=self.headers, json=payload,
+                             timeout=self.request_timeout)
         resp.raise_for_status()
         data = resp.json()
-        usage = data.get("usage", {})
-        self.input_tokens += usage.get("prompt_tokens", 0)
-        self.output_tokens += usage.get("completion_tokens", 0)
+        usage = data.get("usage", {}) or {}
+        self._stats().add(usage, time.time() - started)
+        self.input_tokens += usage.get("prompt_tokens", 0) or 0
+        self.output_tokens += usage.get("completion_tokens", 0) or 0
+        details = usage.get("completion_tokens_details") or {}
+        self.reasoning_tokens += details.get("reasoning_tokens", 0) or 0
         return data["choices"][0]["message"]["content"]
+
+    def usage_lines(self) -> list[str]:
+        """Per-phase then total token usage, ready for the log panel."""
+        lines = [stats.summary() for stats in self.phase_stats.values() if stats.calls]
+        total = sum(s.calls for s in self.phase_stats.values())
+        if total:
+            seconds = sum(s.seconds for s in self.phase_stats.values())
+            cached = sum(s.cached_input_tokens for s in self.phase_stats.values())
+            line = f"total: {total} calls, input {self.input_tokens}"
+            if cached:
+                line += f" (cache hit {cached})"
+            line += f", output {self.output_tokens}"
+            if self.reasoning_tokens:
+                line += f" (reasoning {self.reasoning_tokens})"
+            line += f", {seconds:.1f}s"
+            lines.append(line)
+        return lines
+
+
+def log_llm_usage(client, log_callback, header: str = "API usage"):
+    """Log token statistics; tolerates stub clients used in tests."""
+    lines = getattr(client, "usage_lines", None)
+    lines = lines() if callable(lines) else []
+    if not lines:
+        return
+    log_callback(f"[INFO] {header}:")
+    for line in lines:
+        log_callback(f"  [INFO] {line}")
+
+
+def make_llm_client(config: dict, api_key: str, temperature: float | None = None) -> LLMClient:
+    """Build a client from a translation config dict (single source of truth)."""
+    return LLMClient(
+        config.get("api_base_url", ""),
+        api_key,
+        config.get("model_name", ""),
+        temperature=config.get("temperature", 0.5) if temperature is None else temperature,
+        enable_thinking=bool(config.get("enable_thinking", True)),
+        reasoning_effort=config.get("reasoning_effort", "low"),
+        request_timeout=int(config.get("request_timeout", 900)),
+    )
+
+
+def _set_phase(client, label: str):
+    setter = getattr(client, "set_phase", None)
+    if callable(setter):
+        setter(label)
 
 def parse_srt(text: str) -> dict:
     entries = {}
@@ -2810,6 +2944,30 @@ def sequential_ids(chunk: dict) -> tuple[str, dict]:
 
 _TAG_PAIR = re.compile(r"<(\d+)>(.*?)</\d+>", re.DOTALL | re.MULTILINE)
 _TAG_OPEN_ONLY = re.compile(r"<(\d+)>(.*?)\n", re.DOTALL)
+
+_SPARSE_NO_CHANGE_PATTERNS = (
+    re.compile(r"(?:no\s+)?(?:changes?|corrections?|edits?)(?:\s+(?:are\s+)?needed|required|necessary)?", re.IGNORECASE),
+    re.compile(r"(?:there\s+(?:are|is)\s+)?no\s+(?:subtitle\s+)?(?:changes?|corrections?|edits?)(?:\s+(?:are\s+)?needed|required|necessary)?", re.IGNORECASE),
+    re.compile(r"(?:修正|変更)(?:は)?(?:なし|ありません|不要です?)"),
+    re.compile(r"(?:无需|無需|无须|不需要)(?:进行)?(?:任何)?(?:修改|修正|更改)"),
+    re.compile(r"(?:没有|沒有)(?:任何)?(?:需要)?(?:修改|修正|更改)(?:的内容|的字幕)?"),
+)
+
+
+def _sparse_response_is_explicit_no_change(response: str) -> bool:
+    """Accept a short, unambiguous natural-language no-change answer.
+
+    Some otherwise compatible chat models ignore the requested START/END wrapper
+    and answer "No corrections needed". Treating that as a provider failure causes
+    three identical retries and a worrying warning even though preserving every
+    source line is the safe and intended sparse result.
+    """
+    text = (response or "").lstrip("\ufeff").strip()
+    text = re.sub(r"^```(?:text|xml)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
+    if not text or len(text) > 160 or "<" in text or ">" in text or re.search(r"\d", text):
+        return False
+    normalized = re.sub(r"[\s。.!！?？:：;；,，、'\"`]+", " ", text).strip()
+    return any(pattern.fullmatch(normalized) for pattern in _SPARSE_NO_CHANGE_PATTERNS)
 
 def deobfuscate_ids(response: str, mapping: dict) -> dict:
     results = {}
@@ -2895,7 +3053,9 @@ def _llm_chunk_pass(client: LLMClient, chunk: dict, template: str, placeholders:
             break
         try:
             prompt = _build_prompt(tagged, template, placeholders)
+            _call_started = time.time()
             response = client.complete(prompt)
+            log_callback(f"  [INFO] LLM replied in {time.time() - _call_started:.1f}s.")
             # Accumulate across attempts: a retry response only contains the
             # re-sent lines and must not wipe earlier successful ones.
             parsed = deobfuscate_ids(response, mapping)
@@ -2908,12 +3068,21 @@ def _llm_chunk_pass(client: LLMClient, chunk: dict, template: str, placeholders:
                     re.search(r"\bSTART\b", response, re.IGNORECASE)
                     and re.search(r"\bEND\b", response, re.IGNORECASE)
                 )
-                if parsed or has_empty_markers:
+                natural_no_change = _sparse_response_is_explicit_no_change(response)
+                if parsed or has_empty_markers or natural_no_change:
+                    if natural_no_change:
+                        log_callback("  [INFO] Source proofread reported no changes.")
                     break
-                log_callback(
-                    f"  [WARN] Sparse response had no subtitle tags or START/END markers "
-                    f"(attempt {attempt})."
-                )
+                if attempt < max_retries:
+                    log_callback(
+                        f"  [WARN] Source proofread returned an unsupported response format "
+                        f"(attempt {attempt}); retrying safely."
+                    )
+                else:
+                    log_callback(
+                        "  [WARN] Source proofread response stayed unsupported; "
+                        "original subtitles were preserved for this chunk."
+                    )
                 continue
         except Exception as exc:
             log_callback(f"  [WARN] Chunk LLM error (attempt {attempt}): {exc}")
@@ -2975,6 +3144,7 @@ def _target_expects_kana(lang: str) -> bool:
 def translate_entries(client: LLMClient, entries: dict, lang: str,
                       tokens_per_chunk: int, keep_original: bool, adult_content: bool,
                       dubbing_optimized: bool, max_retries: int, log_callback, stop_event) -> dict:
+    _set_phase(client, "AI translate")
     template = _load_prompt_template(adult_content, dubbing_optimized)
     all_translated = _run_entries_llm(
         client, entries, template, {"target_language": lang},
@@ -3072,6 +3242,7 @@ def correct_entries(client: LLMClient, entries: dict, source_language: str,
 
     Returns ``(changed_count, deleted_ids)``.
     """
+    _set_phase(client, "AI proofread")
     template = _load_correct_prompt_template(adult_content)
     total = len(entries)
     results = _run_entries_llm(
@@ -3164,8 +3335,8 @@ def batch_translate_srt(base_dir: str, search_subdirs: bool, skip_if_exists: boo
     if not os.path.exists(base_dir):
         log_callback(f"Error: Directory not found: {base_dir}")
         return False
-        
-    client = LLMClient(config["api_base_url"], api_key, config["model_name"], config.get("temperature", 0.5))
+
+    client = make_llm_client(config, api_key)
 
     # Collect .jp.srt files
     tasks = []
@@ -3201,7 +3372,8 @@ def batch_translate_srt(base_dir: str, search_subdirs: bool, skip_if_exists: boo
             
         _translate_srt_path(src_path, out_path, client, config, log_callback, stop_event)
 
-    log_callback(f"[INFO] Batch Translation Completed. API usage — input: {client.input_tokens} tokens, output: {client.output_tokens} tokens")
+    log_callback("[INFO] Batch Translation Completed.")
+    log_llm_usage(client, log_callback)
     return True
 
 
@@ -3268,7 +3440,7 @@ def batch_listen_translate_srt(base_dir: str, search_subdirs: bool, skip_if_tran
         generator.set_vad_sensitivity(vad_sensitivity)
         warn_noisy_high_sensitivity(denoise_preset, vad_sensitivity, log_callback)
 
-    client = LLMClient(config["api_base_url"], api_key, config["model_name"], config.get("temperature", 0.5))
+    client = make_llm_client(config, api_key)
     total_tasks = len(pending)
 
     for task_idx, (filepath, jp_srt_file, out_srt_file) in enumerate(pending, start=1):
@@ -3315,7 +3487,8 @@ def batch_listen_translate_srt(base_dir: str, search_subdirs: bool, skip_if_tran
             except Exception as e:
                 log_callback(f"[WARN] Could not remove Japanese subtitle {jp_srt_file.name}: {e}")
 
-    log_callback(f"[INFO] One-click Listening Translation Completed. API usage — input: {client.input_tokens} tokens, output: {client.output_tokens} tokens")
+    log_callback("[INFO] One-click Listening Translation Completed.")
+    log_llm_usage(client, log_callback)
     return True
 
 # ===============================

@@ -2,6 +2,33 @@
 
 ## English
 
+### 2026-08-08
+
+- Major fix: Explicitly configured DeepSeek thinking mode instead of inheriting the service default. Translation now keeps thinking enabled at low reasoning effort by default, uses a 900-second processing timeout, and keeps API connection tests at a short 30-second timeout.
+- Refactor: Added a shared LLM-client factory so subtitle batch translation, one-click listening translation, and Clone Translation Dubbing use the same thinking and timeout settings; unsupported providers are not sent vendor-specific thinking fields.
+- New: Added per-stage API usage and latency reporting for AI source proofreading and translation, including calls, input tokens, cache-hit input, output/reasoning tokens, elapsed time, and combined totals; each LLM response now logs its round-trip time.
+- Change: Updated the application version to `v1.6.3 (build 2026-08-08)`.
+
+### 2026-08-07
+
+- Fix: Restored sparse-output handling for AI source proofreading. Omitted subtitle IDs once again mean "keep the original," so a valid sparse response is no longer misreported as every entry missing or retried as a full translation response.
+- Diagnostics: Invalid sparse responses now retry safely and explicitly report that the original subtitles were preserved when all attempts fail.
+
+### 2026-08-03
+
+- Fix: AI source proofreading now accepts short, unambiguous Chinese, English, or Japanese natural-language no-change responses when a compatible model omits the requested `START`/`END` wrapper.
+- Diagnostics: Reworded sparse-response warnings to identify proofreading format failures clearly and distinguish them from translation failure or subtitle deletion.
+
+### 2026-07-29
+
+- Clarification: Documented that source-scan restoration segments and intermediate SBS files may intentionally contain video only; the final Stage 4 timeline merge restores audio from the original source, and completion is indicated by `Done! Output:`.
+- Documentation/Performance: Documented Native GPU `max_clip_length` as a frame count, including automatic VRAM guard limits of 24/48/64 frames on large inputs and an estimated 1-6% whole-pipeline advantage for 180-frame clips over 90-frame clips under typical workloads.
+
+### 2026-07-24
+
+- Major optimization: Changed AI source proofreading to a sparse changes-only protocol. The model returns only corrected or deleted subtitle IDs, omitted IDs preserve the original text, and empty tags retain the existing deletion safety gate, substantially reducing completion-token usage.
+- Compatibility/Fix: Legacy custom proofreading prompts receive an in-memory `SPARSE_CHANGES_ONLY` override, while ordinary translation retains full-output missing-ID retries. The same sparse path is shared by single-speaker, multi-speaker, legacy, and shared-directory Clone Translation Dubbing workflows.
+
 ### 2026-07-22
 
 - New/UI: Added configurable adjacent-subtitle merging to Clone Translation Dubbing proofreading. Users can set maximum merged duration and subtitle gap, restrict merging to the same speaker, choose all eligible rows or selected rows and neighbors, review exact merge pairs in a clickable preview, and inspect subtitle duration and inter-subtitle gap columns.
@@ -254,6 +281,33 @@
 - Major optimization: GPU-accelerated VR split/merge, fisheye/equirectangular conversion, VR-to-flat projection, and OneClick geometry stages.
 
 ## 中文
+
+### 2026-08-08
+
+- 重大修复：显式配置 DeepSeek thinking 模式，不再继承服务端默认值。翻译默认保留 thinking 但将推理强度固定为 low，处理请求超时调整为 900 秒，API 连通性测试则保持独立的 30 秒短超时。
+- 重构：新增统一 LLM 客户端构造入口，使字幕批量翻译、一键听译和克隆翻译配音共享 thinking 与超时配置；对不支持的服务商不会下发厂商专用 thinking 字段。
+- 新功能：新增 AI 原文校对与 AI 翻译的分阶段 API 用量和耗时统计，包括调用次数、输入 Token、缓存命中输入、输出/推理 Token、耗时及总计；每次 LLM 返回后也会显示本次响应耗时。
+- 变更：应用版本更新为 `v1.6.3 (build 2026-08-08)`。
+
+### 2026-08-07
+
+- 修复：恢复 AI 原文校对的稀疏输出处理。省略的字幕 ID 重新表示“保留原文”，合法的稀疏响应不会再被误报为全部条目缺失，也不会按完整翻译响应重复请求。
+- 诊断：无效稀疏响应会安全重试；全部尝试失败时明确说明该分块已保留原字幕。
+
+### 2026-08-03
+
+- 修复：当兼容模型未按要求返回 `START`/`END` 包装时，AI 原文校对可识别简短且含义明确的中、英、日文“无需修改”自然语言回复。
+- 诊断：改进稀疏响应警告，明确指出是原文校对返回格式问题，并与正式翻译失败或字幕删除区分开。
+
+### 2026-07-29
+
+- 说明：补充 source-scan 去马赛克片段和部分 SBS 中间文件可能刻意只含视频；最终 Stage 4 时间线合并会从原始输入恢复音轨，真正完成以 `Done! Output:` 日志为准。
+- 文档/性能：明确 Native GPU `max_clip_length` 的单位是帧，并记录大分辨率输入下显存保护会自动限制为 24/48/64 帧；典型负载下 180 帧相对 90 帧对整个流水线的预计速度优势约为 1%-6%。
+
+### 2026-07-24
+
+- 重大优化：AI 原文校对改为仅返回差异的稀疏协议。模型只返回修正或删除的字幕 ID，省略 ID 保留原文，空标签继续受本地删除安全门保护，显著降低输出 Token 消耗。
+- 兼容/修复：旧版自定义校对提示词会在内存中追加 `SPARSE_CHANGES_ONLY` 覆盖规则；普通翻译仍保留完整输出及缺失 ID 重试。单人、多人、旧版及共享目录克隆翻译配音统一复用该稀疏路径。
 
 ### 2026-07-22
 
