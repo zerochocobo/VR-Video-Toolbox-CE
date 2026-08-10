@@ -1,3 +1,6 @@
+
+</think>
+
 # VR Video Toolbox (CUDA EDITION) ([中文](README_CN.md) | [日本語](README_JP.md))
 
 A Windows toolkit for VR video cleanup, subtitle work, and common VR video utilities.
@@ -194,7 +197,7 @@ Required executables and packages:
 Install Python dependencies:
 
 ```bat
-cd GUI\VR_Video_Toolbox
+cd VR-Video-Toolbox-CE
 uv sync
 ```
 
