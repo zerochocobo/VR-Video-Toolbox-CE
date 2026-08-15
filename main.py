@@ -39,7 +39,7 @@ import subprocess
 from tkinter import filedialog
 from tkinter import messagebox
 
-ver_name = "v1.6.3 (build 2026-08-08)"
+ver_name = "v2.0.0 (build 2026-08-14)"
 DLNA_SERVER_EXE_NAME = "vr_dlna_server.exe"
 TWO_DVR_DOWNLOAD_URL = "https://wapok.com"
 
@@ -559,6 +559,7 @@ class VRVideoToolboxLauncher:
     def _build_page_voice(self, page):
         inner = self._make_page_inner(page)
         cards = (
+            (get_text('btn_clonevoice_v2'), get_text('desc_clonevoice_v2'), self.launch_clonevoice_v2),
             (get_text('btn_clonevoice'), get_text('desc_clonevoice'), self.launch_clonevoice),
             (get_text('btn_si_voice'), get_text('desc_si_voice'), self.launch_si_voice),
         )
@@ -894,6 +895,12 @@ class VRVideoToolboxLauncher:
 
         self.clear_frame()
         self.app = tool_clonevoice_gui.ClonevoiceToolsApp(self.root, on_return=self.request_show_launcher)
+
+    def launch_clonevoice_v2(self):
+        from tool_clonevoice_v2 import gui as tool_clonevoice_v2_gui
+
+        self.clear_frame()
+        self.app = tool_clonevoice_v2_gui.ClonevoiceV2App(self.root, on_return=self.request_show_launcher)
 
     def launch_subembed_tools(self):
         from tool_subembed import main as tool_subembed_main

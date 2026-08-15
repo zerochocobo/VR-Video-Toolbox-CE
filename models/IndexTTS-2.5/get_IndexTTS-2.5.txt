@@ -1,0 +1,93 @@
+IndexTTS-2.5 model files for sentence-level emotional voice cloning.
+IndexTTS-2.5 逐句情感语音克隆模型文件说明。
+
+This repository does not provide an offline model archive. Download the main
+IndexTTS-2.5 repository into this exact directory:
+本项目不提供模型离线包。请将 IndexTTS-2.5 主模型直接下载到当前目录：
+
+ModelScope (recommended in mainland China) / ModelScope（中国大陆推荐）：
+
+    modelscope download --model IndexTeam/IndexTTS-2.5 --local_dir models/IndexTTS-2.5
+
+Hugging Face through hf-mirror / 通过 hf-mirror 下载 Hugging Face 模型：
+
+    $env:HF_ENDPOINT="https://hf-mirror.com"
+    hf download IndexTeam/IndexTTS-2.5 --local-dir models/IndexTTS-2.5
+
+Expected directory layout / 完整目录结构：
+
+    models/IndexTTS-2.5/
+    |-- config.yaml                                      [required / 必需]
+    |-- gpt.pth                                          [required / 必需]
+    |-- s2mel.pth                                        [required / 必需]
+    |-- codec.pth                                        [required / 必需]
+    |-- feat1.pt                                         [required / 必需]
+    |-- feat2.pt                                         [required / 必需]
+    |-- wav2vec2bert_stats.pt                            [required / 必需]
+    |-- multilingual_zh_ja_yue_char_del.tiktoken        [required / 必需]
+    |-- configuration.json                               [main repo metadata]
+    |-- README.md                                        [main repo documentation]
+    |-- LICENSE                                          [Bilibili model license]
+    |-- .gitattributes                                   [main repo metadata]
+    |-- get_IndexTTS-2.5.txt                             [this file / 本文件]
+    |
+    |-- aux_models/                                      [auto-downloaded / 自动下载]
+    |   |-- campplus_cn_common.bin                       [required / 必需]
+    |   |-- bigvgan/
+    |   |   |-- config.json                              [required / 必需]
+    |   |   `-- bigvgan_generator.pt                     [required / 必需]
+    |   `-- w2v-bert-2.0/
+    |       |-- config.json                              [required / 必需]
+    |       |-- preprocessor_config.json                 [required / 必需]
+    |       |-- model.safetensors                        [required / 必需]
+    |       |-- configuration.json                       [repo metadata, may exist]
+    |       |-- conformer_shaw.pt                        [repo file, may exist]
+    |       |-- README.md                                [repo documentation, may exist]
+    |       `-- .gitattributes                           [repo metadata, may exist]
+    |
+    `-- qwen0.6bemo4-merge/                              [optional / 可选]
+        |-- model.safetensors
+        |-- config.json
+        |-- generation_config.json
+        |-- tokenizer.json
+        |-- tokenizer_config.json
+        |-- vocab.json
+        |-- merges.txt
+        |-- added_tokens.json
+        |-- special_tokens_map.json
+        |-- chat_template.jinja
+        `-- Modelfile
+
+The application validates all required main and auxiliary files before model
+loading. Missing main files are resumed into this directory. Missing auxiliary
+files are automatically downloaded into aux_models; users do not need to create
+another Hugging Face cache directory or move files manually.
+程序会在加载模型前检查全部必需文件。主模型缺失时会继续下载到当前目录；辅助
+模型缺失时会自动下载到 aux_models，无需另外建立 Hugging Face cache 或手动搬运。
+
+Auxiliary model sources / 辅助模型来源：
+
+    W2V-BERT  : facebook/w2v-bert-2.0
+                  ModelScope mirror: AI-ModelScope/w2v-bert-2.0
+    CAMPPlus  : funasr/campplus
+                  ModelScope mirror: iic/speech_campplus_sv_zh-cn_16k-common
+    BigVGAN   : nvidia/bigvgan_v2_22khz_80band_256x
+                  downloaded through hf-mirror with resume support
+
+qwen0.6bemo4-merge is only needed when Qwen emotion analysis is enabled. The
+current sentence-level workflow uses use_qwen_emo=False, so this optional folder
+does not block voice cloning.
+qwen0.6bemo4-merge 只在启用 Qwen 情感分析时需要。当前逐句流程使用
+use_qwen_emo=False，因此该可选目录缺失不会阻止语音克隆。
+
+Files such as *.tmp, chunks/, headers.txt, and cdn_url.txt are download/debug
+artifacts and are not part of the required model layout. They can be removed
+after all required files have been verified.
+*.tmp、chunks/、headers.txt、cdn_url.txt 等属于下载或调试残留，不是必需模型
+结构；确认必需文件完整后可以删除。
+
+The model is distributed under the Bilibili Model Use License. The vendored
+license copy is also available at:
+模型遵循 Bilibili Model Use License，vendor 中的许可证副本位于：
+
+    tool_clonevoice_v2/vendor/INDEXTTS_LICENSE.txt

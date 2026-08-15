@@ -2733,6 +2733,7 @@ class UsageStats:
         self.cached_input_tokens = 0
         self.output_tokens = 0
         self.reasoning_tokens = 0
+        self.last_response_meta = {}
         self.seconds = 0.0
 
     def add(self, usage: dict, seconds: float):
@@ -2830,7 +2831,23 @@ class LLMClient:
         self.output_tokens += usage.get("completion_tokens", 0) or 0
         details = usage.get("completion_tokens_details") or {}
         self.reasoning_tokens += details.get("reasoning_tokens", 0) or 0
-        return data["choices"][0]["message"]["content"]
+        choice = data["choices"][0]
+        message = choice.get("message") or {}
+        content = message.get("content")
+        if isinstance(content, list):
+            content = "".join(
+                part.get("text", "") for part in content
+                if isinstance(part, dict) and part.get("type") in (None, "text")
+            )
+        content = content or ""
+        reasoning = message.get("reasoning_content") or ""
+        self.last_response_meta = {
+            "finish_reason": choice.get("finish_reason"),
+            "content_chars": len(content),
+            "reasoning_chars": len(reasoning),
+            "has_refusal": bool(message.get("refusal")),
+        }
+        return content
 
     def usage_lines(self) -> list[str]:
         """Per-phase then total token usage, ready for the log panel."""
@@ -3073,15 +3090,23 @@ def _llm_chunk_pass(client: LLMClient, chunk: dict, template: str, placeholders:
                     if natural_no_change:
                         log_callback("  [INFO] Source proofread reported no changes.")
                     break
+                meta = getattr(client, "last_response_meta", {}) or {}
+                preview = re.sub(r"\s+", " ", (response or "").strip())[:160]
+                response_details = (
+                    f"content_chars={len(response or '')}, "
+                    f"reasoning_chars={meta.get('reasoning_chars', 0)}, "
+                    f"finish_reason={meta.get('finish_reason') or 'unknown'}, "
+                    f"refusal={bool(meta.get('has_refusal'))}, preview={preview!r}"
+                )
                 if attempt < max_retries:
                     log_callback(
                         f"  [WARN] Source proofread returned an unsupported response format "
-                        f"(attempt {attempt}); retrying safely."
+                        f"(attempt {attempt}); retrying safely. {response_details}"
                     )
                 else:
                     log_callback(
                         "  [WARN] Source proofread response stayed unsupported; "
-                        "original subtitles were preserved for this chunk."
+                        f"original subtitles were preserved for this chunk. {response_details}"
                     )
                 continue
         except Exception as exc:

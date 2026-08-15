@@ -1,6 +1,3 @@
-
-</think>
-
 # VR Video Toolbox (CUDA EDITION) ([中文](README_CN.md) | [日本語](README_JP.md))
 
 A Windows toolkit for VR video cleanup, subtitle work, and common VR video utilities.
@@ -16,7 +13,7 @@ Current main features:
 - Mosaic removal
 - Subtitle generation, translation, and embedding
 - Simultaneous interpretation (SI) voice generation and SI video audio-track mixing
-- Clone translation dubbing with per-speaker voice cloning and original-vocal removal
+- Sentence-level emotional voice cloning with IndexTTS-2.5, plus the legacy OmniVoice clone-dubbing tool
 - 2D to 3D/VR migration notice and download link for the VR Passthrough Server project
 - **Lightweight LAN VR Video DLNA Server** (supports 180° SBS format auto-inducing, external subtitle auto-association, and multi-root mapping)
 - VR split/combine, projection conversion, and other helper tools
@@ -30,7 +27,7 @@ The goal is to make complex video workflows usable through a GUI and batch scrip
 - Users who batch-process VR videos
 - Users who generate, translate, or embed subtitles for VR videos
 - Users who want to turn subtitles into simultaneous-interpretation audio and mix it into videos as an SI track
-- Users who want to translate dialogue and create voice-cloned dubbing that replaces the original vocals while keeping music and effects
+- Users who want to translate dialogue and clone each source sentence's voice and emotion without speaker diarization or reference transcripts
 - Users looking for the migrated 2D-to-3D/VR workflow and its current download link
 - Users who want to play local PC videos wirelessly on VR headsets (e.g. Oculus Quest, Pico) with player apps like Skybox and load subtitles automatically
 - Users who want to try AI-assisted mosaic removal
@@ -106,21 +103,27 @@ The simultaneous interpretation tool builds on Qwen3-TTS and FFmpeg:
 
 SI timing and loudness still need human review. Generated TTS may already contain translation delay, so the extra SI delay should be adjusted per source.
 
-### 4. Clone Translation Dubbing
+### 4. Sentence-Level Emotional Voice Cloning
 
-Clone Translation Dubbing is now a guided workflow for building a target-language voice basis, instead of only the old fully automatic pipeline:
+The new **Sentence-Level Emotional Voice Cloning** tool is based on Bilibili's latest open-source **IndexTTS-2.5**. It uses the WAV extracted for each source sentence directly as both the timbre and emotion reference, then speaks that sentence's translation:
 
-- **Single-Speaker Clone**: for one video or a shared folder with one speaker. Transcribe and translate first, collect candidate clips, then compare the source voice, translated preview, and fixed target-language sample before confirming `SPEAKER1`.
-- **Multi-Speaker Clone**: for dialogue with several speakers. Transcribe with an explicit speaker count, select/import/design a target-language basis for each speaker, export/reuse basis WAV+TXT files, or mark a speaker as `Keep original` when no cloned line should be generated for that speaker.
-- **Basis voice rules**: imported basis WAV files should be 3 to 10 seconds long, the TXT must match the spoken content, and the language must be the same as the translation target. The single-speaker flow writes visible `SPEAKER1.wav` and `SPEAKER1.txt` files for review and reuse.
-- **`.SI.WAV` generation**: after the basis voices are confirmed, OmniVoice synthesizes the translated dialogue into a timeline-aligned `<video>.si.wav`. A matching `<video>.si.duck.wav` is also written so remixing can lower the original audio only while cloned speech is active.
-- **Legacy one-click tab**: still available for bulk automation. It can process a single file, a same-people shared folder, independent batch files, or subfolders where each subfolder shares one voice basis.
-- **Mix / Dubbing tab**:
-  - SI/lower-original mode keeps the original track, overlays the cloned/translated `.si.wav`, can use `.si.duck.wav` for ducking, and outputs `_SI.mp4`.
-  - Dubbing mode uses Bandit-v2 to remove original vocals/dialogue, keeps the music/effects bed, mixes in the cloned voice, and outputs `_DUB.mp4`. It can also add the dub as an independent audio track.
-  - The DLNA server can live-mix `[SI]` with a matching `.SI.WAV`, so a separate mixed MP4 is not always required.
+- **Textless sentence references**: IndexTTS-2.5 does not need a transcript of the reference audio. The workflow therefore performs no speaker diarization, does not add `SPEAKER` prefixes to subtitles, and does not ask users to prepare WAV+TXT basis files.
+- **Short-sentence fallback**: each sentence normally clones its matching source WAV. If that clip is too short to be a reliable prompt, the tool automatically chooses a longer source sentence as the reference.
+- **Voice Clone**: the single-video workflow has two steps: `Transcribe & Translate`, then `Proofread Translation and Export Cloned Voice File`. You can correct the translated text before exporting the timeline-aligned voice track.
+- **Batch Clone**: select one input directory and optionally scan all subdirectories (enabled by default). The tool finishes transcription, translation, and synthesis for every video in the current directory before moving to the next directory; IndexTTS is loaded once per directory. With `Skip existing intermediate files and .SI.WAV` enabled, existing `audio16k.wav`, `manifest.json`, `source.srt`, `translated.srt`, and final `.si.wav` checkpoints are reused instead of repeating completed stages.
+- **Output and remix**: synthesis writes `<video>.si.wav` and the matching `<video>.si.duck.wav`. Per-sentence reference and generated WAV files are retained under `<video>.clone/indextts_v2_manifest/` beside the source video, never in the system Temp directory. `Mix / Dubbing` always keeps and lowers the original track, uses the strongest ducking level by default, overlays the cloned voice, and outputs `_SI.mp4`. The DLNA server can also live-mix a same-name `.SI.WAV` through `[SI]`.
 
-The guided clone tabs require the translation API configuration used by subtitle translation. Voice cloning quality still depends on source audio quality, diarization accuracy, basis selection, and model behavior on short translated lines, so review the generated `.si.wav`, `_SI.mp4`, or `_DUB.mp4` before using them as final output.
+| Difference | New tool | Legacy tool |
+| --- | --- | --- |
+| Home-screen entry | Sentence-Level Emotional Voice Cloning | Clone Translation Dubbing |
+| Voice model | IndexTTS-2.5 | OmniVoice |
+| Voice reference | Matching source WAV for every sentence; no transcript | Selected/designed basis voice with matching reference text |
+| Speaker handling | No speaker recognition or classification | Recognizes and distinguishes speakers |
+| Main use | Direct sentence-by-sentence timbre and emotion cloning | Speaker-based clone dubbing and simple voice design |
+
+The original **Clone Translation Dubbing** entry remains available as a separate legacy tool. It uses OmniVoice, requires speaker recognition and matching reference text, and can also design a simple voice. These legacy requirements do not apply to the IndexTTS-2.5 workflow.
+
+Both workflows share the subtitle translation API configuration. For IndexTTS-2.5, clean source dialogue produces the best result; always review the translated text and listen to the generated `.si.wav` or `_SI.mp4` before final use.
 
 ### 5. 2D to 3D/VR
 
@@ -160,7 +163,8 @@ From the launcher, choose the tool you need:
 - **VR Video DLNA Server**: One-click startup/shutdown for LAN DLNA sharing, providing an independent config window for directories, port, and subtitles.
 - `Japanese Batch Subtitle Tools`: subtitle generation, translation, and batch tools
 - `Simultaneous Interpretation Voice`: generate `.si.wav` from subtitles and mix SI audio into MP4/MKV videos
-- `Clone Translation Dubbing`: use the guided single-speaker or multi-speaker clone tabs to choose target-language basis voices, generate `<video>.si.wav`, then remix it as `_SI.mp4` or `_DUB.mp4`
+- `Sentence-Level Emotional Voice Cloning`: use IndexTTS-2.5 to clone each source sentence directly, with no speaker recognition or reference transcript; use `Voice Clone` for a reviewable single-video workflow or `Batch Clone` for automatic directory processing
+- `Clone Translation Dubbing`: the legacy OmniVoice workflow, which identifies speakers and uses matching reference text or a simply designed voice
 - `2D to 3D/VR`: opens the migration notice for the VR Passthrough Server download
 - `VR Hard Subtitle Embed Tool`: hard subtitle embedding for VR video
 - Other buttons: split/combine, projection conversion, flat conversion, and small utilities
@@ -185,14 +189,12 @@ Required executables and packages:
 - Base Python packages: `Pillow`, `pyinstaller`, `ffmpy3`, `faster-whisper`, `numpy>=1.26,<2.1`, `auditok`, `onnxruntime-gpu`, `huggingface-hub`, `keyring`, `requests`, `transformers`, `accelerate`, `librosa`, `soundfile`, `av`, `fastapi`, `uvicorn`
 - CUDA/video Python packages: `pynvvideocodec>=2.1.0`, `cupy-cuda12x>=14.0`, `nvidia-cuda-nvrtc-cu12==12.8.93`, `nvidia-cuda-runtime-cu12==12.8.90`, `nvidia-cuda-cccl-cu12>=12.9.27`
 - Native AI/GPU packages: `torch==2.8.0`, `torchvision==0.23.0`, and `torchaudio==2.8.0` from the PyTorch `cu128` wheel index, plus `ultralytics==8.4.4`, `mmengine==0.10.7`, `omegaconf`, `einops`, `safetensors`, and `opencv-python`
-- Translation API configuration is required for Clone Translation Dubbing transcription/translation workflows and is shared with subtitle translation settings.
+- Translation API configuration is required for both voice-cloning translation workflows and is shared with subtitle translation settings.
 - Optional/local models:
   - Qwen3-TTS 12Hz CustomVoice under `models/Qwen3-TTS-12Hz-0.6B-CustomVoice` for SI voice generation
-  - OmniVoice under `models/OmniVoice` for clone translation dubbing
-  - OmniVoice ECAPA under `models/OmniVoice_ECAPA` for local speaker clustering in clone translation dubbing
-  - Kotoba Whisper under `models/kotoba-whisper-v2.0-faster` and/or faster-whisper models under `models/faster-whisper-*` for clone translation transcription
-  - pyannote `speaker-diarization-community-1` under `models/speaker-diarization-community-1` if using pyannote diarization
-  - Bandit-v2 under `models/bandit-v2` for dubbing mode vocal removal
+  - IndexTTS-2.5 under `models/IndexTTS-2.5` for sentence-level emotional voice cloning; see `models/IndexTTS-2.5/get_IndexTTS-2.5.txt` for the complete main and auxiliary model layout
+  - Kotoba Whisper under `models/kotoba-whisper-v2.0-faster` and/or faster-whisper models under `models/faster-whisper-*` for voice-cloning transcription
+  - OmniVoice under `models/OmniVoice`, OmniVoice ECAPA under `models/OmniVoice_ECAPA`, and pyannote `speaker-diarization-community-1` under `models/speaker-diarization-community-1` are used only by the legacy Clone Translation Dubbing workflow
 
 Install Python dependencies:
 
@@ -217,7 +219,8 @@ FFmpeg and the AI engine (Lada or Jasna) must be discoverable by the program. Yo
 │     ├─ tool_subtitle/         Subtitle generation, translation, batch processing
 │     ├─ tool_subembed/         VR subtitle embedding
 │     ├─ tool_si/               Simultaneous interpretation voice and SI audio mixing
-│     ├─ tool_clonevoice/       Clone translation dubbing and dubbing remix
+│     ├─ tool_clonevoice_v2/    IndexTTS-2.5 sentence-level emotional voice cloning
+│     ├─ tool_clonevoice/       Legacy OmniVoice clone translation dubbing
 │     ├─ tool_dlna/             LAN DLNA/UPnP video server
 │     ├─ tool_split_combine/    VR split/combine tools
 │     ├─ tool_v360_trans/       VR projection conversion
@@ -239,8 +242,8 @@ Processed files are usually written next to the input video or to the output dir
 - `_L` / `_R`: left-eye or right-eye video
 - Subtitle tools may generate `.srt`, translated subtitle files, or videos with embedded subtitles
 - SI voice tools generate `.si.wav`; SI video audio mixing outputs `_SI.mp4`
-- Clone translation dubbing generates `<video>.si.wav` and `<video>.si.duck.wav`; single-speaker basis files may appear as `SPEAKER1.wav` / `SPEAKER1.txt`, and multi-speaker reusable basis files may appear as `.basis.wav` / `.basis.txt`
-- Remix outputs `_SI.mp4` for SI/lower-original mode or `_DUB.mp4` for Bandit-v2 dubbing mode
+- Sentence-level emotional voice cloning generates `<video>.si.wav` plus `<video>.si.duck.wav`; its fixed lower-original remix outputs `_SI.mp4`
+- The separate legacy OmniVoice tool may create additional speaker basis and dubbing files according to its own selected workflow
 
 Exact names depend on the selected tool and settings.
 

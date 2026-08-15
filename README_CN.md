@@ -18,7 +18,7 @@
 - 马赛克去除
 - 字幕生成、翻译、嵌入
 - 同声传译（SI）语音生成与视频 SI 音轨混合
-- 按说话人音色克隆的翻译配音，并支持移除原始人声
+- 基于 IndexTTS-2.5 的逐句情感语音克隆，并保留旧版 OmniVoice 克隆配音工具
 - 2D 转 3D/VR 迁移提示，并提供 VR 透视服务器项目下载入口
 - **轻量级局域网 VR 视频 DLNA 服务器**（支持 180° SBS 格式自适应诱导、外部字幕自动关联与多物理目录映射）
 - VR 视频拆分、合并、投影转换等辅助工具
@@ -32,7 +32,7 @@
 - 想批量处理 VR 视频的用户
 - 想给 VR 视频生成字幕、翻译字幕或嵌入字幕的用户
 - 想把字幕转换成同声传译语音，并将 SI 音轨混入视频的用户
-- 想翻译对白、克隆原视频中不同说话人音色，并在保留音乐音效的同时替换原始人声的用户
+- 想翻译对白，并在无需区分说话人或提供参考文本的情况下逐句复刻原声音色与情感的用户
 - 想了解已迁移的 2D 转 3D/VR 流程，并获取当前下载入口的用户
 - 想要在 VR 头显（如 Quest/Pico）中用 Skybox 等播放器直接无线播放电脑本地视频并自动关联字幕的用户
 - 想尝试用 AI 工具去除视频马赛克的用户
@@ -110,21 +110,27 @@
 
 SI 的同步和响度仍建议人工试听校对。部分 TTS 结果本身已经包含翻译延迟，此时额外 SI 延迟需要按素材调整。
 
-### 4. 克隆翻译配音
+### 4. 逐句情感语音克隆
 
-克隆翻译配音现在是「先选好目标语言参考音色，再生成配音」的引导式流程，不再只是旧版全自动一键流程：
+新增的 **逐句情感语音克隆** 基于 Bilibili 当前最新开源的 **IndexTTS-2.5**。程序直接把每一句从原视频抽取的 WAV 同时作为音色和情感参考，再朗读该句的翻译文本：
 
-- **单人语音克隆**：适合单个视频或同一目录里只有一个说话人的素材。先转录并翻译，再抽取候选片段；候选列表可试听原声、翻译预览和固定目标语言样本，最后确认 `SPEAKER1`。
-- **多人语音克隆**：适合多人对白。先指定说话人数并完成转录/分离，再为每个说话人选择候选、导入 WAV+TXT、用 OmniVoice 设计音色，或导出/复用参考音色；不想配音的说话人可设为「保留原声」，该说话人不会生成克隆语音。
-- **参考音色规则**：导入的参考 WAV 建议 3 到 10 秒，TXT 必须和语音内容一致，并且语言必须和翻译目标语言一致。单人流程会生成可见的 `SPEAKER1.wav` 和 `SPEAKER1.txt`，方便检查和复用。
-- **生成 `.SI.WAV`**：确认参考音色后，OmniVoice 会把翻译对白合成为按时间线对齐的 `<视频名>.si.wav`；同时生成 `<视频名>.si.duck.wav`，用于回混时只在克隆语音出现的时间压低原声。
-- **旧版一键克隆页**：仍保留给批量自动流程，可处理单文件、同一文件夹共享同一组人物音色、批量独立处理，或按子文件夹分别共享音色。
-- **混音配音页**：
-  - 压低原声模式：保留原音轨，叠加克隆/翻译后的 `.si.wav`，可用 `.si.duck.wav` 控制压低原声的时间，输出 `_SI.mp4`。
-  - 移除原始人声模式：用 Bandit-v2 去掉原始对白/人声，保留音乐和音效背景，再混入克隆语音，输出 `_DUB.mp4`，也可把配音作为独立音轨加入。
-  - DLNA 服务器可以在直播流 `[SI]` 中直接混入同名 `.SI.WAV`，不一定需要先生成混音 MP4。
+- **逐句无文本参考**：IndexTTS-2.5 不需要参考音频对应的文字，因此流程不再识别或区分说话人，不给字幕添加 `SPEAKER` 前缀，也不需要用户准备 WAV+TXT 基准音色。
+- **短句自动回退**：通常每句使用自己对应的原句 WAV；如果原句太短、不适合作为稳定参考，程序会自动寻找更长的原句代替。
+- **语音克隆**：单视频只保留两步——“转录翻译”和“校对翻译并导出”。用户可以先修正翻译文本，再导出按原时间线对齐的克隆音轨。
+- **批量克隆**：只需选择“输入目录”，默认勾选“搜索所有子目录中的视频文件”。程序会先完成当前目录全部视频的转录、翻译和逐句合成，再进入下一个目录；每个目录只加载一次 IndexTTS。勾选“跳过已存在的中间文件和 .SI.WAV”后，会复用已有的 `audio16k.wav`、`manifest.json`、`source.srt`、`translated.srt` 和最终 `.si.wav`，不重复执行已经完成的阶段。
+- **输出与混音**：合成会生成 `<视频名>.si.wav` 和 `<视频名>.si.duck.wav`。每句参考音频和生成 WAV 保留在原视频旁的 `<视频名>.clone/indextts_v2_manifest/`，不写入系统 Temp 目录。“混音配音”固定保留并压低原声，压低强度默认“最强”，叠加克隆音轨后输出 `_SI.mp4`。DLNA 服务器也可在直播流 `[SI]` 中直接混入同名 `.SI.WAV`。
 
-引导式克隆流程需要配置字幕翻译共用的翻译 API。克隆配音质量仍受源音频质量、说话人分离准确度、参考音色选择，以及模型对短翻译句的表现影响；正式使用前建议人工试听 `.si.wav`、`_SI.mp4` 或 `_DUB.mp4`。
+| 区别 | 新版功能 | 旧版功能 |
+| --- | --- | --- |
+| 首页入口 | 逐句情感语音克隆 | 克隆翻译配音 |
+| 语音模型 | IndexTTS-2.5 | OmniVoice |
+| 音色参考 | 每句对应的原声 WAV，不需要参考文本 | 选定或设计基准音色，需要匹配的参考文本 |
+| 说话人处理 | 不识别、不分类说话人 | 识别并区分说话人 |
+| 主要用途 | 逐句直接复刻音色与情感 | 按说话人克隆配音、简单设计音色 |
+
+首页仍保留独立的旧版 **克隆翻译配音**。旧版使用 OmniVoice，需要识别说话人和提供匹配的参考文本，也可以简单设计音色；这些要求不适用于 IndexTTS-2.5 新流程。
+
+两套流程均使用字幕翻译共用的翻译 API 配置。IndexTTS-2.5 的效果仍取决于原始对白清晰度，正式使用前请校对翻译，并试听生成的 `.si.wav` 或 `_SI.mp4`。
 
 ### 5. 2D 转 3D/VR
 
@@ -156,14 +162,14 @@ SI 的同步和响度仍建议人工试听校对。部分 TTS 结果本身已经
 新用户建议优先使用图形界面：
 
 ```bat
-cd GUI\VR_Video_Toolbox
+cd VR-Video-Toolbox-CE
 run.bat
 ```
 
 如果 `run.bat` 无法启动，也可以使用：
 
 ```bat
-cd GUI\VR_Video_Toolbox
+cd VR-Video-Toolbox-CE
 python main.py
 ```
 
@@ -175,7 +181,8 @@ python main.py
 - **VR 视频 DLNA 服务器**：一键开启/停止局域网 DLNA 共享，提供独立的配置窗口（管理共享目录、端口及字幕关联）
 - `日语批量字幕工具`：字幕生成与翻译相关工具
 - `同声传译语音`：从字幕生成 `.si.wav`，并将 SI 音频混入 MP4/MKV 视频
-- `克隆翻译配音`：用单人或多人引导式流程选择目标语言参考音色，生成 `<视频名>.si.wav`，再回混为 `_SI.mp4` 或 `_DUB.mp4`
+- `逐句情感语音克隆`：使用 IndexTTS-2.5 直接逐句复刻原声音色与情感，不需要识别说话人或提供参考文本；“语音克隆”用于可校对的单视频流程，“批量克隆”用于目录自动处理
+- `克隆翻译配音`：旧版 OmniVoice 流程，需要识别说话人和匹配的参考文本，也可简单设计音色
 - `2D转3D/VR`：打开 VR 透视服务器下载提示
 - `VR Hard Subtitle Embed Tool`：VR 硬字幕嵌入
 - 其他按钮：VR 拆分合并、投影转换、小工具箱
@@ -200,14 +207,12 @@ python main.py
 - 基础 Python 包：`Pillow`、`pyinstaller`、`ffmpy3`、`faster-whisper`、`numpy>=1.26,<2.1`、`auditok`、`onnxruntime-gpu`、`huggingface-hub`、`keyring`、`requests`、`transformers`、`accelerate`、`librosa`、`soundfile`、`av`、`fastapi`、`uvicorn`
 - CUDA/视频 Python 包：`pynvvideocodec>=2.1.0`、`cupy-cuda12x>=14.0`、`nvidia-cuda-nvrtc-cu12==12.8.93`、`nvidia-cuda-runtime-cu12==12.8.90`、`nvidia-cuda-cccl-cu12>=12.9.27`
 - 内置 AI/GPU 包：`torch==2.8.0`、`torchvision==0.23.0` 和 `torchaudio==2.8.0`（来自 PyTorch `cu128` wheel 源），以及 `ultralytics==8.4.4`、`mmengine==0.10.7`、`omegaconf`、`einops`、`safetensors`、`opencv-python`
-- 克隆翻译配音的转录/翻译流程需要配置翻译 API，该配置与字幕翻译共用。
+- 两套语音克隆的转录/翻译流程均需要配置翻译 API，该配置与字幕翻译共用。
 - 可选/本地模型：
   - 同声传译语音需要将 Qwen3-TTS 12Hz CustomVoice 放到 `models/Qwen3-TTS-12Hz-0.6B-CustomVoice`
-  - 克隆翻译配音需要将 OmniVoice 放到 `models/OmniVoice`
-  - 克隆翻译配音的本地说话人聚类需要将 OmniVoice ECAPA 放到 `models/OmniVoice_ECAPA`
-  - 克隆翻译配音的转录可使用 `models/kotoba-whisper-v2.0-faster` 下的 Kotoba Whisper，或 `models/faster-whisper-*` 下的 faster-whisper 模型
-  - 如使用 pyannote 说话人分离，需要将 `speaker-diarization-community-1` 放到 `models/speaker-diarization-community-1`
-  - 配音模式移除原始人声需要将 Bandit-v2 放到 `models/bandit-v2`
+  - 逐句情感语音克隆需要将 IndexTTS-2.5 放到 `models/IndexTTS-2.5`；主模型和辅助模型的完整目录结构见 `models/IndexTTS-2.5/get_IndexTTS-2.5.txt`
+  - 语音克隆转录可使用 `models/kotoba-whisper-v2.0-faster` 下的 Kotoba Whisper，或 `models/faster-whisper-*` 下的 faster-whisper 模型
+  - `models/OmniVoice`、`models/OmniVoice_ECAPA` 和 `models/speaker-diarization-community-1` 仅供旧版“克隆翻译配音”流程使用
 
 Python 依赖安装：
 
@@ -232,7 +237,8 @@ FFmpeg 和 AI 引擎（Lada / Jasna）需要能被程序找到。可以放到系
 │     ├─ tool_subtitle/         字幕生成、翻译、批量处理
 │     ├─ tool_subembed/         VR 字幕嵌入
 │     ├─ tool_si/               同声传译语音与 SI 音轨混合
-│     ├─ tool_clonevoice/       克隆翻译配音与配音回混
+│     ├─ tool_clonevoice_v2/    IndexTTS-2.5 逐句情感语音克隆
+│     ├─ tool_clonevoice/       旧版 OmniVoice 克隆翻译配音
 │     ├─ tool_dlna/             局域网 DLNA/UPnP 视频服务器
 │     ├─ tool_split_combine/    VR 拆分与合并
 │     ├─ tool_v360_trans/       VR 投影转换
@@ -254,8 +260,8 @@ FFmpeg 和 AI 引擎（Lada / Jasna）需要能被程序找到。可以放到系
 - `_L` / `_R`：左眼或右眼视频
 - 字幕工具会根据任务生成 `.srt`、翻译后的字幕文件或嵌入字幕后的视频
 - 同声传译语音工具会生成 `.si.wav`；混合 SI 视频音轨会输出 `_SI.mp4`
-- 克隆翻译配音会生成 `<视频名>.si.wav` 和 `<视频名>.si.duck.wav`；单人参考音色可能生成 `SPEAKER1.wav` / `SPEAKER1.txt`，多人可复用参考音色可能生成 `.basis.wav` / `.basis.txt`
-- 回混后，压低原声/SI 模式输出 `_SI.mp4`，Bandit-v2 配音模式输出 `_DUB.mp4`
+- 逐句情感语音克隆会生成 `<视频名>.si.wav` 和 `<视频名>.si.duck.wav`；固定压低原声的混音流程输出 `_SI.mp4`
+- 独立的旧版 OmniVoice 工具可能根据所选流程生成额外的说话人基准音色和配音文件
 
 实际命名以所选工具界面提示为准。
 

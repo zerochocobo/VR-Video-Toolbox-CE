@@ -10,8 +10,9 @@ different external components:
 
   - FFmpeg / ffprobe: common video and audio processing dependency.
   - Lada or Jasna: needed only for AI mosaic removal.
-  - Speech recognition, OmniVoice, ECAPA, pyannote, or Bandit-v2 models:
-    needed only by subtitle, clone-voice, or dubbing tools when you use them.
+  - Speech recognition and IndexTTS-2.5 models: needed for the new sentence-
+    level emotional voice-cloning tool. OmniVoice, ECAPA, and pyannote are
+    used only by the separate legacy clone-dubbing tool.
 
 ┌─────────────────────────────────────────────────────┐
 │  FFmpeg  (common video/audio dependency)             │
@@ -142,43 +143,49 @@ It does require:
      but still functional.
 
 
-◆ Clone Translation Dubbing Tool
+◆ Sentence-Level Emotional Voice Cloning
 ════════════════════════════════════════════════════════
 
-Click "Clone Translation Dubbing" on the main screen if you want to translate
-dialogue and create a cloned-voice dub.
+Click "Sentence-Level Emotional Voice Cloning" on the main screen. This new
+tool uses Bilibili's latest open-source IndexTTS-2.5. Each source sentence WAV
+is used directly as its timbre and emotion prompt, with no reference transcript
+and no speaker diarization or SPEAKER prefix.
 
-The current clone tool is a guided workflow:
+Voice Clone (one video)
+   1. Click "Transcribe & Translate" and select the source video.
+   2. Review and correct the translation.
+   3. Click "Proofread Translation and Export Cloned Voice File" to generate
+      the cloned audio.
+   Every sentence normally uses its matching source WAV. If it is too short,
+   the program automatically substitutes a longer source sentence as prompt.
 
-Single-Speaker Clone
-   Use this when one video or one shared folder contains only one person's
-   voice. First transcribe and translate, then extract candidate voice clips.
-   You can listen to the source clip, translated preview, and fixed target-
-   language sample before confirming SPEAKER1.
+Batch Clone
+   Select one input directory. "Search all subdirectories for video files" is
+   enabled by default. It completes transcription, translation, and synthesis
+   for the current directory before starting the next directory. With "Skip
+   existing intermediate files and .SI.WAV" enabled, existing audio16k.wav,
+   manifest.json, source.srt, translated.srt,
+   and final .si.wav checkpoints are reused instead of processed again.
 
-Multi-Speaker Clone
-   Use this for videos with several speakers. Select the speaker count first,
-   then choose, import, design, export, or reuse a target-language basis voice
-   for each speaker. Speakers that should not be cloned can be set to
-   "Keep original", so no cloned voice is generated for them.
+Output and Mix / Dubbing
+   Synthesis creates <video>.si.wav and <video>.si.duck.wav. Mix / Dubbing always
+   keeps and lowers the original track, uses the strongest ducking level by
+   default, overlays the cloned voice, and outputs _SI.mp4. The DLNA server can
+   also live-mix the matching .SI.WAV through [SI]. Per-sentence reference and
+   generated WAV files remain in <video>.clone/indextts_v2_manifest/ beside the
+   source video; they are not written to the Windows Temp directory.
 
-Basis voice requirements
-   Imported basis WAV files should be 3 to 10 seconds long. The TXT text must
-   match the spoken content, and the basis language must be the translation
-   target language.
+Place the model under models/IndexTTS-2.5. If files are incomplete, the program
+resumes the main/auxiliary model download in this fixed directory (ModelScope
+first, then hf-mirror fallback). Translation uses the same API configuration as
+subtitle translation. Always review the text and listen to .si.wav or _SI.mp4.
 
-Output and remix
-   After confirming the basis voice, the tool generates a timeline-aligned
-   <video>.si.wav and a matching <video>.si.duck.wav. In "Mix / Dubbing",
-   lower-original mode outputs _SI.mp4; Bandit-v2 vocal-removal mode keeps
-   music/effects, mixes the cloned voice, and outputs _DUB.mp4. The DLNA server
-   can also live-mix a matching .SI.WAV through [SI], without making a new MP4.
-
-This feature requires FFmpeg, the speech-recognition model, OmniVoice, and the
-translation API configuration shared with subtitle translation. Multi-speaker
-and dubbing workflows may also need OmniVoice ECAPA, pyannote diarization, and
-Bandit-v2 models. Always listen to the generated .si.wav / _SI.mp4 / _DUB.mp4
-before treating it as final.
+New tool versus legacy tool
+   New "Sentence-Level Emotional Voice Cloning": IndexTTS-2.5; one matching
+   source WAV per sentence; no reference text; no speaker recognition.
+   Legacy "Clone Translation Dubbing": OmniVoice; speaker recognition and
+   matching reference text are required; simple voice design is supported.
+   These are separate home-screen entries and separate workflows.
 
 
 ◆ Frequently Asked Questions

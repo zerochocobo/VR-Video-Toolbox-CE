@@ -120,18 +120,22 @@ def test_make_llm_client_reads_config():
     assert client.send_thinking_field is True
 
 
-def test_shipped_config_relies_on_code_defaults():
-    """The shipped JSON stays lean; thinking/timeout live in DEFAULT_TRANS_CONFIG
-    so existing user config files pick them up on upgrade."""
-    import json
-
-    path = Path(__file__).resolve().parent.parent / "config" / "subtitle_trans_config.json"
-    shipped = json.loads(path.read_text(encoding="utf-8-sig"))
-    for key in ("enable_thinking", "reasoning_effort", "request_timeout"):
-        assert key not in shipped
-
+def test_upgraded_config_without_new_keys_picks_up_defaults():
+    """The new keys are NOT written into the shipped JSON, so a config file left
+    over from an older install must still get thinking/timeout from
+    DEFAULT_TRANS_CONFIG. (Asserting on the shipped file itself would be flaky:
+    the GUI rewrites it with the merged dict as soon as a tab is opened.)"""
+    legacy = {
+        "api_base_url": "https://api.deepseek.com/",
+        "model_name": "deepseek-v4-flash",
+        "tokens_per_chunk": 500000,
+        "temperature": 0.5,
+        "max_retries": 3,
+        "keep_original": True,
+        "adult_content": True,
+    }
     merged = dict(logic.DEFAULT_TRANS_CONFIG)
-    merged.update(shipped)
+    merged.update(legacy)
     client = logic.make_llm_client(merged, "key")
     assert client.enable_thinking is True
     assert client.reasoning_effort == "low"

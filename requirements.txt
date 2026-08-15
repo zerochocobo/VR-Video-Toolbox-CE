@@ -1,2 +1,4 @@
 Pillow
 pyinstaller
+# build_exe.py refuses to clean dist while a packaged exe is still running.
+psutil

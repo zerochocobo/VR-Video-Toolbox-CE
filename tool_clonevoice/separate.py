@@ -21,6 +21,8 @@ import torch
 import torchaudio as ta
 from tqdm import tqdm
 
+from utils.pcm_wav import save_tensor_pcm16_wav
+
 from tool_clonevoice.bandit.bandit import Bandit
 from tool_clonevoice.bandit.inference_handler import (
     StandardTensorChunkedInferenceHandler,
@@ -224,7 +226,7 @@ class BanditSeparator:
         is discarded. ``stop_event`` is honoured between blocks. Returns
         ``out_path``.
         """
-        audio, fs = ta.load(str(audio_path))
+        audio, fs = ta.load(str(audio_path), backend="soundfile")
         if audio.shape[0] > 1:
             audio = audio.mean(0, keepdim=True)
         if fs != FS:
@@ -234,7 +236,7 @@ class BanditSeparator:
         bg = self._separate_blocked(wav, stop_event)
 
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-        ta.save(str(out_path), bg.unsqueeze(0), FS)
+        save_tensor_pcm16_wav(out_path, bg.unsqueeze(0), FS)
         return str(out_path)
 
     def _run_handler(self, segment: torch.Tensor) -> torch.Tensor:

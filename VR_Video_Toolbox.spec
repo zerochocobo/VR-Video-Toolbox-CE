@@ -15,6 +15,7 @@ into dist after build; see the copy steps in build_exe.bat.
 """
 import os
 import sys
+import importlib.util
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
@@ -26,6 +27,10 @@ _VENDOR_ABS = os.path.join(PROJECT_ROOT, "gpu_engine", "native_mosaic", "_vendor
 if _VENDOR_ABS not in sys.path:
     sys.path.insert(0, _VENDOR_ABS)
 _QWEN_TTS_VENDOR_ABS = os.path.join(PROJECT_ROOT, "tool_si", "_vendor", "qwen_tts")
+_INDEXTTS_VENDOR_ROOT = os.path.join(PROJECT_ROOT, "tool_clonevoice_v2", "vendor")
+_INDEXTTS_VENDOR_ABS = os.path.join(_INDEXTTS_VENDOR_ROOT, "indextts")
+if _INDEXTTS_VENDOR_ROOT not in sys.path:
+    sys.path.insert(0, _INDEXTTS_VENDOR_ROOT)
 
 datas = [
     ("i18n", "i18n"),
@@ -79,6 +84,44 @@ if os.path.isdir(_QWEN_TTS_VENDOR_ABS):
             hiddenimports.append(rel_module)
     datas.append((_QWEN_TTS_VENDOR_ABS, os.path.join("tool_si", "_vendor", "qwen_tts")))
 
+# IndexTTS-2.5 is vendored as the top-level `indextts` package but imported
+# lazily by tool_clonevoice_v2. Compile its modules into the PYZ and retain
+# non-Python runtime assets such as vocoder configs and bundled checkpoints.
+if os.path.isdir(_INDEXTTS_VENDOR_ABS):
+    try:
+        hiddenimports += collect_submodules("indextts", on_error="ignore")
+    except TypeError:
+        hiddenimports += collect_submodules("indextts")
+    for root, dirs, files in os.walk(_INDEXTTS_VENDOR_ABS):
+        dirs[:] = [d for d in dirs if d not in {"__pycache__", ".ipynb_checkpoints"}]
+        for filename in files:
+            if filename.endswith((".pyc", ".pyo")) or filename == ".gitignore":
+                continue
+            source = os.path.join(root, filename)
+            relative_dir = os.path.relpath(root, _INDEXTTS_VENDOR_ROOT)
+            datas.append((source, relative_dir))
+
+# IndexTTS-2.5's text frontend loads native extensions and package data at
+# runtime.  This includes Japanese G2P (fugashi + unidic-lite), Chinese/English
+# normalization (wetext + contractions + kaldifst), tokenization, and syllable
+# estimation (textstat + pyphen).  Do not leave these packages in the
+# best-effort dependency loop below: a partial build can load all model weights
+# and then fail only when the first sentence reaches the missing data file.
+for pkg in (
+    "fugashi", "unidic_lite",
+    "wetext", "contractions", "kaldifst",
+    "sentencepiece", "textstat", "pyphen",
+    # Frozen clone tools pin PCM decoding to this backend so torio cannot bind
+    # audio I/O to PyNvVideoCodec's FFmpeg DLLs.
+    "soundfile",
+):
+    if importlib.util.find_spec(pkg) is None:
+        raise RuntimeError(f"Required packaged audio/IndexTTS dependency is missing: {pkg}")
+    d, b, h = collect_all(pkg)
+    datas += d
+    binaries += b
+    hiddenimports += h
+
 # Bundle GPU/AI dependencies, including their DLLs. torch ships runtime DLLs such as cuDNN/cuBLAS/cuFFT.
 # nvidia-cuda-*-cu12 wheels ship cudart/nvrtc + headers, so the build uses wheels without system CUDA.
 for pkg in (
@@ -107,7 +150,7 @@ for pkg in (
     "omegaconf", "safetensors", "einops",
     # Qwen3-TTS runtime deps. The model weights stay outside the exe under
     # models/Qwen3-TTS-12Hz-0.6B-CustomVoice.
-    "transformers", "accelerate", "librosa", "soundfile", "torchaudio",
+    "transformers", "accelerate", "librosa", "torchaudio",
     "huggingface_hub",
     # Vendored Lada + mmengine runtime deps that PyInstaller's static analysis
     # misses because Lada is bundled as data (not analyzed) and mmengine imports
@@ -127,7 +170,7 @@ for pkg in (
 
 a = Analysis(
     ["main.py"],
-    pathex=[PROJECT_ROOT, _VENDOR_ABS],
+    pathex=[PROJECT_ROOT, _VENDOR_ABS, _INDEXTTS_VENDOR_ROOT],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,

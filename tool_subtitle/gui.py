@@ -585,6 +585,28 @@ class SubtitleToolsApp:
         self.stop_event_trans = threading.Event()
         self.root.after(0, self.load_saved_trans_key)
 
+    def _update_key_buttons(self, has_saved_key: bool):
+        """Keep "test API" always available; show "delete key" only when there is one.
+
+        The two buttons used to swap places, so once a key was saved the test
+        button disappeared entirely and connectivity could never be re-checked.
+        ``winfo_manager()`` (not ``winfo_ismapped()``) is the right idempotency
+        probe here: a widget on an unselected notebook tab is un-mapped but still
+        packed, and re-packing it would move it after its sibling.
+        """
+        try:
+            if not self.btn_test_api.winfo_exists():
+                return
+            if not self.btn_test_api.winfo_manager():
+                self.btn_test_api.pack(side='left', fill='x', expand=True)
+            if has_saved_key:
+                if not self.btn_del_key.winfo_manager():
+                    self.btn_del_key.pack(side='left', fill='x', expand=True)
+            else:
+                self.btn_del_key.pack_forget()
+        except tk.TclError:
+            pass
+
     def load_saved_trans_key(self):
         def task():
             try:
@@ -606,9 +628,7 @@ class SubtitleToolsApp:
                         return
                     if not self.api_key_var.get():
                         self.api_key_var.set(saved_key)
-                    self.btn_test_api.pack_forget()
-                    if not self.btn_del_key.winfo_ismapped():
-                        self.btn_del_key.pack(side='left', fill='x', expand=True)
+                    self._update_key_buttons(True)
                 except tk.TclError:
                     pass
 
@@ -667,8 +687,7 @@ class SubtitleToolsApp:
                 except Exception:
                     pass
             self.api_key_var.set("")
-            self.btn_del_key.pack_forget()
-            self.btn_test_api.pack(side='left', fill='x', expand=True)
+            self._update_key_buttons(False)
             messagebox.showinfo("Success", get_text('msg_key_deleted'))
         except Exception as e:
             messagebox.showerror("Error", get_text('msg_key_del_warn').format(e))
@@ -695,8 +714,7 @@ class SubtitleToolsApp:
                     keyring = _load_keyring()
                     keyring.set_password("VR_Video_Toolbox", "deepseek_api_key", api_key)
                     def update_ui_success():
-                        self.btn_test_api.pack_forget()
-                        self.btn_del_key.pack(side='left', fill='x', expand=True)
+                        self._update_key_buttons(True)
                         messagebox.showinfo("Success", get_text('msg_api_test_success').format(response))
                     self.root.after(0, update_ui_success)
                 except Exception as e:

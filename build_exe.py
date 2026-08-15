@@ -33,6 +33,7 @@ DIST = ROOT / "dist" / APP_NAME
 DLNA_DIST = ROOT / "dist" / DLNA_NAME
 INTERNAL = DIST / "_internal"
 VENV_SITE = ROOT / ".venv" / "Lib" / "site-packages"
+RELEASE_README_NAMES = ("readme.txt", "说明.txt", "readme_ja.txt")
 
 
 class BuildError(RuntimeError):
@@ -140,6 +141,52 @@ def clean() -> None:
         ROOT / "dist" / DLNA_NAME,
     ):
         remove_path(p)
+
+
+def running_dist_app_pids() -> list[str]:
+    """Return packaged processes that would make cleaning dist unsafe.
+
+    Both exes matter: ``clean()`` removes ``dist/VR_Video_Toolbox`` and the
+    intermediate ``dist/vr_dlna_server`` directory.  The DLNA exe normally
+    runs from the main directory after merge, but may also be launched from its
+    intermediate directory while testing a build.
+    """
+    try:
+        import psutil
+    except ImportError:  # pragma: no cover - guarded by ensure_dist_app_not_running
+        raise BuildError(
+            "psutil is required to detect a running packaged app before cleaning dist. "
+            "Install it (pip install psutil) or rerun with --skip-clean."
+        )
+
+    targets = {
+        os.path.normcase(str((DIST / f"{APP_NAME}.exe").resolve())): APP_NAME,
+        os.path.normcase(str((DIST / f"{DLNA_NAME}.exe").resolve())): DLNA_NAME,
+        os.path.normcase(str((DLNA_DIST / f"{DLNA_NAME}.exe").resolve())): DLNA_NAME,
+    }
+    running: list[str] = []
+    for process in psutil.process_iter(("pid", "exe")):
+        try:
+            process_exe = process.info.get("exe")
+            if not process_exe:
+                continue
+            name = targets.get(os.path.normcase(str(Path(process_exe).resolve())))
+            if name:
+                running.append(f"{name} PID {int(process.info['pid'])}")
+        except (OSError, psutil.Error):
+            continue
+    return sorted(running)
+
+
+def ensure_dist_app_not_running() -> None:
+    """Stop before cleaning an output directory used by a packaged app."""
+    active = running_dist_app_pids()
+    if active:
+        fail(
+            "Packaged app is still running ("
+            + ", ".join(active)
+            + "). Close it before rebuilding; dist was not modified."
+        )
 
 
 def build_main(pyi: list[str]) -> None:
@@ -401,12 +448,75 @@ def _exists_anywhere(name: str) -> Path | None:
     return None
 
 
+INDEXTTS_UNIDIC_REQUIRED_FILES = (
+    "version",
+    "sys.dic",
+    "unk.dic",
+    "matrix.bin",
+    "char.bin",
+    "dicrc",
+    "mecabrc",
+)
+
+
+def verify_indextts_text_runtime() -> None:
+    """Reject a release with an incomplete IndexTTS-2.5 text frontend."""
+    unidic_dir = INTERNAL / "unidic_lite" / "dicdir"
+    missing = [name for name in INDEXTTS_UNIDIC_REQUIRED_FILES if not (unidic_dir / name).is_file()]
+    if missing:
+        fail(
+            "Incomplete unidic-lite dictionary under "
+            + r"_internal\unidic_lite\dicdir; missing: "
+            + ", ".join(missing)
+        )
+
+    fugashi_dir = INTERNAL / "fugashi"
+    fugashi_extensions = list(fugashi_dir.glob("fugashi*.pyd")) if fugashi_dir.is_dir() else []
+    if not fugashi_extensions:
+        fail(r"Missing fugashi native extension under _internal\fugashi (fugashi*.pyd).")
+
+    required_data_files = (
+        Path("contractions/data/contractions_dict.json"),
+        Path("contractions/data/leftovers_dict.json"),
+        Path("contractions/data/slang_dict.json"),
+        Path("wetext/fsts/zh/tn/tagger.fst"),
+        Path("wetext/fsts/zh/tn/verbalizer.fst"),
+        Path("wetext/fsts/en/tn/tagger.fst"),
+        Path("wetext/fsts/en/tn/verbalizer.fst"),
+        Path("textstat/resources/en/easy_words.txt"),
+        Path("pyphen/dictionaries/hyph_en_US.dic"),
+    )
+    missing_data = [str(path).replace("/", "\\") for path in required_data_files if not (INTERNAL / path).is_file()]
+    if missing_data:
+        fail("Incomplete IndexTTS-2.5 text frontend data under _internal; missing: " + ", ".join(missing_data))
+
+    kaldifst_dir = INTERNAL / "kaldifst" / "lib"
+    if not list(kaldifst_dir.glob("_kaldifst*.pyd")):
+        fail(r"Missing KaldiFST native extension under _internal\kaldifst\lib (_kaldifst*.pyd).")
+
+    sentencepiece_dir = INTERNAL / "sentencepiece"
+    if not list(sentencepiece_dir.glob("_sentencepiece*.pyd")):
+        fail(r"Missing SentencePiece native extension under _internal\sentencepiece (_sentencepiece*.pyd).")
+
+
+def verify_soundfile_runtime() -> None:
+    """Reject a release that cannot use the audio backend pinned by clone tools."""
+    soundfile_data = INTERNAL / "_soundfile_data"
+    if not list(soundfile_data.glob("libsndfile*.dll")):
+        fail(r"Missing libsndfile DLL under _internal\_soundfile_data (libsndfile*.dll).")
+
+
 def verify() -> None:
     info("verifying dist contents")
     if not (DIST / f"{APP_NAME}.exe").exists():
         fail(f"Main exe missing: {DIST / (APP_NAME + '.exe')}")
     if not (DIST / f"{DLNA_NAME}.exe").exists():
         fail(f"DLNA exe missing: {DIST / (DLNA_NAME + '.exe')}")
+    if (DIST / "models").exists():
+        fail(r"Model weights must not be included in dist\VR_Video_Toolbox\models; distribute download instructions separately.")
+    for filename in RELEASE_README_NAMES:
+        if not (DIST / filename).is_file():
+            fail(f"Release readme missing beside exe: {filename}")
 
     for name in REQUIRED_DLLS:
         if not _exists_anywhere(name):
@@ -434,6 +544,9 @@ def verify() -> None:
     qwen_modeling = INTERNAL / "tool_si" / "_vendor" / "qwen_tts" / "core" / "models" / "modeling_qwen3_tts.py"
     if not qwen_modeling.exists():
         fail(r"Missing vendored Qwen3-TTS source under _internal\tool_si\_vendor\qwen_tts.")
+
+    verify_indextts_text_runtime()
+    verify_soundfile_runtime()
 
     info("verification passed.")
 
@@ -468,6 +581,17 @@ def seed_user_config() -> None:
     info(f"seeded user config beside exe: {dst}")
 
 
+def seed_release_readmes() -> None:
+    """Copy the three localized release guides beside the packaged executable."""
+    source_dir = ROOT / "release_readme"
+    for filename in RELEASE_README_NAMES:
+        source = source_dir / filename
+        if not source.is_file():
+            fail(f"Required release readme missing: {source}")
+        copy_file(source, DIST / filename)
+    info("seeded release readmes beside exe: " + ", ".join(RELEASE_README_NAMES))
+
+
 def main() -> int:
     args = parse_args()
     # Disable UPX because it corrupts CUDA DLLs.
@@ -477,6 +601,8 @@ def main() -> int:
         pyi = pyinstaller_cmd()
         info(f"using pyinstaller: {' '.join(pyi)}")
         if not args.skip_clean:
+            # Guard the delete, not the build: --skip-main still cleans dist.
+            ensure_dist_app_not_running()
             clean()
         if not args.skip_main:
             build_main(pyi)
@@ -484,6 +610,7 @@ def main() -> int:
             build_dlna(pyi)
         merge_dlna_into_main()
         seed_user_config()
+        seed_release_readmes()
         ensure_cuda_headers()
         # Dedupe + prune to slim the release. The runtime hook adds torch/lib +
         # nvidia/*/bin to the DLL search path, so no DLL needs to live at the
@@ -507,7 +634,8 @@ def main() -> int:
     info(f"onedir build complete: {DIST}")
     info(f"  main exe: {DIST / (APP_NAME + '.exe')}")
     info(f"  dlna exe: {DIST / (DLNA_NAME + '.exe')}")
-    info("分发时压缩整个目录；models/、ffmpeg.exe / lada-cli.exe 请放在 exe 同目录后再压缩。")
+    info("分发时压缩整个目录，但不要加入 models/；模型由用户根据下载说明单独获取。")
+    info("ffmpeg.exe / lada-cli.exe 仍按需放在 exe 同目录。")
     return 0
 
 

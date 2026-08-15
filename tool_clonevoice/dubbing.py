@@ -23,6 +23,7 @@ import torchaudio as ta
 
 from tool_si import logic as sl
 from tool_clonevoice.separate import FS, BanditSeparator
+from utils.pcm_wav import save_tensor_pcm16_wav
 
 LogCallback = Callable[[str], None]
 ProcessCallback = Callable[["subprocess.Popen | None"], None]
@@ -158,13 +159,13 @@ def _mix_background_and_voice(
     background_volume_percent: int | float,
     voice_volume_percent: int | float,
 ) -> None:
-    bg, bg_fs = ta.load(str(background_path))
+    bg, bg_fs = ta.load(str(background_path), backend="soundfile")
     if bg.shape[0] > 1:
         bg = bg.mean(0, keepdim=True)
     if bg_fs != FS:
         bg = ta.functional.resample(bg, bg_fs, FS)
 
-    voice, v_fs = ta.load(str(voice_path))
+    voice, v_fs = ta.load(str(voice_path), backend="soundfile")
     if voice.shape[0] > 1:
         voice = voice.mean(0, keepdim=True)
     if v_fs != FS:
@@ -182,7 +183,7 @@ def _mix_background_and_voice(
         mix = mix * (0.97 / peak)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    ta.save(str(out_path), mix, FS)
+    save_tensor_pcm16_wav(out_path, mix, FS)
 
 
 def dub_video(

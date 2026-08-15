@@ -340,7 +340,7 @@ class ClonevoiceToolsApp:
 
         opt_frame = ttk.Frame(frame)
         opt_frame.pack(fill="x", pady=(0, 6))
-        self.keep_intermediate_var = tk.BooleanVar(value=True)
+        self.keep_intermediate_var = tk.BooleanVar(value=False)
         self.skip_existing_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(opt_frame, text=get_text("chk_keep_intermediate"), variable=self.keep_intermediate_var).pack(side="left", padx=(0, 20))
         ttk.Checkbutton(opt_frame, text=get_text("chk_skip_existing"), variable=self.skip_existing_var).pack(side="left")
