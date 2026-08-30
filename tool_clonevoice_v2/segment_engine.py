@@ -107,12 +107,17 @@ class CloneTranscriber(subl.SubtitleGenerator):
         raw: list[dict] = []
         detected_lang: Optional[str] = None
         reanchored_far = 0
+        # One line per chunk was 200 lines on a one-hour title, 58% of the whole
+        # transcription log, and the GUI keeps only so many. Report roughly
+        # twenty times instead, plus the first and last.
+        progress_every = max(1, total // 20)
         for index, chunk in enumerate(chunks, start=1):
             offset = chunk["offset_sec"]
-            self.log_callback(
-                f"[seg] chunk {index}/{total} at {offset:.2f}s "
-                f"({chunk['duration_sec']:.2f}s)"
-            )
+            if index == 1 or index == total or index % progress_every == 0:
+                self.log_callback(
+                    f"[seg] chunk {index}/{total} at {offset:.2f}s "
+                    f"({100.0 * index / max(total, 1):.0f}%)"
+                )
             segments, info = self.model.transcribe(
                 chunk["array"],
                 language=self.language,
@@ -162,6 +167,14 @@ class CloneTranscriber(subl.SubtitleGenerator):
         kept: list[dict] = []
         removed_noise = removed_hall = removed_dup = removed_acoustic = compressed = 0
         window = subl.DUPLICATE_LOOKBACK_SECONDS
+        # When a stock phrase is decoded across two entries, dropping the first
+        # leaves the remainder behind as its own line -- on HNVR-174 the credit
+        # "この動画の字幕は視聴者の方によって作成されました" lost its head here
+        # and "されました。" became SRT #1. The tail cannot be judged on its own
+        # (it is ordinary Japanese), only as the completion of what was just
+        # removed, so remember that and check the next line against it.
+        pending_tail: tuple[str, float] | None = None
+        acoustic_shown: dict[str, int] = {}
 
         for item in ordered:
             text = item["text"]
@@ -184,12 +197,28 @@ class CloneTranscriber(subl.SubtitleGenerator):
                 else:
                     removed_noise += 1
                     continue
+            if pending_tail is not None:
+                remainder, deadline = pending_tail
+                pending_tail = None
+                if norm and remainder.startswith(norm) and item["start"] <= deadline:
+                    removed_hall += 1
+                    self.log_callback(
+                        f"[seg] dropped [stock-phrase tail] "
+                        f"{item['start']:.2f}-{item['end']:.2f} {text[:30]}"
+                    )
+                    continue
             if Gen.is_known_hallucination(
                 text, item["start"], item["end"], total_end,
                 avg_logprob=item.get("avg_logprob"),
                 no_speech_prob=item.get("no_speech_prob"),
             ):
                 removed_hall += 1
+                # If what we dropped was only the front of a stock phrase, the
+                # rest of it is probably the next line.
+                for phrase in subl.HARD_HALLUCINATION_NORMS:
+                    if len(phrase) > len(norm) and phrase.startswith(norm):
+                        pending_tail = (phrase[len(norm):], item["end"] + 3.0)
+                        break
                 continue
             # Acoustic hallucination checks (peak/coverage stats from
             # collect_segment_entries). Vital for dubbing: an invented line
@@ -197,10 +226,14 @@ class CloneTranscriber(subl.SubtitleGenerator):
             acoustic_reason = self.acoustic_removal_reason(item)
             if acoustic_reason:
                 removed_acoustic += 1
-                self.log_callback(
-                    f"[seg] dropped [{acoustic_reason}] "
-                    f"{item['start']:.2f}-{item['end']:.2f} {text[:30]}"
-                )
+                # 102 of these on a one-hour title. A few examples are worth
+                # seeing; the rest are counted into the summary line below.
+                acoustic_shown[acoustic_reason] = acoustic_shown.get(acoustic_reason, 0) + 1
+                if acoustic_shown[acoustic_reason] <= 3:
+                    self.log_callback(
+                        f"[seg] dropped [{acoustic_reason}] "
+                        f"{item['start']:.2f}-{item['end']:.2f} {text[:30]}"
+                    )
                 continue
 
             # Near-duplicate against recent kept lines (overlapping chunks repeat
@@ -241,8 +274,52 @@ class CloneTranscriber(subl.SubtitleGenerator):
             f"[seg] kept {len(kept)} lines "
             f"(removed {removed_dup} dup, {removed_noise} noise, {removed_hall} hallucination, "
             f"{removed_acoustic} acoustic; compressed {compressed} repetition lines)"
+            + (f" [acoustic by reason: "
+               + ", ".join(f"{k} x{v}" for k, v in sorted(acoustic_shown.items())) + "]"
+               if acoustic_shown else "")
         )
         return kept
+
+
+# "max" removes the RMS gate entirely, which on hnvr-174 let 2502s of 3467s
+# reach the decoder against 2007s at "high" -- 44 gated regions against none --
+# and recovered real dialogue that had been lost. It also feeds the decoder
+# every breath, and whisper answers a breath with a stock phrase. Counted over
+# the transcribed titles: the ones run at "max" carry 12-15% stock-phrase lines
+# and 31-46% fragments of three characters or fewer, against 0-5% and 3-13% at
+# "high". A missing line is silence; a hallucinated one is spoken aloud in the
+# dub, so "high" is the better default and "max" stays available for a title
+# whose quiet speech is genuinely being lost.
+JAPANESE_ONLY_MODELS = ("kotoba",)
+FALLBACK_MODEL_KEY = "large-v3"
+
+
+def resolve_model_for_language(model_key: str, language: Optional[str],
+                               models_root: str, log: LogCallback) -> str:
+    """Keep a Japanese-only ASR model off a non-Japanese source.
+
+    kotoba is the default here because large-v3 invents stock phrases on this
+    material rather than transcribing it -- measured on hnvr-174 part1, where
+    large-v3 rendered the opening monologue as "ご視聴ありがとうございました"
+    and produced 7 hallucinations in a 200s bedroom scene that kotoba
+    transcribed with none. It is a Japanese-only fine-tune, so any other source
+    language has to fall back.
+    """
+    if model_key not in JAPANESE_ONLY_MODELS:
+        return model_key
+    if language and not str(language).lower().startswith("ja"):
+        log(
+            f"[seg] {model_key} is Japanese-only; source language is "
+            f"{language!r}, using {FALLBACK_MODEL_KEY} instead"
+        )
+        return FALLBACK_MODEL_KEY
+    if not wx.check_model_files(model_key, models_root):
+        log(
+            f"[seg] {model_key} model files are missing; "
+            f"using {FALLBACK_MODEL_KEY} instead"
+        )
+        return FALLBACK_MODEL_KEY
+    return model_key
 
 
 def transcribe(
@@ -261,6 +338,7 @@ def transcribe(
     no_speech_prob}`` with absolute (offset-corrected) timestamps, matching the
     shape ``run_transcribe_diarize`` already consumes from the old whisperx path.
     """
+    model_key = resolve_model_for_language(model_key, language, models_root, log)
     model_path = str(wx.model_dir(model_key, models_root))
     # Honour clonevoice's CTranslate2 cuDNN probe: trying CUDA when the matching
     # cuDNN DLLs are absent hard-crashes the process (0xc0000409), which the base

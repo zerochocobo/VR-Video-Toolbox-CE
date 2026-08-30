@@ -66,6 +66,8 @@ def run_single_transcribe(
     models_root: str,
     denoise: str = "mild",
     vad_sensitivity: str = "high",
+    diarize_backend: str = "none",
+    num_speakers: Optional[int] = None,
     log: LogCallback = print,
     stop_event: Optional[Event] = None,
     model_holder: Optional[list] = None,
@@ -74,13 +76,13 @@ def run_single_transcribe(
         video_path,
         model_key=model_key,
         language=language,
-        diarize_backend="none",
-        num_speakers=None,
+        diarize_backend=diarize_backend,
+        num_speakers=num_speakers,
         target_language=target_language,
         models_root=models_root,
         denoise=denoise,
         vad_sensitivity=vad_sensitivity,
-        skip_diarization=True,
+        skip_diarization=(diarize_backend == "none"),
         log=log,
         stop_event=stop_event,
         model_holder=model_holder,
@@ -802,22 +804,37 @@ def translate_and_synthesize(
     api_key: Optional[str] = None,
     source_correction: Optional[bool] = None,
     tempo_fit: str = "moderate",
+    level_match: bool = True,
     skip_existing: bool = True,
     log: LogCallback = print,
     stop_event: Optional[Event] = None,
     model_holder: Optional[list] = None,
 ) -> dict:
+    from tool_clonevoice_v2 import backend
     from tool_si import logic as si
 
     outputs: list[str] = []
     written: list[str] = []
     skipped: list[str] = []
+    # One model for the whole run. Leaving ``model`` unset made run_synthesize
+    # load its own for every video and nothing released the previous one, so a
+    # three-part title carried three copies: measured on hnvr-174, VRAM
+    # allocated went 0.01 -> 5.60 -> 11.18 GB across the three parts, which is
+    # what "the card fills up and it crawls" looks like. run_batch already
+    # loads once and passes it down; this path did not.
+    shared_model = None
     for video in videos:
         if stop_event is not None and stop_event.is_set():
             raise RuntimeError("Stopped by user.")
         out_path = si.default_si_audio_path(video)
-        if skip_existing and Path(out_path).exists():
-            log(f"[single] target .SI.WAV exists; skipped translation and cloning: {out_path}")
+        # "Up to date", not merely "present": proofreading a video and exporting
+        # again with this ticked used to skip the whole video and drop the edits
+        # on the floor, with `skipped` in the log as the only trace.
+        if skip_existing and logic.synthesis_is_current(
+            video, language=target_language, tempo_fit=tempo_fit,
+            level_match=level_match,
+        ):
+            log(f"[single] target .SI.WAV is up to date; skipped: {out_path}")
             outputs.append(out_path)
             skipped.append(out_path)
             continue
@@ -830,12 +847,20 @@ def translate_and_synthesize(
             stop_event=stop_event,
         )
         log(f"[single] synthesize -> {video}")
+        # Loaded on the first video that actually needs it, so a run where
+        # every output already exists never pays for it.
+        if shared_model is None:
+            shared_model = backend.load_model(models_root, log=log)
+            if model_holder is not None:
+                model_holder.append(shared_model)
         out = logic.run_synthesize(
             video,
             models_root=models_root,
+            model=shared_model,
             text_field="tgt_text",
             language=target_language,
             tempo_fit=tempo_fit,
+            level_match=level_match,
             log=log,
             stop_event=stop_event,
             model_holder=model_holder,

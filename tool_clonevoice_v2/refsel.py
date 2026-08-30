@@ -249,6 +249,20 @@ def _turn_candidates(speaker: str, manifest: dict, segments: List[dict]) -> List
     return cands
 
 
+# A reference has to show the voice across varied phonemes. Measured on the
+# ipvr-385 candidate list, the distinct-character ratio separates a moan from a
+# sentence cleanly: 0.33 for "やばいやばいやばい" and 0.50 for
+# "くっくりくれくれかいかい", against 0.67-0.93 for every real line.
+GOOD_TEXT_VARIETY = 0.65
+
+
+def _phonetic_variety(text: str) -> float:
+    chars = [ch for ch in (text or "") if not ch.isspace() and ch.isalnum()]
+    if not chars:
+        return 0.0
+    return len(set(chars)) / len(chars)
+
+
 def _score(cand: dict, audio: np.ndarray, sr: int, other_segs: List[dict]) -> float:
     dur = cand["dur"]
     dur_s = math.exp(-((dur - IDEAL) ** 2) / (2 * 2.5 ** 2))
@@ -266,6 +280,12 @@ def _score(cand: dict, audio: np.ndarray, sr: int, other_segs: List[dict]) -> fl
         dens_s = 0.0  # no transcript -> likely non-speech (moans/breath): avoid
     else:
         dens_s = 1.0 if 2.0 <= cps <= 12.0 else 0.5
+    # Density alone gives a moan full marks: "やばいやばいやばい" is 9 characters
+    # over 3.8s, a perfectly ordinary 2.4 chars/sec. What makes it a poor voice
+    # print is that it is the same sound three times. On ipvr-385 the two
+    # top-ranked candidates were exactly this -- 0.905 and 0.895, above every
+    # real sentence -- and the batch anchor picked the same kind of clip.
+    variety = _phonetic_variety(cand["text"])
 
     overlap = 0.0
     for o in other_segs:
@@ -276,8 +296,16 @@ def _score(cand: dict, audio: np.ndarray, sr: int, other_segs: List[dict]) -> fl
     turn_purity = max(0.0, 1.0 - float(cand.get("other_turn_overlap", 0.0)) / max(0.1, dur))
 
     # Text density is weighted heavily: a reference must carry real speech whose
-    # transcript matches the audio, otherwise cloning degrades badly.
-    return 0.17 * dur_s + 0.18 * rms_s + 0.08 * gap_s + 0.25 * dens_s + 0.15 * ov_s + 0.12 * turn_purity + source_bonus
+    # transcript matches the audio, otherwise cloning degrades badly. Variety
+    # carries part of that weight now, since density cannot tell a sentence
+    # from the same syllable repeated at the same rate.
+    base = (0.17 * dur_s + 0.18 * rms_s + 0.08 * gap_s + 0.25 * dens_s
+            + 0.15 * ov_s + 0.12 * turn_purity + source_bonus)
+    # Applied as a multiplier rather than another weighted term: a moan scores
+    # well on every acoustic measure at once, so shaving a few points off one
+    # of them does not move it. Scaling the whole score does -- and a line with
+    # ordinary variety is multiplied by 1.0, so nothing else changes.
+    return base * min(1.0, variety / GOOD_TEXT_VARIETY)
 
 
 def _cut_ref(video: str, start: float, end: float, out_wav: str, log: LogCallback) -> None:

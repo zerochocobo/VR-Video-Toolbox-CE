@@ -5,7 +5,7 @@ import numpy as np
 import soundfile as sf
 import torch
 
-from tool_clonevoice_v2 import backend, logic, single_clone
+from tool_clonevoice_v2 import backend, logic, segment_engine, single_clone
 
 
 def test_vendored_pcm16_writer_does_not_use_torchaudio_codec(tmp_path: Path):
@@ -200,6 +200,12 @@ def test_reference_quality_rejects_loud_unvoiced_breath_noise() -> None:
 
 
 def test_manifest_uses_nearest_stable_timbre_and_current_weak_emotion(tmp_path: Path):
+    """The weak-reference fallback, which now only runs with anchoring off.
+
+    With the speaker anchor on (the default) the timbre comes from the best
+    sentence in the whole title rather than the nearest stable one, so this
+    path is exercised explicitly; see the companion assertion at the end.
+    """
     sr = backend.SAMPLE_RATE
     source = tmp_path / "source.wav"
     output = tmp_path / "result.wav"
@@ -235,6 +241,7 @@ def test_manifest_uses_nearest_stable_timbre_and_current_weak_emotion(tmp_path: 
         language="en",
         fit_duration=False,
         log=messages.append,
+        timbre_anchor=False,
     )
 
     assert len(model.calls) == 3
@@ -242,8 +249,36 @@ def test_manifest_uses_nearest_stable_timbre_and_current_weak_emotion(tmp_path: 
     assert Path(weak_call["spk_audio_prompt"]).name == "sentence_ref_00001.wav"
     assert Path(weak_call["emo_audio_prompt"]).name == "sentence_ref_00002.wav"
     assert weak_call["emo_alpha"] == backend.UNVOICED_EMOTION_ALPHA
-    assert any("weak-ref(active=" in message for message in messages)
-    assert any("periodic=" in message for message in messages)
+    # One line per sentence now, not two: the reference detail is folded into
+    # the duration line, and the per-sentence profile numbers are gone -- they
+    # were debugging output and the GUI log holds a limited number of lines.
+    assert any("weak-ref" in message for message in messages)
+    assert any("emo-alpha=" in message for message in messages)
+    assert not any("periodic=" in message for message in messages)
+
+    # Same manifest with the default on. The discriminator is segment 3: it is
+    # stable, so the fallback path leaves it cloning from itself, while the
+    # anchor path makes it borrow the title's best line (segment 1 -- louder
+    # than segment 3, and loudness is now judged against the title's median).
+    anchored = FakeModel()
+    # Its own intermediate directory: sharing one with the run above would let
+    # the unchanged lines come back from the per-line cache instead of reaching
+    # the model -- correct behaviour, but it leaves nothing here to inspect.
+    anchored_dir = Path(output).parent / "anchored_manifest"
+    backend.synthesize_manifest(
+        anchored, source,
+        [
+            {"id": 1, "start": 0.0, "end": 3.0, "text": "near stable"},
+            {"id": 2, "start": 4.0, "end": 5.0, "text": "weak breath"},
+            {"id": 3, "start": 8.0, "end": 12.0, "text": "far stable"},
+        ],
+        output, language="en", fit_duration=False, log=lambda _m: None,
+        intermediate_dir=anchored_dir,
+    )
+    assert Path(anchored.calls[1]["spk_audio_prompt"]).name == "sentence_ref_00001.wav"
+    assert anchored.calls[1]["emo_alpha"] == backend.UNVOICED_EMOTION_ALPHA
+    assert Path(anchored.calls[2]["spk_audio_prompt"]).name == "sentence_ref_00001.wav"
+    assert Path(model.calls[2]["spk_audio_prompt"]).name == "sentence_ref_00003.wav"
 
 
 def test_manifest_retries_failed_short_prompt_with_local_context(tmp_path: Path):
@@ -305,3 +340,55 @@ def test_candidate_preview_writes_legacy_table_fields(tmp_path: Path):
     assert candidate["ecapa_similarity"] == 0.72
     assert preview_sr == 22050
     assert np.isclose(np.max(np.abs(preview)), 0.1, atol=5e-5)
+
+
+# --- ASR model choice -------------------------------------------------------
+
+def test_kotoba_is_kept_for_a_japanese_source(tmp_path: Path):
+    (tmp_path / "kotoba-whisper-v2.0-faster").mkdir()
+    (tmp_path / "kotoba-whisper-v2.0-faster" / "model.bin").write_bytes(b"x")
+    (tmp_path / "kotoba-whisper-v2.0-faster" / "config.json").write_text("{}")
+    lines: list[str] = []
+    assert segment_engine.resolve_model_for_language(
+        "kotoba", "ja", str(tmp_path), lines.append
+    ) == "kotoba"
+    assert lines == []
+
+
+def test_kotoba_falls_back_on_a_non_japanese_source(tmp_path: Path):
+    lines: list[str] = []
+    assert segment_engine.resolve_model_for_language(
+        "kotoba", "en", str(tmp_path), lines.append
+    ) == segment_engine.FALLBACK_MODEL_KEY
+    assert any("Japanese-only" in line for line in lines)
+
+
+def test_kotoba_falls_back_when_its_files_are_absent(tmp_path: Path):
+    lines: list[str] = []
+    assert segment_engine.resolve_model_for_language(
+        "kotoba", "ja", str(tmp_path), lines.append
+    ) == segment_engine.FALLBACK_MODEL_KEY
+    assert any("missing" in line for line in lines)
+
+
+def test_a_non_japanese_only_model_is_never_second_guessed(tmp_path: Path):
+    lines: list[str] = []
+    assert segment_engine.resolve_model_for_language(
+        "large-v3", "en", str(tmp_path), lines.append
+    ) == "large-v3"
+    assert lines == []
+
+
+def test_the_v2_transcription_defaults():
+    """kotoba because large-v3 invents stock phrases over this material rather
+    than transcribing it; "high" because "max" answers every breath with one.
+    Counted over the transcribed titles, the runs at "max" carry 12-15%
+    stock-phrase lines and 31-46% three-character fragments, against 0-5% and
+    3-13% at "high" -- and a hallucinated line is spoken aloud in the dub,
+    where a missing one is only silence."""
+    import inspect
+
+    for fn in (logic.run_transcribe_diarize, logic.run_full, logic.run_batch):
+        params = inspect.signature(fn).parameters
+        assert params["model_key"].default == "kotoba"
+        assert params["vad_sensitivity"].default == "high"

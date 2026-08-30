@@ -10,6 +10,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from utils import i18n, ui_theme
 from tool_clonevoice_v2.gui_candidate_panel import CandidateBasisPanel
+from tool_clonevoice_v2.gui_pace import PaceTab
 from tool_clonevoice_v2.gui_proofread import build_proofread_panel
 from tool_clonevoice_v2.log_redirect import redirect_stdio
 
@@ -103,6 +104,18 @@ class ClonevoiceToolsApp:
         self.notebook.add(self.tab_single_clone, text=get_text("tab_single_clone"), icon=ui_theme.TAB_ICONS["person"])
         self._setup_single_clone_tab(self.tab_single_clone)
 
+        # Per-speaker basis auditioning. a265bda ("Refactor v2 voice clone to
+        # sentence references") dropped these three lines and left the ~500-line
+        # tab body and all 21 of its handlers behind, so the only way to choose
+        # a speaker's reference by ear has been unreachable ever since -- the
+        # automatic timbre anchor was the only path left.
+        self.tab_multi_clone = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(
+            self.tab_multi_clone, text=get_text("tab_multi_clone"),
+            icon=ui_theme.TAB_ICONS["people"],
+        )
+        self._setup_multi_clone_tab(self.tab_multi_clone)
+
         self.tab_clone = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(self.tab_clone, text=get_text("tab_clone"), icon=ui_theme.TAB_ICONS["auto"])
         self._setup_clone_tab(self.tab_clone)
@@ -110,6 +123,14 @@ class ClonevoiceToolsApp:
         self.tab_mix = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(self.tab_mix, text=get_text("tab_mix_video_audio"), icon=ui_theme.TAB_ICONS["volume"])
         self._setup_single_mix_tab(self.tab_mix)
+
+        # Last in the rail: what the dub actually did, line by line. IndexTTS
+        # renders about twice the length the translated text predicts, so how
+        # much of a source line the dub covers cannot be worked out on paper --
+        # and the uncovered remainder is the ducked original still talking.
+        self.tab_pace = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(self.tab_pace, text=get_text("tab_pace"), icon=ui_theme.TAB_ICONS["locate"])
+        self.pace_tab = PaceTab(self.tab_pace)
 
     def _setup_clone_tab(self, frame):
         info = ttk.Label(frame, text=get_text("lbl_info"), wraplength=760, justify="left", foreground="dim gray")
@@ -149,7 +170,7 @@ class ClonevoiceToolsApp:
             "large-v2": "large-v2",
             get_text("opt_model_kotoba"): "kotoba",
         }
-        self.model_var = tk.StringVar(value="large-v3")
+        self.model_var = tk.StringVar(value=get_text("opt_model_kotoba"))
         self.model_combo = ttk.Combobox(row1, textvariable=self.model_var, values=list(self._model_map.keys()), state="readonly", width=18)
         self.model_combo.pack(side="left", padx=(0, 8))
         self.model_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_asr_model_status())
@@ -234,6 +255,32 @@ class ClonevoiceToolsApp:
         self.tgt_lang_combo.pack(side="left")
         self.btn_trans_config = ttk.Button(row3, text=get_text("btn_trans_config"), command=self._open_translate_config)
         self.btn_trans_config.pack(side="left", padx=(12, 0))
+
+        diar_frame = ttk.Frame(frame)
+        diar_frame.pack(fill="x", pady=(0, 6))
+        # Speaker count is the only control worth exposing: 1 means skip
+        # diarization outright, anything else resolves to pyannote (resolve_backend
+        # picks it whenever the bundle is present and degrades to "single"
+        # otherwise, and ECAPA is never auto-selected anyway).
+        ttk.Label(diar_frame, text=get_text("lbl_num_speakers")).pack(side="left", padx=(0, 6))
+        self.batch_num_speakers_var = tk.StringVar(value="1")
+        ttk.Combobox(
+            diar_frame,
+            textvariable=self.batch_num_speakers_var,
+            values=[get_text("opt_num_auto")] + [str(n) for n in range(1, 8)],
+            state="readonly",
+            width=8,
+        ).pack(side="left")
+
+        # Directly under the speaker count: one anchor is chosen per speaker,
+        # so the two controls only make sense read together.
+        anchor_frame = ttk.Frame(frame)
+        anchor_frame.pack(fill="x", pady=(0, 6))
+        self.batch_timbre_anchor_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            anchor_frame, text=get_text("chk_timbre_anchor"),
+            variable=self.batch_timbre_anchor_var,
+        ).pack(side="left")
 
         opt_frame = ttk.Frame(frame)
         opt_frame.pack(fill="x", pady=(0, 6))
@@ -404,7 +451,7 @@ class ClonevoiceToolsApp:
         ttk.Label(step1, text=get_text("lbl_model"), width=step1_label_width).grid(
             row=3, column=0, sticky="w", padx=(0, 6), pady=3
         )
-        self.single_clone_model_var = tk.StringVar(value="large-v3")
+        self.single_clone_model_var = tk.StringVar(value=get_text("opt_model_kotoba"))
         self.single_clone_model_combo = ttk.Combobox(
             step1,
             textvariable=self.single_clone_model_var,
@@ -460,8 +507,22 @@ class ClonevoiceToolsApp:
             side="left"
         )
 
+        single_clone_speaker_row = ttk.Frame(step1)
+        single_clone_speaker_row.grid(row=7, column=0, columnspan=4, sticky="ew", pady=3)
+        ttk.Label(
+            single_clone_speaker_row, text=get_text("lbl_num_speakers"), width=step1_label_width
+        ).pack(side="left", padx=(0, 6))
+        self.single_clone_num_speakers_var = tk.StringVar(value="1")
+        ttk.Combobox(
+            single_clone_speaker_row,
+            textvariable=self.single_clone_num_speakers_var,
+            values=[get_text("opt_num_auto")] + [str(n) for n in range(1, 8)],
+            state="readonly",
+            width=8,
+        ).pack(side="left")
+
         self.single_clone_btn_transcribe = ttk.Button(step1, text=get_text("btn_start_transcribe"), command=self._single_clone_run_transcribe)
-        self.single_clone_btn_transcribe.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self.single_clone_btn_transcribe.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(8, 0))
 
         step2 = ttk.Frame(content, padding=8)
         step2.columnconfigure(0, weight=1)
@@ -558,6 +619,12 @@ class ClonevoiceToolsApp:
             text=get_text("chk_single_skip_existing_si"),
             variable=self.single_clone_skip_existing_var,
         ).pack(side="left")
+        self.single_clone_level_match_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            step4_options,
+            text=get_text("chk_level_match"),
+            variable=self.single_clone_level_match_var,
+        ).pack(side="left", padx=(18, 0))
         (
             self.single_clone_proofread_panel,
             self._refresh_single_clone_proofread_panel,
@@ -639,8 +706,11 @@ class ClonevoiceToolsApp:
             get_text("opt_denoise_balanced"): "balanced",
             get_text("opt_denoise_strong"): "strong",
         }
+        # No "auto": pyannote's own estimate is what produced the fragment
+        # clusters this tab then has to ignore, and the count is something the
+        # user knows by looking at the video. 1 is both the common case and the
+        # single-speaker refined-clone path.
         self.multi_clone_num_map = {
-            get_text("opt_num_auto"): None,
             "1": 1,
             "2": 2,
             "3": 3,
@@ -770,7 +840,7 @@ class ClonevoiceToolsApp:
         model_row = ttk.Frame(step1)
         model_row.grid(row=3, column=0, columnspan=4, sticky="ew", pady=3)
         ttk.Label(model_row, text=get_text("lbl_model"), width=label_width).pack(side="left", padx=(0, 6))
-        self.multi_clone_model_var = tk.StringVar(value="large-v3")
+        self.multi_clone_model_var = tk.StringVar(value=get_text("opt_model_kotoba"))
         self.multi_clone_model_combo = ttk.Combobox(
             model_row,
             textvariable=self.multi_clone_model_var,
@@ -788,7 +858,7 @@ class ClonevoiceToolsApp:
         self.btn_download_multi_asr_model.pack(side="left", padx=(6, 16))
         self.multi_clone_num_label = ttk.Label(model_row, text=get_text("lbl_num_speakers"), width=secondary_width)
         self.multi_clone_num_label.pack(side="left", padx=(0, 6))
-        self.multi_clone_num_var = tk.StringVar(value=get_text("opt_num_auto"))
+        self.multi_clone_num_var = tk.StringVar(value="1")
         self.multi_clone_num_combo = ttk.Combobox(
             model_row,
             textvariable=self.multi_clone_num_var,
@@ -924,6 +994,12 @@ class ClonevoiceToolsApp:
             state="readonly",
             width=8,
         ).pack(side="left")
+        self.multi_clone_level_match_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            synthesis_options,
+            text=get_text("chk_level_match"),
+            variable=self.multi_clone_level_match_var,
+        ).pack(side="left", padx=(18, 0))
 
         step3_options = ttk.Frame(step3)
         step3_options.grid(row=2, column=0, sticky="ew", pady=(8, 6))
@@ -1018,6 +1094,10 @@ class ClonevoiceToolsApp:
         ttk.Entry(self.mix_batch_dir_row, textvariable=self.mix_dir_var).grid(row=0, column=1, sticky="ew")
         ttk.Button(self.mix_batch_dir_row, text=get_text("btn_browse"), command=self._browse_mix_dir).grid(row=0, column=2, sticky="ew", padx=(6, 0))
 
+        # No mode selector: the bandit-bed dubbing mode is gone. Measured on
+        # HNVR-174, bandit left 279 of 369 lines within 3 dB of the original --
+        # the bed still carried the dialogue it was supposed to remove -- so
+        # ducking the original is the only mode that actually works.
         options = ttk.Frame(frame)
         self.single_mix_opts_frame = options
         self._single_mix_channel_map = {
@@ -1035,19 +1115,13 @@ class ClonevoiceToolsApp:
         self.single_mix_sivol_var = tk.StringVar(value="100%")
         self.single_mix_delay_var = tk.StringVar(value="0s")
         self.single_mix_duck_var = tk.BooleanVar(value=True)
-        self.single_mix_duck_preset_label = ttk.Label(options, text=get_text("lbl_original_duck_preset"))
-        self.single_mix_duck_preset_label.grid(row=0, column=0, sticky="w", padx=(0, 6), pady=2)
+        # No strength selector: band ducking only pays off at "strongest" (the
+        # three-way split costs ~1.8 dB of background whatever the preset, so a
+        # lighter setting gives away more than it saves), and anything lighter
+        # left the original dialogue audible under the dub.
         self.single_mix_duck_preset_var = tk.StringVar(value=si("opt_duck_preset_strongest"))
-        self.single_mix_duck_preset_combo = ttk.Combobox(
-            options,
-            textvariable=self.single_mix_duck_preset_var,
-            values=list(self._single_mix_duck_preset_map),
-            width=8,
-            state="readonly",
-        )
-        self.single_mix_duck_preset_combo.grid(row=0, column=1, sticky="w", pady=2)
         self.single_mix_sivol_label = ttk.Label(options, text=get_text("lbl_dub_volume"))
-        self.single_mix_sivol_label.grid(row=1, column=0, sticky="w", padx=(0, 6), pady=2)
+        self.single_mix_sivol_label.grid(row=0, column=0, sticky="w", padx=(0, 6), pady=2)
         self.single_mix_sivol_combo = ttk.Combobox(
             options,
             textvariable=self.single_mix_sivol_var,
@@ -1055,31 +1129,32 @@ class ClonevoiceToolsApp:
             width=8,
             state="readonly",
         )
-        self.single_mix_sivol_combo.grid(row=1, column=1, sticky="w", pady=2)
-        self.single_mix_duck_key_var = tk.BooleanVar(value=True)
-        self.single_mix_duck_key_check = ttk.Checkbutton(
-            options,
-            text=get_text("chk_use_duck_key"),
-            variable=self.single_mix_duck_key_var,
+        self.single_mix_sivol_combo.grid(row=0, column=1, sticky="w", pady=2)
+        # One switch, not two: the key track decides WHEN the original is pushed
+        # down (the full subtitle span, not merely where the dub happens to make
+        # noise) and the band split decides WHICH frequencies (80-8000 Hz, where
+        # the voice lives). They are the two halves of one behaviour and there is
+        # no sane reason to run half of it.
+        self.single_mix_duck_voice_var = tk.BooleanVar(value=True)
+        self.single_mix_duck_voice_check = ttk.Checkbutton(
+            options, text=get_text("chk_duck_voice_bands"),
+            variable=self.single_mix_duck_voice_var,
         )
-        self.single_mix_duck_key_check.grid(row=2, column=0, columnspan=6, sticky="w", pady=2)
+        self.single_mix_duck_voice_check.grid(row=1, column=0, columnspan=6, sticky="w", pady=2)
         self.single_mix_indep_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(options, text=si("chk_add_independent_track"), variable=self.single_mix_indep_var).grid(
-            row=3, column=0, columnspan=6, sticky="w", pady=2
+            row=2, column=0, columnspan=6, sticky="w", pady=2
         )
         self.single_mix_si_option_widgets = [
-            self.single_mix_duck_preset_label,
-            self.single_mix_duck_preset_combo,
             self.single_mix_sivol_label,
             self.single_mix_sivol_combo,
-            self.single_mix_duck_key_check,
+            self.single_mix_duck_voice_check,
         ]
-        self._update_single_mix_duck_preset_state()
 
         btn_frame = ttk.Frame(frame)
         self._single_mix_btn_frame = btn_frame
-        options.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 6))
-        btn_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(2, 6))
+        options.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        btn_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(2, 6))
         btn_frame.columnconfigure(0, weight=1)
         btn_frame.columnconfigure(1, weight=1)
         self.single_mix_btn_start = ttk.Button(btn_frame, text=get_text("btn_start_mix"), command=self._run_single_mix)
@@ -1088,8 +1163,11 @@ class ClonevoiceToolsApp:
         self.single_mix_btn_stop.grid(row=0, column=1, sticky="ew", padx=(5, 0))
 
         log_frame = ttk.LabelFrame(frame, text=get_text("lbl_log"), padding=6)
-        log_frame.grid(row=5, column=0, columnspan=3, sticky="nsew")
-        frame.rowconfigure(5, weight=1)
+        # Row 6, not 5: the mode selector pushed options and the buttons down one
+        # row each, and the log is the only stretching row, so sharing a row with
+        # the buttons hid them entirely.
+        log_frame.grid(row=6, column=0, columnspan=3, sticky="nsew")
+        frame.rowconfigure(6, weight=1)
         self.single_mix_log = scrolledtext.ScrolledText(log_frame, height=10, state="disabled")
         self.single_mix_log.pack(fill="both", expand=True)
         self.mix_batch_dir_row.grid_remove()
@@ -1473,6 +1551,9 @@ class ClonevoiceToolsApp:
         denoise = self.single_clone_denoise_map.get(self.single_clone_denoise_var.get(), "none")
         source_correction = self.single_clone_source_correction_var.get()
         vad_sensitivity = self.vad_sensitivity_map.get(self.single_clone_vad_var.get(), "high")
+        diarize_backend, num_speakers = self._speaker_choice(
+            self.single_clone_num_speakers_var.get()
+        )
 
         def worker(holder, release_holder):
             from tool_clonevoice_v2 import single_clone as sc
@@ -1490,6 +1571,8 @@ class ClonevoiceToolsApp:
                     models_root=self.models_root,
                     denoise=denoise,
                     vad_sensitivity=vad_sensitivity,
+                    diarize_backend=diarize_backend,
+                    num_speakers=num_speakers,
                     log=lambda m: self.log(self.single_clone_log, m),
                     stop_event=self.single_clone_stop_event,
                     model_holder=holder,
@@ -1615,37 +1698,26 @@ class ClonevoiceToolsApp:
         def worker(holder, release_holder):
             from tool_clonevoice_v2 import single_clone as sc
 
+            # Same one-pass path the bulk candidate run uses. The old two-pass
+            # OmniVoice flow here raises on v2, so picking a candidate whose
+            # preview had not been generated yet failed instead of generating
+            # one.
             model = self._load_single_clone_omnivoice_model(holder)
             try:
-                job = sc.build_candidate_target_sample_job(
-                    cand,
+                sc.generate_indextts_candidate_previews(
+                    [cand],
                     model=model,
                     target_language=target_language,
-                    log_label=get_text("msg_single_candidate_label").format(1, 1, cand.get("id") or ""),
+                    log_label=lambda i, n, c: get_text("msg_single_candidate_label").format(
+                        i, n, c.get("id") or ""
+                    ),
                     log=lambda m: self.log(self.single_clone_log, m),
                     stop_event=self.single_clone_stop_event,
                 )
             finally:
                 del model
                 release_holder()
-            result = sc.finish_candidate_target_sample_jobs(
-                [job],
-                models_root=self.models_root,
-                log=lambda m: self.log(self.single_clone_log, m),
-            )[0]
-            model = self._load_single_clone_omnivoice_model(holder)
-            try:
-                sc.generate_candidate_translated_previews_with_model(
-                    [result],
-                    model=model,
-                    target_language=target_language,
-                    label_func=lambda i, n, c: get_text("msg_single_candidate_label").format(i, n, c.get("id") or ""),
-                    log=lambda m: self.log(self.single_clone_log, m),
-                    stop_event=self.single_clone_stop_event,
-                )
-            finally:
-                del model
-                release_holder()
+            result = cand
             scored = sc.score_candidate_similarities(
                 [result],
                 models_root=self.models_root,
@@ -1938,6 +2010,7 @@ class ClonevoiceToolsApp:
         tempo_fit = "moderate"
         skip_existing = self.single_clone_skip_existing_var.get()
         source_correction = self.single_clone_source_correction_var.get()
+        level_match = self.single_clone_level_match_var.get()
 
         def worker(holder, _release_holder):
             from tool_clonevoice_v2 import single_clone as sc
@@ -1948,6 +2021,7 @@ class ClonevoiceToolsApp:
                 models_root=self.models_root,
                 source_correction=source_correction,
                 tempo_fit=tempo_fit,
+                level_match=level_match,
                 skip_existing=skip_existing,
                 log=lambda m: self.log(self.single_clone_log, m),
                 stop_event=self.single_clone_stop_event,
@@ -2339,7 +2413,7 @@ class ClonevoiceToolsApp:
 
             turns_by_video = {}
             if batch_mode:
-                speaker_note = num_speakers if num_speakers is not None else get_text("opt_num_auto")
+                speaker_note = num_speakers if num_speakers is not None else "?"
                 self.log(self.multi_clone_log, get_text("msg_multi_global_prescan_start").format(len(videos), speaker_note))
                 turns_by_video = mc.prescan_global_diarize(
                     videos,
@@ -2936,8 +3010,14 @@ class ClonevoiceToolsApp:
                     self.log(self.multi_clone_log, get_text("msg_multi_no_candidates").format(speaker))
                     return collected
                 self.log(self.multi_clone_log, get_text("msg_single_prepare_samples"))
-                jobs = []
-                missing_target = [
+                # One pass, straight from each candidate's own reference WAV.
+                # This used to run OmniVoice's two-pass "target reference take
+                # then preview" flow, which the v2 migration replaced with a
+                # stub that raises -- so auditioning a speaker's candidates was
+                # dead on arrival. IndexTTS needs neither pass: it clones from
+                # the reference WAV directly, which is what the single-voice tab
+                # has been doing all along.
+                missing_preview = [
                     cand for cand in collected
                     if not (
                         cand.get("target_sample_audio")
@@ -2945,50 +3025,16 @@ class ClonevoiceToolsApp:
                         and (cand.get("target_sample_text") or "").strip()
                     )
                 ]
-                if missing_target:
+                if missing_preview:
                     model = self._load_multi_clone_omnivoice_model(holder)
                     try:
-                        for idx, cand in enumerate(collected, 1):
-                            if cand not in missing_target:
-                                continue
-                            if self.multi_clone_stop_event.is_set():
-                                raise RuntimeError("Stopped by user.")
-                            label = get_text("msg_multi_candidate_label").format(speaker, idx, len(collected), cand.get("id") or "")
-                            self.log(self.multi_clone_log, get_text("msg_single_candidate_generating").format(label))
-                            jobs.append(
-                                sc.build_candidate_target_sample_job(
-                                    cand,
-                                    model=model,
-                                    target_language=target_language,
-                                    log_label=label,
-                                    log=lambda m: self.log(self.multi_clone_log, m),
-                                    stop_event=self.multi_clone_stop_event,
-                                )
-                            )
-                    finally:
-                        del model
-                        release_holder()
-                if jobs:
-                    sc.finish_candidate_target_sample_jobs(
-                        jobs,
-                        models_root=self.models_root,
-                        log=lambda m: self.log(self.multi_clone_log, m),
-                    )
-                preview_missing = [
-                    cand for cand in collected
-                    if (cand.get("tgt_text") or "").strip()
-                    and cand.get("target_sample_audio")
-                    and os.path.isfile(cand.get("target_sample_audio"))
-                    and not (cand.get("translated_audio") and os.path.isfile(cand.get("translated_audio")))
-                ]
-                if preview_missing:
-                    model = self._load_multi_clone_omnivoice_model(holder)
-                    try:
-                        sc.generate_candidate_translated_previews_with_model(
-                            collected,
+                        sc.generate_indextts_candidate_previews(
+                            missing_preview,
                             model=model,
                             target_language=target_language,
-                            label_func=lambda i, n, c: get_text("msg_multi_candidate_label").format(speaker, i, n, c.get("id") or ""),
+                            log_label=lambda i, n, c: get_text("msg_multi_candidate_label").format(
+                                speaker, i, n, c.get("id") or ""
+                            ),
                             log=lambda m: self.log(self.multi_clone_log, m),
                             stop_event=self.multi_clone_stop_event,
                         )
@@ -3115,6 +3161,7 @@ class ClonevoiceToolsApp:
             return
         target_language = self._selected_multi_target_language()
         tempo_fit = self.multi_clone_tempo_fit_map.get(self.multi_clone_tempo_fit_var.get(), "moderate")
+        level_match = self.multi_clone_level_match_var.get()
         skip_existing = self.multi_clone_skip_existing_var.get()
         skipped = set(self.multi_clone_skipped)
         source_correction = self.multi_clone_source_correction_var.get()
@@ -3134,6 +3181,7 @@ class ClonevoiceToolsApp:
                 models_root=self.models_root,
                 source_correction=source_correction,
                 tempo_fit=tempo_fit,
+                level_match=level_match,
                 skip_existing=skip_existing,
                 log=lambda m: self.log(self.multi_clone_log, m),
                 stop_event=self.multi_clone_stop_event,
@@ -3373,7 +3421,8 @@ class ClonevoiceToolsApp:
             self.single_mix_duck_preset_var.get(),
             sl.DEFAULT_DUCK_PRESET,
         )
-        use_duck_key = self.single_mix_duck_key_var.get()
+        # One control drives both halves: see the checkbox above.
+        use_duck_key = duck_band = self.single_mix_duck_voice_var.get()
 
         self.single_mix_stop_event.clear()
         self.single_mix_btn_start.config(state="disabled")
@@ -3392,6 +3441,7 @@ class ClonevoiceToolsApp:
                         duck_original=duck,
                         duck_preset=duck_preset,
                         use_duck_key=use_duck_key,
+                        duck_band=duck_band,
                         log_callback=lambda m: self.log(self.single_mix_log, m),
                         stop_event=self.single_mix_stop_event,
                         process_callback=lambda p: setattr(self, "single_mix_proc", p),
@@ -3411,6 +3461,7 @@ class ClonevoiceToolsApp:
                     duck_original=duck,
                     duck_preset=duck_preset,
                     use_duck_key=use_duck_key,
+                    duck_band=duck_band,
                     log_callback=lambda m: self.log(self.single_mix_log, m),
                     stop_event=self.single_mix_stop_event,
                     process_callback=lambda p: setattr(self, "single_mix_proc", p),
@@ -3437,9 +3488,23 @@ class ClonevoiceToolsApp:
             pass
         self.single_mix_btn_stop.config(state="disabled")
 
-    def _update_single_mix_duck_preset_state(self):
-        if hasattr(self, "single_mix_duck_preset_combo"):
-            self.single_mix_duck_preset_combo.config(state="readonly")
+    def _speaker_choice(self, label: str) -> tuple[str, "int | None"]:
+        """Turn the speaker-count choice into (diarize_backend, num_speakers).
+
+        1 used to skip diarization altogether, on the reasoning that one
+        speaker leaves nothing to separate. It does not: a title whose one
+        voice is the point still has the odd line from someone else, and with
+        no labels at all that line was cloned from the main speaker's anchor.
+        1 now means "hold one voice together", which
+        ``diarize_primary_speakers`` reads as a count of voices to keep rather
+        than a cluster count, so a clearly different voice is still separated.
+
+        ``auto`` resolves to pyannote when its bundle is present and falls back
+        to a single turn when it is not.
+        """
+        if label.isdigit():
+            return "auto", int(label)
+        return "auto", None
 
     def _selected_target_language(self) -> str:
         return self._tgt_map.get(self.tgt_lang_var.get(), "Chinese")
@@ -3553,6 +3618,8 @@ class ClonevoiceToolsApp:
         keep_intermediate = self.keep_intermediate_var.get()
         source_correction = self.source_correction_var.get()
         vad_sensitivity = self.vad_sensitivity_map.get(self.clone_vad_var.get(), "high")
+        diarize_backend, num_speakers = self._speaker_choice(self.batch_num_speakers_var.get())
+        timbre_anchor = self.batch_timbre_anchor_var.get()
 
         def task():
             holder: list = []
@@ -3583,6 +3650,9 @@ class ClonevoiceToolsApp:
                     models_root=self.models_root,
                     keep_intermediate=keep_intermediate,
                     skip_existing=skip_existing,
+                    timbre_anchor=timbre_anchor,
+                        diarize_backend=diarize_backend,
+                    num_speakers=num_speakers,
                     source_correction=source_correction,
                     vad_sensitivity=vad_sensitivity,
                     log=lambda m: self.log(self.clone_log, m),

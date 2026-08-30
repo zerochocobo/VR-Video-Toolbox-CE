@@ -283,6 +283,12 @@ def save_rows(video: str | Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
             seg["end"] = float(row.get("end"))
         if row.get("src_text") is not None:
             seg["src_text"] = row.get("src_text") or ""
+        # Diarization mixes up who is speaking, most visibly between a man and
+        # a woman in the same exchange, and the wrong label sends the line to
+        # the wrong voice. The proofread pass is where that gets corrected, so
+        # the choice has to survive back into the manifest.
+        if row.get("speaker") is not None and str(row.get("speaker") or "").strip():
+            seg["speaker"] = str(row["speaker"]).strip()
         try:
             seg_id_int = int(seg_id)
         except Exception:
@@ -290,10 +296,24 @@ def save_rows(video: str | Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
         if seg_id_int is not None:
             if row.get("_merged_ids"):
                 edited_ids.append(seg_id_int)
-            # A deliberately emptied line (now, or carried over from an earlier
-            # proofread) must not look "untranslated" to ensure_translated,
-            # otherwise export would re-translate the whole video and wipe edits.
-            if not new_text and (seg.get("src_text") or "").strip() and (old_text or seg_id_int in prev_cleared):
+            # A line left without target text -- emptied here, carried over
+            # from an earlier proofread, or one the translator itself gave up
+            # on -- must not look "untranslated" to ensure_translated.
+            #
+            # That last case is why the third clause exists. Saving a proofread
+            # removes the "no proofread key means the old translated.srt counts
+            # as complete" escape hatch, so from then on a single line the
+            # translator left blank (ipvr-385 part1 had five, all of them ASR
+            # fragments it could make nothing of) declared the whole video
+            # untranslated on every export. run_translate begins by blanking
+            # every tgt_text, so that did not merely waste an API call: it
+            # threw away the edits that had just been saved.
+            translation_ran = any(
+                (item.get("tgt_text") or "").strip() for item in segments
+            )
+            if not new_text and (seg.get("src_text") or "").strip() and (
+                old_text or seg_id_int in prev_cleared or translation_ran
+            ):
                 cleared_ids.add(seg_id_int)
             if new_text != old_text:
                 edited_ids.append(seg_id_int)
@@ -334,27 +354,46 @@ def save_rows(video: str | Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def cut_segment_preview(video: str | Path, start: float, end: float, *, pad: float = 0.2) -> Path:
-    """Cut [start-pad, end+pad] from the intermediate audio16k.wav for audition.
+def cloned_track_path(video: str | Path) -> Path | None:
+    """The finished cloned track, if this video has been exported already.
 
-    Rewrites one shared preview file per video; the caller must stop any
-    playback that still holds the previous clip before calling this.
+    Auditioning the clone against the original needs no generation: export
+    already wrote the whole dub to <video>.si.wav, so the same slice of it that
+    a row occupies is the cloned reading of that row.
+    """
+    from tool_si import logic as si
+
+    path = Path(si.default_si_audio_path(str(video)))
+    return path if path.is_file() else None
+
+
+def cut_segment_preview(video: str | Path, start: float, end: float, *,
+                        pad: float = 0.2, tail_pad: float | None = None,
+                        source: str | Path | None = None,
+                        out_name: str = "pf_preview.wav") -> Path:
+    """Cut [start-pad, end+tail_pad] from ``source`` for audition.
+
+    Defaults to the intermediate audio16k.wav -- the original. Rewrites one
+    shared preview file per source; the caller must stop any playback that
+    still holds the previous clip before calling this.
     """
     import soundfile as sf
 
     cdir = logic.clone_dir(video)
-    src = cdir / logic.AUDIO16K_NAME
+    src = Path(source) if source is not None else cdir / logic.AUDIO16K_NAME
+    if tail_pad is None:
+        tail_pad = pad
     if not src.is_file():
         raise FileNotFoundError(f"Intermediate audio missing: {src}")
     with sf.SoundFile(str(src)) as f:
         sr = int(f.samplerate)
         begin = max(0, int((float(start) - pad) * sr))
-        stop = min(int(f.frames), int((float(end) + pad) * sr))
+        stop = min(int(f.frames), int((float(end) + tail_pad) * sr))
         if stop <= begin:
             raise ValueError(f"Empty segment range: {start}..{end}")
         f.seek(begin)
         data = f.read(stop - begin)
-    out = cdir / "pf_preview.wav"
+    out = cdir / out_name
     sf.write(str(out), data, sr)
     return out
 

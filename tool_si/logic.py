@@ -130,6 +130,18 @@ SI_DUCK_PRESETS = {
     "strongest": {"threshold": "0.005", "ratio": "20", "release": "1000"},
 }
 SI_DUCK_ATTACK_MS = "30"
+# Band ducking: push down only the frequencies that carry the original voice,
+# and leave the room tone either side of them alone. Measured on HNVR-174 over
+# a 30s window, speech against the gaps between it:
+#   50-80 Hz    +0.5 dB voice, 12.8% of the background  -> keep, it is the room
+#   80-300 Hz   +12..17 dB voice, ~10% of the background -> the male fundamental
+#   300-400 Hz  +5.0 dB voice, 41.4% of the background   -> cutting it costs most
+#   400-8000 Hz +7..19 dB voice, ~3% of the background
+# Cutting 300-400 along with the rest costs only 0.2 dB more background, and in
+# a listening test it was the difference between "a distant voice you can still
+# make out" and inaudible -- so the ducked band is one span, not two.
+SI_DUCK_BAND_LOW_HZ = 80.0
+SI_DUCK_BAND_HIGH_HZ = 8000.0
 SI_DUCK_MAKEUP = "1"
 MAX_SUBTITLE_ENTRY_DURATION = 300.0
 MAX_SUBTITLE_TIMECODE_SECONDS = 6 * 60 * 60
@@ -525,6 +537,36 @@ def _duck_compressor(preset: str = DEFAULT_DUCK_PRESET) -> str:
     )
 
 
+def _duck_stage(compressor: str, duck_band: bool) -> str:
+    """Graph from ``[orig_base]`` + ``[si_key]`` to ``[orig]``.
+
+    Broadband ducking gives up a dB of background for every dB it takes off the
+    original voice. Band ducking splits the original in three, ducks only the
+    middle, and sums them back, so the room tone below and above the voice
+    survives.
+    """
+    if not duck_band:
+        return "[orig_base][si_key]sidechaincompress=" + compressor + "[orig];"
+    low, high = _filter_number(SI_DUCK_BAND_LOW_HZ), _filter_number(SI_DUCK_BAND_HIGH_HZ)
+    # Cascaded, not single: a 12 dB/oct crossover at 80 Hz leaves the low branch
+    # only 12 dB down at 160 Hz, so it passes the male fundamental through
+    # un-ducked and caps suppression there at about 10 dB. Measured through
+    # ffmpeg, one pair of stages gave -9.6 dB on 80-300 Hz where the offline
+    # reference reached -23.9. Three stages put the corner where the numbers
+    # say it should be.
+    lo_chain = ",".join([f"lowpass=f={low}:poles=2"] * 3)
+    hi_edge = ",".join([f"highpass=f={low}:poles=2"] * 3)
+    return (
+        "[orig_base]asplit=3[duck_lo][duck_mid][duck_hi];"
+        f"[duck_lo]{lo_chain}[duck_lo_out];"
+        f"[duck_hi]highpass=f={high}:poles=2[duck_hi_out];"
+        f"[duck_mid]{hi_edge},lowpass=f={high}:poles=2[duck_mid_band];"
+        f"[duck_mid_band][si_key]sidechaincompress={compressor}[duck_mid_out];"
+        "[duck_lo_out][duck_mid_out][duck_hi_out]"
+        "amix=inputs=3:duration=first:dropout_transition=0:normalize=0[orig];"
+    )
+
+
 def build_si_mix_filter(
     mix_channel: str,
     original_volume_percent: int | float,
@@ -533,6 +575,7 @@ def build_si_mix_filter(
     duck_original: bool = False,
     duck_preset: str = DEFAULT_DUCK_PRESET,
     duck_key_input: bool = False,
+    duck_band: bool = False,
 ) -> str:
     channel = _validate_si_mix_channel(mix_channel)
     original_volume = _filter_number(_validate_original_volume(original_volume_percent) / 100.0)
@@ -550,7 +593,7 @@ def build_si_mix_filter(
                     "[2:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=mono,apad[si_key];"
                     "[1:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=mono,"
                     f"adelay={si_delay_ms},volume={si_volume},apad[si_mono];"
-                    f"[orig_base][si_key]sidechaincompress={compressor}[orig];"
+                    f"{_duck_stage(compressor, duck_band)}"
                     "[si_mono]aformat=channel_layouts=stereo[si];"
                     "[orig][si]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
                     "alimiter=limit=0.95[si_track]"
@@ -560,7 +603,7 @@ def build_si_mix_filter(
                 f"volume={original_volume}[orig_base];"
                 "[1:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=mono,"
                 f"adelay={si_delay_ms},volume={si_volume},apad,asplit=2[si_key][si_mono];"
-                f"[orig_base][si_key]sidechaincompress={compressor}[orig];"
+                f"{_duck_stage(compressor, duck_band)}"
                 "[si_mono]aformat=channel_layouts=stereo[si];"
                 "[orig][si]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
                 "alimiter=limit=0.95[si_track]"
@@ -595,7 +638,7 @@ def build_si_mix_filter(
                 "[2:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=mono,apad[si_key];"
                 "[1:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=mono,"
                 f"adelay={si_delay_ms},volume={si_volume},apad[si];"
-                f"[orig_base][si_key]sidechaincompress={compressor}[orig];"
+                f"{_duck_stage(compressor, duck_band)}"
                 "[orig]channelsplit=channel_layout=stereo[ol][or];"
                 f"{mix_part}"
             )
@@ -604,7 +647,7 @@ def build_si_mix_filter(
             f"volume={original_volume}[orig_base];"
             "[1:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=mono,"
             f"adelay={si_delay_ms},volume={si_volume},apad,asplit=2[si_key][si];"
-            f"[orig_base][si_key]sidechaincompress={compressor}[orig];"
+            f"{_duck_stage(compressor, duck_band)}"
             "[orig]channelsplit=channel_layout=stereo[ol][or];"
             f"{mix_part}"
         )
@@ -678,6 +721,7 @@ def build_si_audio_mix_command(
     add_independent_track: bool = False,
     duck_original: bool = False,
     duck_preset: str = DEFAULT_DUCK_PRESET,
+    duck_band: bool = False,
     duck_key_path: str | os.PathLike[str] | None = None,
 ) -> list[str]:
     if audio_stream_count is not None and audio_stream_count < 1:
@@ -691,6 +735,7 @@ def build_si_audio_mix_command(
         duck_original=duck_original,
         duck_preset=duck_preset,
         duck_key_input=duck_original and duck_key_path is not None,
+        duck_band=duck_band,
     )
     cmd = [
         "ffmpeg",
@@ -810,6 +855,7 @@ def mix_si_audio_track(
     add_independent_track: bool = False,
     duck_original: bool = False,
     duck_preset: str = DEFAULT_DUCK_PRESET,
+    duck_band: bool = False,
     use_duck_key: bool = True,
     duck_key_path: str | os.PathLike[str] | None = None,
     log_callback: LogCallback = print,
@@ -860,6 +906,7 @@ def mix_si_audio_track(
         add_independent_track=add_independent_track,
         duck_original=duck_original,
         duck_preset=duck_preset,
+        duck_band=duck_band,
         duck_key_path=effective_duck_key,
     )
     log_callback(f"Executing: {_format_command_for_log(cmd)}")
@@ -921,6 +968,7 @@ def batch_mix_si_audio_tracks(
     add_independent_track: bool = False,
     duck_original: bool = False,
     duck_preset: str = DEFAULT_DUCK_PRESET,
+    duck_band: bool = False,
     use_duck_key: bool = True,
     log_callback: LogCallback = print,
     stop_event: Event | None = None,
@@ -947,6 +995,7 @@ def batch_mix_si_audio_tracks(
             add_independent_track=add_independent_track,
             duck_original=duck_original,
             duck_preset=duck_preset,
+            duck_band=duck_band,
             use_duck_key=use_duck_key,
             duck_key_path=task.duck_key_path,
             log_callback=log_callback,

@@ -1214,22 +1214,11 @@ class ClonevoiceToolsApp:
         ttk.Entry(self.mix_batch_dir_row, textvariable=self.mix_dir_var).grid(row=0, column=1, sticky="ew")
         ttk.Button(self.mix_batch_dir_row, text=get_text("btn_browse"), command=self._browse_mix_dir).grid(row=0, column=2, sticky="ew", padx=(6, 0))
 
-        mode_frame = ttk.Frame(frame)
-        mode_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 6))
-        ttk.Label(mode_frame, text=get_text("lbl_mode")).pack(side="left", padx=(0, 8))
-        self.single_mix_mode_var = tk.StringVar(value="si")
-        ttk.Radiobutton(
-            mode_frame, text=get_text("opt_mode_si"), variable=self.single_mix_mode_var,
-            value="si", command=self._on_single_mix_mode_change,
-        ).pack(side="left", padx=(0, 12))
-        dub_ok = self._dubbing_available()
-        ttk.Radiobutton(
-            mode_frame, text=get_text("opt_mode_dub") if dub_ok else get_text("opt_mode_dub_wip"),
-            variable=self.single_mix_mode_var, value="dub",
-            state="normal" if dub_ok else "disabled",
-            command=self._on_single_mix_mode_change,
-        ).pack(side="left")
-
+        # No mode selector: dubbing is withdrawn here for the same reason as in
+        # v2. Bandit could not remove this material's dialogue -- measured over
+        # HNVR-174, 279 of 369 lines came back within 3 dB of the original --
+        # so the "background bed" still carried the speech it was meant to
+        # replace. Ducking the original is the only mode.
         options = ttk.Frame(frame)
         self.single_mix_opts_frame = options
         self._single_mix_channel_map = {
@@ -3613,16 +3602,6 @@ class ClonevoiceToolsApp:
 
         threading.Thread(target=task, daemon=True).start()
 
-    def _dubbing_available(self) -> bool:
-        # Mirror tool_clonevoice.separate.is_available() without importing it.
-        # Importing separate pulls in torch/torchaudio/Bandit/librosa and can
-        # make the launcher click feel frozen in the packaged build.
-        bandit_dir = os.path.join(self.models_root, "bandit-v2")
-        return (
-            os.path.isfile(os.path.join(bandit_dir, "checkpoint-multi.slim.pt"))
-            or os.path.isfile(os.path.join(bandit_dir, "checkpoint-multi.ckpt"))
-        )
-
     def _browse_mix_dir(self):
         d = filedialog.askdirectory()
         if d:
@@ -3645,9 +3624,7 @@ class ClonevoiceToolsApp:
 
     def _run_single_mix(self):
         from tool_si import logic as sl
-        from tool_clonevoice import dubbing as dub
 
-        dubbing = self.single_mix_mode_var.get() == "dub"
         batch_mode = self.mix_input_mode_var.get() == "batch"
         if batch_mode:
             base = self.mix_dir_var.get().strip()
@@ -3663,11 +3640,7 @@ class ClonevoiceToolsApp:
             if not si_audio_path or not os.path.isfile(si_audio_path):
                 messagebox.showerror("Error", i18n.translate("si", "err_si_wav_file"))
                 return
-            output_path = (
-                dub.default_dub_output_path(video_path)
-                if dubbing
-                else sl.default_si_mix_output_path(video_path)
-            )
+            output_path = sl.default_si_mix_output_path(video_path)
             if os.path.abspath(video_path) == os.path.abspath(output_path):
                 messagebox.showerror("Error", i18n.translate("si", "err_mix_output_file"))
                 return
@@ -3677,17 +3650,17 @@ class ClonevoiceToolsApp:
             ):
                 return
 
-        channel = "both" if dubbing else self._single_mix_channel_map.get(self.single_mix_channel_var.get(), "left")
+        channel = self._single_mix_channel_map.get(self.single_mix_channel_var.get(), "left")
         orig_vol = int(self.single_mix_origvol_var.get().rstrip("%"))
         si_vol = int(self.single_mix_sivol_var.get().rstrip("%"))
-        delay = 0.0 if dubbing else float(self.single_mix_delay_var.get().rstrip("s"))
+        delay = float(self.single_mix_delay_var.get().rstrip("s"))
         indep = self.single_mix_indep_var.get()
-        duck = False if dubbing else self.single_mix_duck_var.get()
+        duck = self.single_mix_duck_var.get()
         duck_preset = self._single_mix_duck_preset_map.get(
             self.single_mix_duck_preset_var.get(),
             sl.DEFAULT_DUCK_PRESET,
         )
-        use_duck_key = False if dubbing else self.single_mix_duck_key_var.get()
+        use_duck_key = self.single_mix_duck_key_var.get()
 
         self.single_mix_stop_event.clear()
         self.single_mix_btn_start.config(state="disabled")
@@ -3695,12 +3668,6 @@ class ClonevoiceToolsApp:
 
         def task():
             try:
-                if dubbing:
-                    self._run_dub_task(batch_mode, base if batch_mode else video_path,
-                                       None if batch_mode else si_audio_path,
-                                       None if batch_mode else output_path,
-                                       indep)
-                    return
                 if batch_mode:
                     sl.batch_mix_si_audio_tracks(
                         base_dir=base,
@@ -3746,51 +3713,6 @@ class ClonevoiceToolsApp:
         self.single_mix_thread = threading.Thread(target=task, daemon=True)
         self.single_mix_thread.start()
 
-    def _run_dub_task(self, batch_mode, target, si_audio_path, output_path, add_independent_track):
-        """Dubbing mode: separate original dialogue (bandit-v2) and replace it
-        with the cloned voice. The separator stays resident in VRAM across a
-        batch (no OmniVoice runs concurrently here)."""
-        from tool_clonevoice import dubbing as dub
-
-        log = lambda m: self.log(self.single_mix_log, m)
-        proc = lambda p: setattr(self, "single_mix_proc", p)
-        # Dubbing fixes both channels / 100% voice / 0 s delay; the cloned track
-        # is already aligned to the source timeline, so no delay or channel split.
-        # Route bandit-v2's progress bar (tqdm to stderr) into the GUI log.
-        with redirect_stdio(self._make_log_emitter(self.single_mix_log)):
-            if batch_mode:
-                dub.batch_dub_videos(
-                    base_dir=target,
-                    models_root=self.models_root,
-                    background_volume_percent=100,
-                    voice_volume_percent=100,
-                    add_independent_track=add_independent_track,
-                    log_callback=log,
-                    stop_event=self.single_mix_stop_event,
-                    process_callback=proc,
-                )
-                if not self.single_mix_stop_event.is_set():
-                    self.log(self.single_mix_log, get_text("msg_mix_done"))
-                return
-            separator = dub.BanditSeparator(self.models_root, log=log)
-            try:
-                output = dub.dub_video(
-                    video_path=target,
-                    si_audio_path=si_audio_path,
-                    output_path=output_path,
-                    separator=separator,
-                    background_volume_percent=100,
-                    voice_volume_percent=100,
-                    add_independent_track=add_independent_track,
-                    log_callback=log,
-                    stop_event=self.single_mix_stop_event,
-                    process_callback=proc,
-                )
-            finally:
-                separator.close()
-            if not self.single_mix_stop_event.is_set():
-                self.log(self.single_mix_log, get_text("msg_mix_done").format(output))
-
     def _stop_single_mix(self):
         from tool_si import logic as sl
 
@@ -3818,19 +3740,6 @@ class ClonevoiceToolsApp:
     def _selected_target_language(self) -> str:
         return self._tgt_map.get(self.tgt_lang_var.get(), "Chinese")
 
-    def _on_single_mix_mode_change(self):
-        dubbing = self.single_mix_mode_var.get() == "dub"
-        if dubbing:
-            self.single_mix_channel_var.set(get_text("opt_channel_both"))
-            self.single_mix_delay_var.set("0s")
-            for widget in self.single_mix_si_option_widgets:
-                widget.grid_remove()
-        else:
-            for widget in self.single_mix_si_option_widgets:
-                widget.grid()
-            self.single_mix_opts_frame.grid()
-
-    # --- helpers ---
     def log(self, text_widget, message):
         def _log():
             text_widget.config(state="normal")

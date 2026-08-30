@@ -6,7 +6,7 @@
   "ui_theme": "light",
   "dlna_server_name": "VR Video Server",
   "dlna_port": 8099,
-  "dlna_video_dirs": "G:\\Downloads|G:\\Downloads\\VR\\VR110|G:\\GIT\\debug\\VR_Video_Toolbox_NE\\videos|Y:\\",
+  "dlna_video_dirs": "G:\\Downloads|Y:\\|F:\\VR\\VR",
   "dlna_auto_subtitles": true,
   "dlna_si_enabled": true,
   "dlna_si_mix_channel": "both",

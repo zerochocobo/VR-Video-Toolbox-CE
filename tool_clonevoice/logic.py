@@ -155,8 +155,13 @@ def _split_on_word_gaps(start: float, end: float, text: str, words: list, max_ga
         # lines 1/2/11 lost 0.3-0.4s of speech to the old clamp, audibly
         # truncating the dub).
         w_start, w_end = float(words[0]["start"]), float(words[-1]["end"])
+        # A bound may sit outside the word extent, never inside it: a slot that
+        # starts after its own first word cannot hold the line. Only the
+        # outward direction is a judgement call, so only it consults the slack.
         keep_start = start if abs(start - w_start) <= WORD_EXTENT_SLACK else w_start
         keep_end = end if abs(end - w_end) <= WORD_EXTENT_SLACK else w_end
+        keep_start = min(keep_start, w_start)
+        keep_end = max(keep_end, w_end)
         return [{"start": keep_start, "end": keep_end, "text": text, "words": words}]
     subs = []
     for g in groups:

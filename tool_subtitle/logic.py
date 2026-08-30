@@ -184,6 +184,14 @@ HALLUCINATION_PHRASES = {
     "次回の動画でお会いしましょう",
     "字幕by",
     "字幕バイ",
+    # YouTube's community-subtitle credit, which Whisper emits over the music
+    # of an opening title card. Seen on HNVR-174 at 23.6-39.0s, where the audio
+    # is scene ambience at the same level as real dialogue, so no energy or
+    # confidence gate can tell it apart -- only the words give it away.
+    "この動画の字幕は視聴者の方によって作成されました",
+    "この動画の字幕は視聴者によって作成されました",
+    "字幕は視聴者の方によって作成されました",
+    "字幕提供",
 }
 SHORT_HALLUCINATION_PHRASES = {
     "今日はこの辺で",
@@ -1831,7 +1839,8 @@ class SubtitleGenerator:
         ]
         def word_dicts(piece_words: list) -> list:
             # Absolute-time word list; kept on every entry so duration-aligned
-            # consumers (tool_clonevoice dubbing) get per-word timing for free.
+            # consumers (the clone tools' slot fitting and speaker splitting)
+            # get per-word timing for free.
             return [
                 {"word": text, "start": offset + start, "end": offset + end}
                 for start, end, text in piece_words
@@ -1912,6 +1921,14 @@ class SubtitleGenerator:
             # outro (視聴ありがとうございました, mdvr-433 #2 entry 18); a norm
             # that is nearly the whole phrase is the same hallucination.
             if len(norm) >= max(6, len(phrase) - 2) and norm in phrase:
+                return True
+            # ...and sometimes it emits the phrase across two entries, cut at a
+            # decode-chunk boundary, so the first entry is a PREFIX of it. Only
+            # a prefix: "ありがとうございます" is a 77% substring of
+            # "ご視聴ありがとうございます" and an entirely ordinary thing to say,
+            # while nothing ordinary begins with most of a stock credit.
+            if (len(phrase) >= 12 and len(norm) >= 12
+                    and len(norm) >= 0.7 * len(phrase) and phrase.startswith(norm)):
                 return True
 
         if norm in SHORT_HALLUCINATION_NORMS:
@@ -2944,7 +2961,7 @@ def split_into_chunks(entries: dict, limit: int) -> list[dict]:
         chunks.append(current)
     return chunks
 
-def sequential_ids(chunk: dict) -> tuple[str, dict]:
+def sequential_ids(chunk: dict, budgets: dict | None = None) -> tuple[str, dict]:
     """Tag entries with sequential ids (1..n, playback order).
 
     Sequential tags keep the "these lines are consecutive dialogue" signal for
@@ -2956,7 +2973,12 @@ def sequential_ids(chunk: dict) -> tuple[str, dict]:
     lines = []
     for seq, (orig_id, text) in enumerate(chunk.items(), start=1):
         mapping[seq] = orig_id
-        lines.append(f"<{seq}>{text}</{seq}>")
+        # ``budgets`` carries a per-line attribute string (the clone tools pass
+        # the measured seconds and the character budget that fits them). With no
+        # budgets the tag is byte-for-byte what it has always been.
+        attrs = (budgets or {}).get(orig_id, "")
+        open_tag = f"<{seq} {attrs}>" if attrs else f"<{seq}>"
+        lines.append(f"{open_tag}{text}</{seq}>")
     return "\n".join(lines), mapping
 
 _TAG_PAIR = re.compile(r"<(\d+)>(.*?)</\d+>", re.DOTALL | re.MULTILINE)
@@ -3001,8 +3023,13 @@ def _strip_adult_background(template: str) -> str:
     # Remove Content Background section up to "--------" separator
     return re.sub(r'Content Background:.*?(?=-{5,})', '', template, flags=re.DOTALL)
 
-def _load_prompt_template(adult_content: bool = True, dubbing_optimized: bool = False) -> str:
-    prompt_name = "translate_prompt_dubbing.txt" if dubbing_optimized else "translate_prompt.txt"
+def _load_prompt_template(adult_content: bool = True, dubbing_optimized: bool = False,
+                          prompt_name: str | None = None) -> str:
+    """Load a translation prompt. ``prompt_name`` overrides the pair below, so a
+    caller with its own prompt (the clone tools' duration-budget one) can use it
+    without changing which prompt anyone else gets."""
+    if prompt_name is None:
+        prompt_name = "translate_prompt_dubbing.txt" if dubbing_optimized else "translate_prompt.txt"
     prompt_file = os.path.join(get_config_dir(), prompt_name)
     template = DEFAULT_PROMPT
     if os.path.isfile(prompt_file):
@@ -3061,8 +3088,8 @@ def _with_context(missing_ids: list, pool: dict, before: int = 2, after: int = 1
 
 def _llm_chunk_pass(client: LLMClient, chunk: dict, template: str, placeholders: dict,
                     max_retries: int, log_callback, stop_event,
-                    sparse_output: bool = False) -> dict:
-    tagged, mapping = sequential_ids(chunk)
+                    sparse_output: bool = False, budgets: dict | None = None) -> dict:
+    tagged, mapping = sequential_ids(chunk, budgets)
     results = {}
 
     for attempt in range(1, max_retries + 1):
@@ -3129,7 +3156,8 @@ def _llm_chunk_pass(client: LLMClient, chunk: dict, template: str, placeholders:
 
 def _run_entries_llm(client: LLMClient, entries: dict, template: str, placeholders: dict,
                      tokens_per_chunk: int, max_retries: int, log_callback, stop_event,
-                     label: str = "Translating", sparse_output: bool = False) -> dict:
+                     label: str = "Translating", sparse_output: bool = False,
+                     budgets: dict | None = None) -> dict:
     """Run one LLM pass over all entries, returning {sid: response_text}."""
     chunks = split_into_chunks(entries, tokens_per_chunk)
     log_callback(f"[INFO] Total chunks: {len(chunks)}")
@@ -3144,7 +3172,7 @@ def _run_entries_llm(client: LLMClient, entries: dict, template: str, placeholde
         log_callback(f"[INFO] {label} chunk {idx + 1}/{len(chunks)} ({len(chunk)} entries)...")
         result = _llm_chunk_pass(
             client, chunk, template, placeholders, max_retries, log_callback,
-            stop_event, sparse_output=sparse_output,
+            stop_event, sparse_output=sparse_output, budgets=budgets,
         )
 
         if not sparse_output and not result and len(chunk) > 1:
@@ -3154,7 +3182,8 @@ def _run_entries_llm(client: LLMClient, entries: dict, template: str, placeholde
                 if stop_event and stop_event.is_set():
                     break
                 log_callback(f"  [INFO] Retrying {half_label} half ({len(half)} entries)...")
-                half_result = _llm_chunk_pass(client, half, template, placeholders, max_retries, log_callback, stop_event)
+                half_result = _llm_chunk_pass(client, half, template, placeholders, max_retries,
+                                              log_callback, stop_event, budgets=budgets)
                 all_results.update(half_result)
         else:
             all_results.update(result)
@@ -3168,13 +3197,16 @@ def _target_expects_kana(lang: str) -> bool:
 
 def translate_entries(client: LLMClient, entries: dict, lang: str,
                       tokens_per_chunk: int, keep_original: bool, adult_content: bool,
-                      dubbing_optimized: bool, max_retries: int, log_callback, stop_event) -> dict:
+                      dubbing_optimized: bool, max_retries: int, log_callback, stop_event,
+                      budgets: dict | None = None, prompt_name: str | None = None) -> dict:
+    """``budgets`` and ``prompt_name`` serve callers that give the model a
+    per-line time budget; omitted, this behaves exactly as it always has."""
     _set_phase(client, "AI translate")
-    template = _load_prompt_template(adult_content, dubbing_optimized)
+    template = _load_prompt_template(adult_content, dubbing_optimized, prompt_name)
     all_translated = _run_entries_llm(
         client, entries, template, {"target_language": lang},
         tokens_per_chunk, max_retries, log_callback, stop_event,
-        label="Translating",
+        label="Translating", budgets=budgets,
     )
 
     # Kana-leak backstop: on garbled ASR fragments the model tends to echo the
@@ -3236,6 +3268,56 @@ _STOCK_PHRASE_NORMS = (
     | SHORT_HALLUCINATION_NORMS
     | {re.sub(r"[、。！？!?….\s]+", "", p).lower() for p in _STOCK_HALLUCINATION_EXTRA}
 )
+
+def drop_split_stock_phrases(entries: list, text_key: str = "text",
+                             max_run: int = 4, log_callback=None) -> list:
+    """Drop runs of consecutive lines that together spell a stock hallucination.
+
+    The decoder sometimes emits one stock phrase across several entries. On
+    HNVR-174 the YouTube subtitle credit arrived as "この動画の字幕は視聴者の方
+    によって作成" + "されました。": the first half is recognisable on its own,
+    the second is an ordinary Japanese ending that no per-line rule may touch.
+    Only the two together give it away, so the run has to be matched as a whole.
+
+    Returns the entries that survive, in order.
+    """
+    if not entries:
+        return entries
+    def norm_of(item) -> str:
+        return SubtitleGenerator.normalize_for_duplicate(str(item.get(text_key) or ""))
+    drop: set[int] = set()
+    index = 0
+    while index < len(entries):
+        if index in drop:
+            index += 1
+            continue
+        joined = ""
+        matched_end = None
+        for end in range(index, min(index + max_run, len(entries))):
+            joined += norm_of(entries[end])
+            if not joined:
+                continue
+            for phrase in _STOCK_PHRASE_NORMS:
+                # Only long phrases: a short one could be a real line, and a
+                # run of real lines could reach it by accident.
+                if len(phrase) < 12:
+                    continue
+                if joined == phrase or (len(joined) >= 0.9 * len(phrase) and joined in phrase):
+                    matched_end = end
+                    break
+            if matched_end is not None and joined == phrase:
+                break
+        if matched_end is not None and matched_end > index:
+            drop.update(range(index, matched_end + 1))
+            if log_callback:
+                text = " / ".join(str(entries[i].get(text_key) or "") for i in range(index, matched_end + 1))
+                log_callback(f"[hallucination] dropped {matched_end - index + 1} line(s) "
+                             f"spelling a stock phrase: {text[:60]}")
+            index = matched_end + 1
+            continue
+        index += 1
+    return [item for i, item in enumerate(entries) if i not in drop]
+
 
 def _deletable_interjection(text: str) -> bool:
     norm = SubtitleGenerator.normalize_for_duplicate(text)

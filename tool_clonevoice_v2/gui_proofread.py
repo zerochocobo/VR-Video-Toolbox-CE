@@ -180,6 +180,7 @@ class ProofreadDialog(tk.Toplevel):
 
         self._build_hint()
         self._build_tree()
+        self.speaker_hint_var = tk.StringVar()
         self._build_editor()
         self._build_actions()
         self._populate_tree()
@@ -264,16 +265,81 @@ class ProofreadDialog(tk.Toplevel):
         self.tgt_text.grid(row=row, column=1, sticky="ew", pady=2)
         self.tgt_text.bind("<Control-Return>", self._commit_and_next)
         self.tgt_text.bind("<Control-Down>", self._commit_and_next)
+        if self.show_speaker:
+            row += 1
+            speaker_row = ttk.Frame(editor)
+            speaker_row.grid(row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
+            ttk.Label(speaker_row, text=get_text("col_pf_speaker")).pack(side="left", padx=(0, 6))
+            self.speaker_var = tk.StringVar()
+            self.speaker_combo = ttk.Combobox(
+                speaker_row, textvariable=self.speaker_var, state="readonly", width=16,
+                values=self._known_speakers(),
+            )
+            self.speaker_combo.pack(side="left")
+            # Applies to the whole selection: diarization usually flips a run of
+            # lines in one exchange, not a single one, so fixing them one at a
+            # time would be the wrong unit of work.
+            ttk.Button(
+                speaker_row, text=get_text("btn_pf_set_speaker"),
+                command=self.apply_speaker_to_selection,
+            ).pack(side="left", padx=(6, 0))
+            ttk.Label(
+                speaker_row, textvariable=self.speaker_hint_var, foreground="dim gray"
+            ).pack(side="left", padx=(8, 0))
+        else:
+            self.speaker_var = None
+            self.speaker_combo = None
         buttons = ttk.Frame(editor)
-        buttons.grid(row=row, column=2, sticky="nsw", padx=(6, 0))
+        buttons.grid(row=0, column=2, rowspan=row + 1, sticky="nsw", padx=(6, 0))
         self.btn_apply_row = ttk.Button(buttons, text=get_text("btn_apply_ref_row"), command=self.apply_ref_row)
         self.btn_apply_row.pack(fill="x", pady=(0, 4))
         self.btn_revert_row = ttk.Button(buttons, text=get_text("btn_revert_row"), command=self.revert_row)
         self.btn_revert_row.pack(fill="x")
         self.btn_play_source = ttk.Button(buttons, text=get_text("btn_pf_play_source"), command=self.play_row_source)
         self.btn_play_source.pack(fill="x", pady=(4, 0))
+        # Deliberately not greyed out before an export exists: a disabled button
+        # explains nothing. Clicking it says what it is for instead.
+        self.btn_play_cloned = ttk.Button(
+            buttons, text=get_text("btn_pf_play_cloned"), command=self.play_row_cloned
+        )
+        self.btn_play_cloned.pack(fill="x", pady=(4, 0))
         if not self.has_reference:
             self.btn_apply_row.pack_forget()
+
+    def _known_speakers(self) -> list[str]:
+        """Every speaker this video actually has, in a stable order.
+
+        Taken from the rows rather than the manifest's speakers map, which is
+        empty whenever diarization was skipped.
+        """
+        seen: list[str] = []
+        for row in self.rows:
+            name = str(row.get("speaker") or "").strip()
+            if name and name not in seen:
+                seen.append(name)
+        return sorted(seen)
+
+    def apply_speaker_to_selection(self) -> None:
+        if not self.show_speaker or self.speaker_var is None:
+            return
+        name = (self.speaker_var.get() or "").strip()
+        if not name:
+            return
+        self._commit_editor()
+        changed = 0
+        for iid in self.tree.selection():
+            row = self._row(iid)
+            if row is None or row.get("kind") != "seg":
+                continue
+            if str(row.get("speaker") or "") == name:
+                continue
+            row["speaker"] = name
+            self._refresh_tree_row(iid)
+            changed += 1
+        self.speaker_hint_var.set(
+            get_text("msg_pf_speaker_applied").format(changed, name) if changed else ""
+        )
+        self._refresh_modified_count()
 
     def _build_actions(self) -> None:
         actions = ttk.Frame(self)
@@ -468,6 +534,11 @@ class ProofreadDialog(tk.Toplevel):
             # missed is exactly what they are shown for.
             has_span = (row.get("end") or 0.0) > (row.get("start") or 0.0)
             self.btn_play_source.config(state="normal" if has_span else "disabled")
+            self.btn_play_cloned.config(state="normal" if has_span else "disabled")
+            if self.show_speaker and self.speaker_var is not None:
+                self.speaker_var.set(str(row.get("speaker") or ""))
+                self.speaker_combo.config(state="readonly" if not readonly else "disabled")
+                self.speaker_hint_var.set("")
         finally:
             self.loading = False
 
@@ -621,6 +692,35 @@ class ProofreadDialog(tk.Toplevel):
             winsound.PlaySound(None, 0)
             clip = proofread.cut_segment_preview(
                 self.video, float(row.get("start") or 0.0), float(row.get("end") or 0.0)
+            )
+            winsound.PlaySound(str(clip), winsound.SND_FILENAME | winsound.SND_ASYNC)
+        except Exception as exc:
+            messagebox.showerror("Error", get_text("err_pf_play_failed").format(exc), parent=self)
+
+    def play_row_cloned(self) -> None:
+        row = self._row()
+        if row is None:
+            return
+        # Resolved per click rather than at construction: the export that
+        # creates it may well have happened since this dialog was opened.
+        cloned = proofread.cloned_track_path(self.video)
+        if cloned is None:
+            messagebox.showinfo(
+                "Info", get_text("msg_pf_no_cloned_yet"), parent=self
+            )
+            return
+        try:
+            import winsound
+
+            winsound.PlaySound(None, 0)
+            # A generous tail: the dub is allowed to run past its slot into the
+            # silence behind it, so cutting at `end` would clip the line short
+            # and make a correct rendition sound truncated.
+            clip = proofread.cut_segment_preview(
+                self.video,
+                float(row.get("start") or 0.0), float(row.get("end") or 0.0),
+                tail_pad=1.5, source=cloned,
+                out_name="pf_preview_cloned.wav",
             )
             winsound.PlaySound(str(clip), winsound.SND_FILENAME | winsound.SND_ASYNC)
         except Exception as exc:

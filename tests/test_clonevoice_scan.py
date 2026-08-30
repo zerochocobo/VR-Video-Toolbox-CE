@@ -23,19 +23,14 @@ class ClonevoiceBatchScanTests(unittest.TestCase):
 
         self.assertEqual([Path(path).name for path in videos], ["movie.mkv", "movie.mp4"])
 
-    def test_dubbing_available_does_not_import_separator_backend(self) -> None:
-        sys.modules.pop("tool_clonevoice.separate", None)
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            models_root = Path(tmp_dir)
-            bandit_dir = models_root / "bandit-v2"
-            bandit_dir.mkdir()
-            (bandit_dir / "checkpoint-multi.slim.pt").write_bytes(b"weights")
-            obj = type("Obj", (), {"models_root": str(models_root)})()
-
-            available = ClonevoiceToolsApp._dubbing_available(obj)
-
-        self.assertTrue(available)
-        self.assertNotIn("tool_clonevoice.separate", sys.modules)
+    def test_the_dubbing_mode_is_gone(self) -> None:
+        """This used to guard a lazy import: _dubbing_available checked the
+        checkpoint paths by hand so clicking the tab would not drag in
+        torch/Bandit. Both the method and the separator module are gone with
+        the dubbing mode, so the guard has nothing left to protect."""
+        self.assertFalse(hasattr(ClonevoiceToolsApp, "_dubbing_available"))
+        self.assertFalse(Path("tool_clonevoice/separate.py").exists())
+        self.assertFalse(Path("tool_clonevoice/dubbing.py").exists())
 
     def test_translation_api_key_configured_accepts_saved_key(self) -> None:
         fake_keyring = types.SimpleNamespace(

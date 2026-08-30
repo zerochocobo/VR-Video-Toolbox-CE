@@ -10,6 +10,7 @@ collapsing ``\\r``-updated progress bars onto a single (replaceable) line.
 from __future__ import annotations
 
 import contextlib
+import re
 import sys
 import time
 from typing import Callable
@@ -18,11 +19,50 @@ from typing import Callable
 # should replace the previous progress line rather than pile up.
 Emit = Callable[[str, bool], None]
 
+# Per-sentence chatter from the vendored IndexTTS: 14 lines for every line of
+# dialogue, ~1100 of the 1254 lines a single 80-line title produced. None of it
+# says anything the pipeline's own logging does not, and the GUI log holds a
+# limited number of lines, so real progress was being pushed out of the window.
+_VENDOR_NOISE_PREFIXES = (
+    ">> ",
+    "torch.Size(",
+    "Use the specified emotion vector",
+    "origin text:",
+    # One line per sentence restating text the pipeline already logs.
+    "text after normalization:",
+)
+
+# tqdm bars. Two problems, both visible on hnvr-174: tqdm closes a bar by
+# writing a newline, so the final "100%|" frame arrives as an ordinary line and
+# piles up instead of replacing anything; and the vendored IndexTTS opens a
+# 25-step bar for every sentence, which on a 352-line title is 704 lines of
+# nothing. A bar carrying a description ("Span 112/195: 100%|...") is the only
+# progress signal that stage has, so it is kept -- but as a *replaceable*
+# progress line. A bare bar has no description and is dropped outright.
+_PROGRESS_BAR_RE = re.compile(r"^(?P<desc>.*?)\s*\d{1,3}%\|")
+
+
+def _is_vendor_noise(line: str) -> bool:
+    text = line.strip()
+    if any(text.startswith(prefix) for prefix in _VENDOR_NOISE_PREFIXES):
+        return True
+    match = _PROGRESS_BAR_RE.match(text)
+    return match is not None and not match.group("desc").strip()
+
+
+def _is_progress_bar(line: str) -> bool:
+    """A described tqdm frame, which should replace the previous one."""
+    match = _PROGRESS_BAR_RE.match(line.strip())
+    return match is not None and bool(match.group("desc").strip())
+
 
 class LogWriter:
-    def __init__(self, emit: Emit, min_progress_interval: float = 0.12) -> None:
+    def __init__(self, emit: Emit, min_progress_interval: float = 0.12,
+                 drop_vendor_noise: bool = True) -> None:
         self.emit = emit
         self.min_progress_interval = min_progress_interval
+        self.drop_vendor_noise = drop_vendor_noise
+        self.dropped = 0
         self._buf = ""
         self._last_progress_at = 0.0
 
@@ -43,6 +83,13 @@ class LogWriter:
             self._buf = self._buf[idx + 1 :]
             if not line.strip():
                 continue
+            if self.drop_vendor_noise and _is_vendor_noise(line):
+                self.dropped += 1
+                continue
+            # A closed tqdm bar ends with a newline, so without this its final
+            # frame would be appended as a permanent line.
+            if _is_progress_bar(line):
+                is_progress = True
             if is_progress:
                 now = time.monotonic()
                 if now - self._last_progress_at < self.min_progress_interval:
@@ -59,8 +106,8 @@ class LogWriter:
 
 
 @contextlib.contextmanager
-def redirect_stdio(emit: Emit):
-    writer = LogWriter(emit)
+def redirect_stdio(emit: Emit, drop_vendor_noise: bool = True):
+    writer = LogWriter(emit, drop_vendor_noise=drop_vendor_noise)
     old_out, old_err = sys.stdout, sys.stderr
     sys.stdout = writer
     sys.stderr = writer

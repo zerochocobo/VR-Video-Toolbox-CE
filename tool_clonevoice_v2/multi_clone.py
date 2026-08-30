@@ -304,25 +304,37 @@ def prescan_global_diarize(
     log: LogCallback = print,
     stop_event: Optional[Event] = None,
 ) -> dict[str, list[tuple[float, float, str]]]:
-    """Run one diarization pass over concatenated batch audio.
+    """Diarize each part on its own, then give the same person one label.
 
-    Returns ``{video_path: local_turns}`` where speaker labels are global across
-    the batch. The temporary concatenated WAV is removed after diarization.
+    This used to concatenate every part into one WAV and diarize that, so the
+    labels would line up across a title without any matching work. On
+    3dsvr-1911 that produced a clustering split by *part* rather than by
+    person: the two clusters came out at 1015.5s and 1007.4s, each part
+    dominated by a different one, and the man who introduces the new hire in
+    part 1 was folded into the woman's cluster. The actress sounds different
+    enough between the two scenes that her own cross-part variation exceeds
+    the gap between her and him within a scene, so the two cluster slots went
+    to the two parts. Diarized alone, part 1 separates him correctly (39.7s,
+    against 26.3s concatenated).
+
+    Each part is now diarized by itself, which is the case the diarizer is good
+    at, and the labels are lined up afterwards by comparing voice embeddings.
+    A voice that matches nothing keeps a label of its own -- for a title whose
+    parts really do have different casts that is the right answer, and merging
+    on a weak match would put one person's lines out in another's voice.
     """
     if not videos:
         return {}
-    # num_speakers=None -> let the diarizer auto-detect the count (used by the
-    # per-subfolder batch mode where each folder may have a different headcount).
 
     def _check_stop() -> None:
         if stop_event is not None and stop_event.is_set():
             raise RuntimeError("Stopped by user.")
 
-    parts: list[np.ndarray] = []
-    offsets: dict[str, float] = {}
-    durations: dict[str, float] = {}
-    sr: Optional[int] = None
-    cursor = 0.0
+    torch_device, _ = wx.resolve_device()
+    speaker_note = num_speakers if num_speakers is not None else "auto"
+    per_part: list[list[tuple[float, float, str]]] = []
+    audio_paths: list[Path] = []
+    keys: list[str] = []
     for index, video_arg in enumerate(videos, 1):
         _check_stop()
         video = Path(video_arg)
@@ -330,55 +342,54 @@ def prescan_global_diarize(
         cdir.mkdir(parents=True, exist_ok=True)
         audio16k = cdir / logic.AUDIO16K_NAME
         log(f"[multi-global] extract audio {index}/{len(videos)} -> {video}")
-        wx.extract_audio_16k(str(video), str(audio16k), log=log, stop_event=stop_event, denoise=denoise)
-        audio, part_sr = _read_wav_mono_f32(audio16k)
-        if sr is None:
-            sr = part_sr
-        elif part_sr != sr:
-            raise ValueError(f"Unexpected sample rate {part_sr}; expected {sr}: {audio16k}")
-        offsets[str(video)] = cursor
-        duration = audio.size / float(sr or 1)
-        durations[str(video)] = duration
-        parts.append(audio)
-        cursor += duration
-        if index < len(videos):
-            gap = np.zeros(max(0, int(round(float(silence_gap) * float(sr)))), dtype=np.float32)
-            parts.append(gap)
-            cursor += gap.size / float(sr)
-
-    if sr is None:
-        return {}
-    concat = np.concatenate(parts) if parts else np.zeros(1, dtype=np.float32)
-    concat_path = logic.clone_dir(Path(videos[0])) / "global_diarize_concat.wav"
-    _write_wav_mono_f32(concat_path, concat, sr)
-    try:
+        wx.extract_audio_16k(
+            str(video), str(audio16k), log=log, stop_event=stop_event, denoise=denoise
+        )
         _check_stop()
-        torch_device, _ = wx.resolve_device()
-        speaker_note = num_speakers if num_speakers is not None else "auto"
+        log(f"[multi-global] diarize {index}/{len(videos)} on its own, speakers={speaker_note}")
+        turns = diar.diarize_primary_speakers(
+            str(audio16k), backend=diarize_backend, num_speakers=num_speakers,
+            models_root=models_root, device=torch_device, log=log,
+        )
+        per_part.append(turns)
+        audio_paths.append(audio16k)
+        keys.append(str(video))
+
+    if len(per_part) == 1:
+        out = {keys[0]: [(round(s, 3), round(e, 3), str(k)) for s, e, k in per_part[0]]}
+        log(f"[multi-global] {Path(keys[0]).name}: {len(out[keys[0]])} turn(s)")
+        return out
+
+    centroids = []
+    for audio16k, turns in zip(audio_paths, per_part):
+        _check_stop()
+        centroids.append(
+            diar.speaker_centroids(
+                str(audio16k), turns, models_root=models_root,
+                device=torch_device, log=log,
+            )
+        )
+    if not any(centroids):
         log(
-            f"[multi-global] diarize {len(videos)} video(s), "
-            f"{concat.size / float(sr):.1f}s concat, speakers={speaker_note}"
+            "[multi-global] no voice embeddings available; each part keeps its own "
+            "speaker labels, so a basis has to be chosen per part"
         )
-        global_turns = diar.diarize(
-            str(concat_path),
-            backend=diarize_backend,
-            num_speakers=num_speakers,
-            models_root=models_root,
-            device=torch_device,
-            log=log,
-        )
-    finally:
-        try:
-            concat_path.unlink()
-        except OSError:
-            pass
+        mappings = [{name: name for name in {k for _s, _e, k in turns}} for turns in per_part]
+    else:
+        mappings = diar.match_speakers_across_parts(centroids)
 
     out: dict[str, list[tuple[float, float, str]]] = {}
-    for video_arg in videos:
-        key = str(Path(video_arg))
-        local = split_turns_to_video(global_turns, offset=offsets[key], duration=durations[key])
+    for key, turns, mapping in zip(keys, per_part, mappings):
+        local = [
+            (round(float(s), 3), round(float(e), 3), mapping.get(str(k), str(k)))
+            for s, e, k in turns
+        ]
         out[key] = local
-        log(f"[multi-global] {Path(key).name}: {len(local)} local global-speaker turn(s)")
+        renamed = {f"{a}->{b}" for a, b in sorted(mapping.items()) if a != b}
+        log(
+            f"[multi-global] {Path(key).name}: {len(local)} turn(s)"
+            + (f", matched {', '.join(sorted(renamed))}" if renamed else "")
+        )
     return out
 
 

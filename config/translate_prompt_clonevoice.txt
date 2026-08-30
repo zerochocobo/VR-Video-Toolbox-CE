@@ -1,0 +1,74 @@
+Task: Translate movie subtitles into {target_language} for AI voice cloning. Each line is spoken by a cloned voice and has a MEASURED time budget, given with the line.
+
+The subtitles are the complete dialogue of one video, listed in playback order (subtitle_id increases in playback order), and were produced by speech recognition (ASR), so they may contain recognition errors.
+
+Input format: <id dur="S" max="N">text</id>
+  * dur="S"  -> the original line occupies S seconds of screen time.
+  * max="N"  -> at a natural speaking pace, N characters/words of {target_language} fit in those S seconds.
+Output format: <id>translation</id> -- ids only, never repeat dur or max.
+
+Core Constraint: stay within max
+- Treat max="N" as the budget for the line. Landing at or under it is what keeps the dub in sync.
+- Going a little over is tolerable: the engine speaks up to ~20% faster, and if the line still does not fit it runs on into the silence that follows. Both cost sync, so use that margin only when the meaning needs it.
+- Going far over is not: a line at twice its budget either gets rushed past intelligibility or drags on top of the next line.
+- Do NOT pad a short line to reach max. A one-word original stays one word. Silence is better than filler.
+- Some budgets are impossible -- the original was spoken very fast, and no faithful translation fits. There, keep the MEANING and accept the overrun; never emit a garbled fragment to hit a number.
+
+How to fit a line into its budget
+- Drop what the picture and context already carry: pronouns, repeated names, discourse fillers.
+- Prefer the shorter of two natural phrasings; prefer common words to formal ones.
+- Use spoken, colloquial register and contractions throughout -- this is speech, not prose.
+- Never drop the point of the line. Cutting meaning to hit max is worse than a small overrun.
+
+Context & Consistency (important):
+- Always use the surrounding subtitles as context. A sentence often spans several consecutive subtitles; the dubbed lines must connect naturally and read as one continuous dialogue.
+- Keep person names, nicknames, forms of address, and recurring terms consistent across the whole file.
+- Keep each speaker's tone and register consistent across the whole file.
+- The source text is ASR output: it may contain homophone mistakes, wrong particles, or garbled fragments. Infer the intended meaning from the context and translate that intended meaning, not the literal mis-recognized words.
+
+Content Background:
+    Contains adult elements; therefore, the translation will primarily use informal, spoken-style language suitable.
+
+--------
+
+Instructions:
+1. Format Integrity: Each subtitle must start with <subtitle_id> and end with </subtitle_id>. Maintain a strict one-to-one correspondence. The output tag carries the id ONLY.
+2. Contextual Coherence: Understand the dialogue flow to ensure the translation is natural, but never merge or split IDs.
+3. Handle Noise: Ignore gibberish or errors; if a subtitle_text is empty or nonsensical, output <subtitle_id></subtitle_id>. The same applies to lines that consist only of non-lexical vocalizations or sound-effect onomatopoeia the ASR transcribed from physical sounds (e.g. くいくいくい, ぬちゃぬちゃ, はぁはぁ): output the id EMPTY -- a cloned voice must never speak sound effects. NEVER echo the source text or leave source-language words in the output -- every non-empty output line must be written entirely in {target_language} (a cloned voice has to speak it).
+4. Lip-Sync Optimization (for Chinese target): Avoid ending sentences with long, dragging particles unless the original speaker does so.
+
+Input Format:
+Subtitles are between START and END markers.
+subtitle_id increases in playback order: neighboring subtitles are consecutive lines of the same dialogue.
+
+---
+
+Example (Japanese to Chinese):
+
+Input:
+START
+<1 dur="3.10" max="17">もちろん「はい」と言うでしょう。-なぜ？でも、それは商品を買うということではありません。</1>
+<2 dur="0.60" max="3">さあ。</2>
+<3 dur="0.98" max="5">濡れて帰ってきちゃった</3>
+END
+
+Output (Optimized for Sync):
+START
+<1>当然会说“会”。-为啥？但这不代表就会买。</1>
+<2>来。</2>
+<3>淋湿着回来了</3>
+END
+
+Note on <3>: the budget is 5 and the natural rendering "回来的时候都淋湿了" is 9 -- nearly double. "淋湿着回来了" keeps the whole meaning in 6.
+
+---
+
+Subtitles to Translate:
+-----------------------
+START
+
+{subtitles}
+
+END
+
+Remember: every line carries its own budget. Stay within max where the meaning allows, use the small speed margin where it does not, and let a line overrun rather than lose its point. Output the id tag only -- never repeat dur or max. Use the surrounding lines as context, keep names, terms, and tone consistent across the whole file, and never skip or merge IDs.

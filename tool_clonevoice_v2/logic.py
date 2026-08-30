@@ -14,6 +14,8 @@ from __future__ import annotations
 import gc
 import json
 import re
+import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event
 from typing import Callable, Optional
@@ -75,6 +77,67 @@ def save_manifest(video_path: str | Path, manifest: dict) -> Path:
     path = cdir / MANIFEST_NAME
     path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
+
+
+def log_memory(label: str, log: LogCallback = print) -> None:
+    """One line with this process's memory and the GPU's, at a stage boundary.
+
+    Stage boundaries only: the level pass alone used to hold 666 MB for a
+    one-hour video and nothing said so, which is the kind of thing you only
+    find by looking. Silently does nothing if psutil is unavailable.
+    """
+    parts = []
+    try:
+        import psutil
+
+        info = psutil.Process().memory_info()
+        parts.append(f"RSS {info.rss / 1e9:.2f} GB")
+        available = psutil.virtual_memory().available / 1e9
+        parts.append(f"free {available:.1f} GB")
+    except Exception:
+        pass
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            parts.append(
+                f"VRAM {torch.cuda.memory_allocated() / 1e9:.2f}/"
+                f"{torch.cuda.max_memory_allocated() / 1e9:.2f} GB peak"
+            )
+            torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+    if parts:
+        log(f"[mem] {label}: " + ", ".join(parts))
+
+
+def cleanup_clone_dir(video_path: str | Path, *, log: LogCallback = print) -> bool:
+    """Delete a video's ``.clone`` working directory once it is fully synthesized.
+
+    Called when the batch UI's "keep intermediate files (debug)" box is left
+    unchecked. Until now that box was threaded through every stage but never
+    read, so nothing was ever removed.
+
+    This takes the whole directory, not just the bulky per-sentence WAVs: the
+    manifest and both SRTs go with it. A later run therefore re-transcribes and
+    re-translates the video from scratch (the translation stage calls a paid
+    API), and ``skip_existing`` has no checkpoint left to resume from. That is
+    the intended meaning of the option.
+    """
+    cdir = clone_dir(video_path)
+    # Guard against a malformed video path turning this into a wide delete.
+    if cdir.suffix.lower() != ".clone":
+        log(f"[cleanup] refusing to remove a non-.clone path: {cdir}")
+        return False
+    if not cdir.is_dir():
+        return False
+    try:
+        shutil.rmtree(cdir)
+    except OSError as exc:
+        log(f"[cleanup] could not remove {cdir}: {exc}")
+        return False
+    log(f"[cleanup] removed intermediate directory: {cdir}")
+    return True
 
 
 def _load_resume_manifest(video_path: str | Path, log: LogCallback) -> Optional[dict]:
@@ -330,8 +393,13 @@ def _split_on_word_gaps(start: float, end: float, text: str, words: list, max_ga
         # lines 1/2/11 lost 0.3-0.4s of speech to the old clamp, audibly
         # truncating the dub).
         w_start, w_end = float(words[0]["start"]), float(words[-1]["end"])
+        # A bound may sit outside the word extent, never inside it: a slot that
+        # starts after its own first word cannot hold the line. Only the
+        # outward direction is a judgement call, so only it consults the slack.
         keep_start = start if abs(start - w_start) <= WORD_EXTENT_SLACK else w_start
         keep_end = end if abs(end - w_end) <= WORD_EXTENT_SLACK else w_end
+        keep_start = min(keep_start, w_start)
+        keep_end = max(keep_end, w_end)
         return [{"start": keep_start, "end": keep_end, "text": text, "words": words}]
     subs = []
     for g in groups:
@@ -414,6 +482,55 @@ def _gap_between(target: dict, other: dict, *, other_first: bool) -> float:
     )
 
 
+# Above this rate a slot cannot hold its line at any plausible tempo, whatever
+# the timestamps claim: Japanese and Chinese TTS sit near 5.5-6.5 characters per
+# second, so this is already more than twice natural speed. It is deliberately
+# not a "reasonable pace" threshold — it only has to separate a merge that kept
+# a sane slot from one that left a whole sentence on a sliver.
+MAX_SPEAKABLE_CHARS_PER_SECOND = 14.0
+
+
+def _slot_can_hold_line(seg: dict) -> bool:
+    """Whether the slot could carry its own text at a plausible speaking rate."""
+    visible = _visible_len(seg.get("src_text"))
+    if visible <= 0:
+        return True
+    slot = _slot_seconds(seg)
+    return slot > 0 and visible / slot <= MAX_SPEAKABLE_CHARS_PER_SECOND
+
+
+def _cover_own_words(seg: dict) -> bool:
+    """Grow a slot that cannot hold its line back over the words it carries.
+
+    A slot may legitimately sit *outside* its word extent (``extend_entry_tails``
+    pushes the end past the last word's early DTW stamp) and it may legitimately
+    sit *inside* it too: when a hanging fragment is folded into a neighbour, the
+    fragment's own timestamp is the untrustworthy part, so the merged line keeps
+    the neighbour's slot and drops the fragment's timing on purpose.
+
+    What is never legitimate is a slot too small to speak the text it ended up
+    with. ``split_group_on_silence`` can clamp a piece edge to a silence run
+    while keeping all of that piece's words, and an ``extend=False`` absorb can
+    move a whole sentence into a sliver of a neighbour: on sivr-314 part1 that
+    left 34 of 81 lines unable to hold their own words, the worst a full sentence
+    on 0.12 s. ``fit_audio_to_duration`` then time-compresses the utterance into
+    the sliver and the dub is inaudible. Only that case is repaired here, so the
+    deliberate fragment-timing behaviour above survives untouched.
+
+    Returns whether the slot was grown.
+    """
+    words = seg.get("words") or []
+    if not words or _slot_can_hold_line(seg):
+        return False
+    start, end = float(seg["start"]), float(seg["end"])
+    covered_start = min(start, float(words[0]["start"]))
+    covered_end = max(end, float(words[-1]["end"]))
+    if covered_start >= start - 1e-6 and covered_end <= end + 1e-6:
+        return False
+    seg["start"], seg["end"] = covered_start, covered_end
+    return True
+
+
 def _absorb_fragment(target: dict, other: dict, *, other_first: bool, extend: bool) -> None:
     """Fold ``other``'s text and words into ``target``, keeping timeline order.
 
@@ -441,6 +558,7 @@ def _absorb_fragment(target: dict, other: dict, *, other_first: bool, extend: bo
         target["words"] = target_words + other_words
         if extend:
             target["end"] = max(float(target["end"]), float(other["end"]))
+    _cover_own_words(target)
     target["dur"] = round(_slot_seconds(target), 3)
     overlap = float(target.get("speaker_overlap") or 0.0) + float(other.get("speaker_overlap") or 0.0)
     if overlap:
@@ -535,6 +653,12 @@ def _merge_dub_fragments(segments: list, log: LogCallback = print) -> list:
     result, absorbed = _absorb_orphan_fragments(segments)
     result, joined = _join_adjacent_lines(result)
 
+    # Safety net over both passes: whatever route a line took, it must end up
+    # able to hold the words attached to it.
+    covered = sum(1 for seg in result if _cover_own_words(seg))
+    if covered:
+        log(f"[seg] dub merge: widened {covered} line(s) that could not hold their own words")
+
     for index, seg in enumerate(result, start=1):
         seg.pop(GAP_SPENT_KEY, None)
         seg["id"] = index
@@ -554,14 +678,13 @@ def _merge_dub_fragments(segments: list, log: LogCallback = print) -> list:
 def run_transcribe_diarize(
     video_path: str | Path,
     *,
-    model_key: str = "large-v3",
+    model_key: str = "kotoba",
     language: Optional[str] = None,
     diarize_backend: str = "auto",
     num_speakers: Optional[int] = None,
     target_language: str = "",
     ref_strategy: str = "hybrid",
     models_root: str,
-    keep_intermediate: bool = True,
     denoise: str = "mild",
     vad_sensitivity: str = "high",
     precomputed_turns: Optional[list] = None,
@@ -580,6 +703,10 @@ def run_transcribe_diarize(
     video = Path(video_path)
     if not video.is_file():
         raise FileNotFoundError(f"Video not found: {video}")
+
+    # Reported here rather than in run_full: batch runs drive the stages
+    # directly and would otherwise show no memory readings at all.
+    log_memory("before transcription", log)
 
     def _check_stop():
         if stop_event is not None and stop_event.is_set():
@@ -644,7 +771,7 @@ def run_transcribe_diarize(
             ]
             log(f"[diarize] using {len(turns)} precomputed global turn(s)")
         else:
-            turns = diar.diarize(
+            turns = diar.diarize_primary_speakers(
                 str(audio_wav), backend=diarize_backend, num_speakers=num_speakers,
                 models_root=models_root, device=torch_device, log=log,
             )
@@ -676,9 +803,22 @@ def run_transcribe_diarize(
             })
 
     if not skip_diarization:
+        # Split before labelling: assign_speakers only tags a line with whoever
+        # dominates it, so a line holding two speakers would keep one voice.
+        segments = diar.split_segments_by_turns(segments, turns, log=log)
         diar.assign_speakers(segments, turns)
     # Speakers first: a merge must never span a speaker change.
     segments = _merge_dub_fragments(segments, log)
+    # A stock hallucination split across entries survives the per-line guards:
+    # on HNVR-174 the YouTube credit arrived as two lines and became SRT #1/#2,
+    # 15 seconds of invented dialogue at the head of the file. Run this after
+    # merging, so the pieces are adjacent in their final form.
+    before = len(segments)
+    segments = subl.drop_split_stock_phrases(segments, text_key="src_text", log_callback=log)
+    if len(segments) != before:
+        for index, item in enumerate(segments, 1):
+            item["id"] = index
+            item["srt_index"] = index
     speaker_ids = sorted({seg["speaker"] for seg in segments if seg.get("speaker")})
 
     manifest = {
@@ -701,6 +841,7 @@ def run_transcribe_diarize(
     log(f"[srt] source subtitles -> {cdir / SOURCE_SRT_NAME}")
 
     _release_cuda_cache()
+    log_memory("after transcription", log)
     return manifest
 
 
@@ -737,7 +878,70 @@ def run_extract_references(
     return manifest
 
 
-# --- Stage 3: AI translation (reuses tool_subtitle's LLM client + dubbing prompt) ---
+# --- Stage 3: AI translation ---
+
+# Its own prompt, not tool_subtitle's: this one is given each line's measured
+# seconds and the character budget that fits them. Measured on sivr-314 part1,
+# the character-ratio guidance alone left 23 of 80 lines unable to fit -- the
+# ratio assumes the source is spoken at a normal rate, and lines there run to
+# 11.2 kana/s against the 6.5 the pipeline assumes.
+CLONE_TRANSLATE_PROMPT = "translate_prompt_clonevoice.txt"
+# Characters (or words) of the target language that fit in one second, spoken
+# unhurried. Mirrors backend.natural_reading_seconds, which decides how long
+# the synthesized line is actually allowed to take.
+TARGET_CHARS_PER_SECOND = {"zh": 5.5, "ja": 6.5, "en": 13.0, "es": 13.5, "ar": 11.0}
+# A line may exceed its budget by this much before it is sent back: the engine
+# speaks up to ~20% faster, and past that it runs into the following silence.
+TRANSLATION_BUDGET_TOLERANCE = 1.25
+
+
+def _target_chars_per_second(target_language: str) -> float:
+    from . import backend
+
+    return TARGET_CHARS_PER_SECOND.get(backend.normalize_language(target_language), 12.0)
+
+
+def line_budget(seconds: float, cps: float) -> int:
+    """How many characters of the target language fit in ``seconds``."""
+    return max(1, int(round(float(seconds) * cps)))
+
+
+def translation_budgets(segments: list, target_language: str) -> dict:
+    """Per-line ``dur``/``max`` attributes for the prompt, keyed by segment id."""
+    cps = _target_chars_per_second(target_language)
+    budgets = {}
+    for item in segments:
+        start, end = item.get("start"), item.get("end")
+        if start is None or end is None:
+            continue
+        seconds = max(0.0, float(end) - float(start))
+        if seconds <= 0.0:
+            continue
+        budgets[int(item["id"])] = f'dur="{seconds:.2f}" max="{line_budget(seconds, cps)}"'
+    return budgets
+
+
+def overlong_translations(segments: list, target_language: str,
+                          tolerance: float = TRANSLATION_BUDGET_TOLERANCE) -> list:
+    """Ids whose translation cannot be spoken in the time the line has.
+
+    Only a real overrun counts. A line shorter than its budget is fine -- the
+    dub simply finishes early -- and is never sent back for another pass.
+    """
+    cps = _target_chars_per_second(target_language)
+    over = []
+    for item in segments:
+        text = (item.get("tgt_text") or "").strip()
+        start, end = item.get("start"), item.get("end")
+        if not text or start is None or end is None:
+            continue
+        seconds = max(0.0, float(end) - float(start))
+        if seconds <= 0.0:
+            continue
+        if len("".join(text.split())) > line_budget(seconds, cps) * tolerance:
+            over.append(int(item["id"]))
+    return over
+
 
 def run_translate(
     video_path: str | Path,
@@ -864,6 +1068,7 @@ def run_translate(
             write_srt(clone_dir(video) / "source.srt", segments, "src_text", speaker_prefix=False)
 
     log(f"[translate] {len(entries)} segments -> {target_language} ({cfg.get('model_name')})")
+    budgets = translation_budgets(segments, target_language)
     sl.translate_entries(
         client,
         entries,
@@ -871,9 +1076,12 @@ def run_translate(
         tokens_per_chunk,
         keep_original=False,
         adult_content=adult_content,
-        # The clone pipeline always dubs, so always use the dubbing-optimized
-        # prompt — never inherit tool_subtitle's checkbox from the shared config.
+        # The clone pipeline always dubs, so always use a dubbing prompt — never
+        # inherit tool_subtitle's checkbox from the shared config. The clone
+        # prompt supersedes it: same rules plus each line's real time budget.
         dubbing_optimized=True,
+        prompt_name=CLONE_TRANSLATE_PROMPT,
+        budgets=budgets,
         max_retries=max_retries,
         log_callback=log,
         stop_event=stop_event,
@@ -889,14 +1097,24 @@ def run_translate(
             s["tgt_text"] = entries[sid]["text"].strip()
             translated += 1
 
+    _retighten_overlong(client, segments, entries, target_language, budgets,
+                        max_retries, adult_content, log, stop_event)
+
+    # Every line that still has source text and no translation, however it got
+    # that way. Asking `entries` which lines came back "translated" missed the
+    # ones marked translated whose text was empty or was rejected by the
+    # kana-leak backstop: they got no tgt_text and no cleared mark either, so
+    # the "already translated" check stayed false forever and every export sent
+    # the whole video back to the API. On 3dsvr-1911 part 1, 7 hallucinated
+    # lines held 187 entries hostage that way, run after run, and re-running
+    # could never fix them -- the LLM has nothing to translate.
     untranslated = sorted(
-        int(sid) for sid, info in entries.items() if not info.get("translated")
+        int(s["id"]) for s in segments
+        if str(s.get("src_text") or "").strip() and not str(s.get("tgt_text") or "").strip()
     )
-    if untranslated:
-        # Lines the LLM could not translate (garbled ASR fragments dropped by
-        # the kana-leak backstop, or lines missing after all retries): record
-        # them as "cleared" so the proofread panel and the pre-export check do
-        # not treat the video as untranslated and silently re-translate it.
+    # Not when the pass produced nothing at all: that is an API failure, and
+    # marking the whole video cleared would call it finished with no dub.
+    if untranslated and translated:
         pf = manifest.get("proofread") if isinstance(manifest.get("proofread"), dict) else {}
         pf = dict(pf)
         existing = {int(x) for x in (pf.get("cleared_ids") or []) if str(x).lstrip("-").isdigit()}
@@ -913,6 +1131,154 @@ def run_translate(
     return manifest
 
 
+def _retighten_overlong(client, segments: list, entries: dict, target_language: str,
+                        budgets: dict, max_retries: int, adult_content: bool,
+                        log: LogCallback, stop_event) -> int:
+    """Send lines that still overrun their budget back for a second pass.
+
+    The prompt asks for a fitting line; nothing checked that it got one. A line
+    kept only if the retry is BOTH shorter and still a translation -- an empty
+    or source-language answer leaves the first attempt in place, because a line
+    that overruns is better than a line the dub cannot speak.
+    """
+    from tool_subtitle import logic as sl
+
+    if stop_event is not None and stop_event.is_set():
+        return 0
+    over = overlong_translations(segments, target_language)
+    if not over:
+        log("[translate] every line fits its time budget")
+        return 0
+    by_id = {int(item["id"]): item for item in segments}
+    log(f"[translate] {len(over)} line(s) overrun their time budget; asking again: {over[:10]}")
+    pool = {sid: (by_id[sid].get("src_text") or "") for sid in over if sid in by_id}
+    chunk = sl._with_context(over, pool)
+    template = sl._load_prompt_template(adult_content, True, CLONE_TRANSLATE_PROMPT)
+    retried = sl._llm_chunk_pass(
+        client, chunk, template, {"target_language": target_language},
+        max(1, min(2, max_retries)), log, stop_event,
+        budgets={sid: budgets[sid] for sid in chunk if sid in budgets},
+    )
+    cps = _target_chars_per_second(target_language)
+    tightened = 0
+    for sid in over:
+        item = by_id.get(sid)
+        candidate = (retried.get(sid) or "").strip()
+        if item is None or not candidate:
+            continue
+        if sl._KANA_RE.search(candidate) and not sl._target_expects_kana(target_language):
+            continue
+        before = len("".join((item.get("tgt_text") or "").split()))
+        after = len("".join(candidate.split()))
+        if after >= before:
+            continue
+        item["tgt_text"] = candidate
+        if sid in entries:
+            entries[sid]["text"] = candidate
+        tightened += 1
+        budget = line_budget(float(item["end"]) - float(item["start"]), cps)
+        log(f"[translate] {sid}: {before} -> {after} chars (budget {budget})")
+    still = len(overlong_translations(segments, target_language))
+    log(f"[translate] tightened {tightened} line(s); {still} still overrun "
+        "(kept: meaning matters more than the overrun, and the synthesizer "
+        "runs those into the silence behind them)")
+    return tightened
+
+
+def synthesis_signature(manifest: dict, *, text_field: str = "tgt_text",
+                        language: Optional[str] = None, tempo_fit: str = "moderate",
+                        level_match: bool = True, timbre_anchor: bool = True,
+                        speaker_refs: dict | None = None) -> str:
+    """Fingerprint of everything that decides what the dub sounds like.
+
+    Lets "skip the export when the .si.wav is already there" mean what it says
+    it means. Without it the check was purely "does the file exist", so
+    proofreading a video and exporting again with the box ticked skipped the
+    whole video and silently threw the edits away -- the log said `skipped` and
+    nothing else.
+    """
+    import hashlib
+
+    parts = [
+        f"v2|{text_field}|{language or ''}|{tempo_fit}|"
+        f"{int(bool(level_match))}|{int(bool(timbre_anchor))}"
+    ]
+    # The chosen basis decides the voice of every line that speaker has, so
+    # swapping it has to re-export as surely as editing the text does. Content,
+    # not path: re-picking the same clip from a different candidate file is not
+    # a change, and picking a different clip under the same name is.
+    for speaker, path in sorted((speaker_refs or {}).items()):
+        try:
+            digest = hashlib.sha1(Path(path).read_bytes()).hexdigest()[:16]
+        except OSError:
+            digest = "missing"
+        parts.append(f"basis|{speaker}|{digest}")
+    for item in manifest.get("segments", []) or []:
+        text = str(item.get(text_field) or "").strip()
+        if not text:
+            continue
+        parts.append(
+            f"{item.get('id')}|{item.get('speaker') or ''}|"
+            f"{float(item.get('start') or 0.0):.3f}|{float(item.get('end') or 0.0):.3f}|{text}"
+        )
+    return hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def synthesis_is_current(video_path: str | Path, **kwargs) -> bool:
+    """Whether <video>.si.wav already reflects the manifest as it stands now."""
+    from tool_si import logic as si
+
+    if not Path(si.default_si_audio_path(str(video_path))).is_file():
+        return False
+    manifest = _load_resume_manifest(video_path, lambda _m: None)
+    if not isinstance(manifest, dict):
+        return False
+    recorded = manifest.get("synthesis")
+    if not isinstance(recorded, dict):
+        # Exported before this marker existed: re-export once so the output is
+        # known to match, rather than trusting a file whose provenance is
+        # unknown.
+        return False
+    # Derived here rather than taken from the caller: the check and the export
+    # must fingerprint the same basis, and every caller of this would otherwise
+    # have to remember to pass it.
+    kwargs.setdefault(
+        "speaker_refs", chosen_speaker_refs(video_path, manifest, log=lambda _m: None)
+    )
+    return str(recorded.get("signature") or "") == synthesis_signature(manifest, **kwargs)
+
+
+def chosen_speaker_refs(video: str | Path, manifest: dict,
+                        *, log: LogCallback = print) -> dict[str, str]:
+    """Basis WAVs a person picked for this video, by speaker.
+
+    The refined-clone tab writes its choice here and synthesis never read it,
+    so auditioning and choosing a speaker's voice changed nothing about the
+    dub. Names are stored relative to the clone directory; one that no longer
+    exists is reported and dropped rather than silently ignored, because the
+    fallback is a different voice.
+    """
+    speakers = manifest.get("speakers")
+    if not isinstance(speakers, dict):
+        return {}
+    cdir = clone_dir(video)
+    out: dict[str, str] = {}
+    for speaker, info in sorted(speakers.items()):
+        if not isinstance(info, dict):
+            continue
+        name = str(info.get("ref_audio") or "").strip()
+        if not name:
+            continue
+        path = Path(name)
+        if not path.is_absolute():
+            path = cdir / name
+        if path.is_file():
+            out[str(speaker)] = str(path)
+        else:
+            log(f"[synth] chosen basis for {speaker} is missing, falling back: {path}")
+    return out
+
+
 # --- Stage 4: IndexTTS-2.5 voice-clone synthesis -> <video>.si.wav ---
 
 def run_synthesize(
@@ -923,6 +1289,8 @@ def run_synthesize(
     text_field: str = "tgt_text",
     language: Optional[str] = None,
     tempo_fit: str = "moderate",
+    level_match: bool = True,
+    timbre_anchor: bool = True,
     log: LogCallback = print,
     stop_event: Optional[Event] = None,
     model_holder: Optional[list] = None,
@@ -933,6 +1301,7 @@ def run_synthesize(
     ``tgt_text`` and the source language when synthesizing ``src_text``.
     """
     video = Path(video_path)
+    log_memory("before synthesis", log)
     manifest = load_manifest(video)
     if not manifest:
         raise FileNotFoundError(f"Manifest not found; run earlier stages first: {manifest_path(video)}")
@@ -940,6 +1309,14 @@ def run_synthesize(
         language = manifest.get("target_language") if text_field == "tgt_text" else manifest.get("language")
     from . import backend
     from tool_si import logic as si
+    if level_match:
+        # Levels come from the source mixture, measured by the synthesizer off
+        # audio16k.wav. A bandit-separated speech stem used to be preferred
+        # where one existed; it produced a usable reading on only 140 of 304
+        # lines (hnvr-174) and agreed with the mixture to a median 0.0-0.3 dB
+        # where it did work, for a 13 GB VRAM peak and a full-length 48 kHz
+        # scratch extraction on every run, so it was removed outright.
+        log("[level] targets come from the source mixture")
     if model is None:
         model = backend.load_model(models_root, log=log)
         if model_holder is not None:
@@ -951,12 +1328,15 @@ def run_synthesize(
             item = dict(item)
             item["text"] = text
             segments.append(item)
+    speaker_refs = chosen_speaker_refs(video, manifest, log=log)
     out = backend.synthesize_manifest(
         model, clone_dir(video) / AUDIO16K_NAME, segments,
         si.default_si_audio_path(str(video)),
         language=language or "zh", fit_duration=(tempo_fit != "off"), tempo_fit=tempo_fit,
         log=log, stop_event=stop_event,
         intermediate_dir=clone_dir(video) / backend.MANIFEST_INTERMEDIATE_DIR_NAME,
+        level_match=level_match, timbre_anchor=timbre_anchor,
+        speaker_refs=speaker_refs,
     )
     duck_spans = [
         {"start": float(s["start"]), "end": float(s["end"])}
@@ -966,7 +1346,17 @@ def run_synthesize(
     duck_duration = max((float(s["end"]) for s in segments), default=1.0)
     si.write_duck_key_wav(duck_path, duck_spans, duck_duration, backend.SAMPLE_RATE)
     log(f"[synth] wrote duck key {duck_path}")
+    manifest["synthesis"] = {
+        "signature": synthesis_signature(
+            manifest, text_field=text_field, language=language,
+            tempo_fit=tempo_fit, level_match=level_match, timbre_anchor=timbre_anchor,
+            speaker_refs=speaker_refs,
+        ),
+        "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    save_manifest(video, manifest)
     _release_cuda_cache()
+    log_memory("after synthesis", log)
     return out
 
 
@@ -975,7 +1365,7 @@ def run_synthesize(
 def run_full(
     video_path: str | Path,
     *,
-    model_key: str = "large-v3",
+    model_key: str = "kotoba",
     language: Optional[str] = None,
     target_language: str = "Chinese",
     models_root: str,
@@ -983,6 +1373,10 @@ def run_full(
     skip_existing: bool = True,
     denoise: str = "mild",
     tempo_fit: str = "moderate",
+    level_match: bool = True,
+    timbre_anchor: bool = True,
+    diarize_backend: str = "none",
+    num_speakers: Optional[int] = None,
     source_correction: Optional[bool] = None,
     vad_sensitivity: str = "high",
     log: LogCallback = print,
@@ -1000,10 +1394,10 @@ def run_full(
 
     log("=== [1/3] Transcription (sentence references, no speaker detection) ===")
     run_transcribe_diarize(
-        video, model_key=model_key, language=language, diarize_backend="none",
-        num_speakers=None, target_language=target_language, models_root=models_root,
-        keep_intermediate=keep_intermediate, denoise=denoise, vad_sensitivity=vad_sensitivity,
-        skip_diarization=True,
+        video, model_key=model_key, language=language, diarize_backend=diarize_backend,
+        num_speakers=num_speakers, target_language=target_language, models_root=models_root,
+        denoise=denoise, vad_sensitivity=vad_sensitivity,
+        skip_diarization=(diarize_backend == "none"),
         skip_existing=skip_existing,
         log=log, stop_event=stop_event, model_holder=model_holder,
     )
@@ -1020,10 +1414,13 @@ def run_full(
     log("=== [3/3] IndexTTS-2.5 sentence-level voice-clone synthesis ===")
     out = run_synthesize(
         video, models_root=models_root, text_field="tgt_text", language=target_language,
-        tempo_fit=tempo_fit,
+        tempo_fit=tempo_fit, level_match=level_match, timbre_anchor=timbre_anchor,
         log=log, stop_event=stop_event,
         model_holder=model_holder,
     )
+    if not keep_intermediate:
+        cleanup_clone_dir(video, log=log)
+    log_memory("done", log)
     log(f"=== Done -> {out} ===")
     return out
 
@@ -1031,7 +1428,7 @@ def run_full(
 def run_batch(
     video_paths,
     *,
-    model_key: str = "large-v3",
+    model_key: str = "kotoba",
     language: Optional[str] = None,
     target_language: str = "Chinese",
     models_root: str,
@@ -1039,6 +1436,10 @@ def run_batch(
     skip_existing: bool = True,
     denoise: str = "mild",
     tempo_fit: str = "moderate",
+    level_match: bool = True,
+    timbre_anchor: bool = True,
+    diarize_backend: str = "none",
+    num_speakers: Optional[int] = None,
     source_correction: Optional[bool] = None,
     vad_sensitivity: str = "high",
     log: LogCallback = print,
@@ -1060,8 +1461,11 @@ def run_batch(
     pending_by_directory: dict[Path, list[Path]] = {}
     for video in videos:
         output = Path(si.default_si_audio_path(str(video)))
-        if skip_existing and output.is_file():
-            log(f"[batch] output exists, skipping: {output}")
+        if skip_existing and synthesis_is_current(
+            video, language=target_language, tempo_fit=tempo_fit,
+            level_match=level_match, timbre_anchor=timbre_anchor,
+        ):
+            log(f"[batch] output is up to date, skipping: {output}")
             outputs_by_video[video] = str(output)
         else:
             pending_by_directory.setdefault(video.parent, []).append(video)
@@ -1091,14 +1495,13 @@ def run_batch(
                 video,
                 model_key=model_key,
                 language=language,
-                diarize_backend="none",
-                num_speakers=None,
+                diarize_backend=diarize_backend,
+                num_speakers=num_speakers,
                 target_language=target_language,
                 models_root=models_root,
-                keep_intermediate=keep_intermediate,
                 denoise=denoise,
                 vad_sensitivity=vad_sensitivity,
-                skip_diarization=True,
+                skip_diarization=(diarize_backend == "none"),
                 skip_existing=skip_existing,
                 log=log,
                 stop_event=stop_event,
@@ -1143,9 +1546,16 @@ def run_batch(
                     text_field="tgt_text",
                     language=target_language,
                     tempo_fit=tempo_fit,
+                    level_match=level_match,
+                    timbre_anchor=timbre_anchor,
                     log=log,
                     stop_event=stop_event,
                 )
+                # Only videos this run actually synthesized are cleaned; a video
+                # skipped because its .SI.WAV already existed keeps whatever
+                # checkpoint it has, since this run did no work on it.
+                if not keep_intermediate:
+                    cleanup_clone_dir(video, log=log)
         except Exception:
             shared_model = None
             release_model_holder(model_holder)

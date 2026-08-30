@@ -266,6 +266,250 @@ def _extract_ecapa_embeddings(model, audio, sr: int, windows: List[tuple[float, 
     return np.asarray(embs, dtype=np.float32)
 
 
+def speaker_centroids(
+    audio16k_path: str,
+    turns: List[Turn],
+    *,
+    models_root: str,
+    device: str,
+    max_windows_per_speaker: int = 12,
+    min_window: float = 1.0,
+    log: LogCallback = print,
+):
+    """One averaged voice embedding per speaker label in ``turns``.
+
+    Used to line up the labels two separately-diarized parts of the same title
+    gave the same person. Returns ``{speaker: unit-norm vector}``, empty if the
+    ECAPA bundle is not installed.
+    """
+    import numpy as np
+
+    if not ecapa_available(models_root):
+        return {}
+    by_speaker: dict[str, List[tuple[float, float]]] = {}
+    for start, end, speaker in turns:
+        if float(end) - float(start) >= min_window:
+            by_speaker.setdefault(str(speaker), []).append((float(start), float(end)))
+    if not by_speaker:
+        return {}
+    # Longest turns first: the cleanest look at the voice, and a bounded number
+    # of them keeps this to seconds even on a long part.
+    windows: List[tuple[float, float]] = []
+    index: List[str] = []
+    for speaker, spans in sorted(by_speaker.items()):
+        spans.sort(key=lambda span: span[0] - span[1])
+        for span in spans[:max_windows_per_speaker]:
+            windows.append(span)
+            index.append(speaker)
+    if not windows:
+        return {}
+    audio, sr = _read_wav_mono(audio16k_path)
+    model = _load_ecapa_model(models_root, device, log)
+    try:
+        embeddings = _extract_ecapa_embeddings(
+            model, audio, sr, windows, device, lambda _m: None
+        )
+    finally:
+        del model
+    centroids: dict[str, "np.ndarray"] = {}
+    for speaker in sorted(set(index)):
+        rows = np.asarray(
+            [embeddings[i] for i, name in enumerate(index) if name == speaker],
+            dtype=np.float32,
+        )
+        mean = rows.mean(axis=0)
+        norm = float(np.linalg.norm(mean))
+        if norm > 0:
+            centroids[speaker] = mean / norm
+    log(f"[diarize] voice centroids for {len(centroids)} speaker(s) from {len(windows)} window(s)")
+    return centroids
+
+
+def match_speakers_across_parts(centroids_by_part: list[dict], *, min_similarity: float = 0.55):
+    """Give the same person the same label in every part of a title.
+
+    Returns one ``{local_label: global_label}`` per part. Greedy nearest match
+    on cosine similarity; anything below ``min_similarity`` is treated as a
+    voice that part does not share and gets a label of its own, because a wrong
+    merge sends one person's lines out in another person's voice.
+    """
+    import numpy as np
+
+    globals_: list[tuple[str, "np.ndarray"]] = []
+    mappings: list[dict[str, str]] = []
+    for centroids in centroids_by_part:
+        mapping: dict[str, str] = {}
+        taken: set[str] = set()
+        for speaker, vector in sorted(centroids.items()):
+            best_name, best_score = None, -1.0
+            for name, reference in globals_:
+                if name in taken:
+                    continue
+                score = float(np.dot(vector, reference))
+                if score > best_score:
+                    best_name, best_score = name, score
+            if best_name is not None and best_score >= min_similarity:
+                mapping[speaker] = best_name
+                taken.add(best_name)
+            else:
+                name = f"SPEAKER_{len(globals_):02d}"
+                globals_.append((name, vector))
+                mapping[speaker] = name
+                taken.add(name)
+        mappings.append(mapping)
+    return mappings
+
+
+# Over-splitting on purpose is what makes an odd voice recognisable, and it is
+# free: pyannote's work does not depend on the count it is asked for. Measured
+# on 3dsvr-1911 part 1, whose 11.60-18.34 is a man among a woman's 634s. Asked
+# for 2 clusters his came out at 39.7s and cos 0.357 against hers, still
+# carrying her voice; asked for 3 or 4 it came out at 26.8s/28.1s and cos
+# 0.111/0.113. Sub-clusters of one person rejoin each other, so the headroom
+# costs nothing when the extra voices are not there.
+SPEAKER_SPLIT_HEADROOM = 2
+MAX_SPLIT_CLUSTERS = 10
+
+# Where "the same person over-split" stops and "someone else" starts. On the
+# title above, sub-clusters of the one woman scored 0.689-0.887 against each
+# other, within a part and across parts, while the man scored 0.092-0.144
+# against everyone once his cluster was clean. 0.45 sits between the two bands
+# with room on either side.
+MERGE_INTO_PRIMARY_SIMILARITY = 0.45
+
+# Collapsing two of the voices the caller asked for needs better evidence than
+# absorbing a leftover cluster into one of them, so it gets its own threshold
+# at the bottom of the measured same-person band rather than in the gap. Asked
+# for 2 on the title above, the two longest clusters in part 1 were both the
+# woman at cos 0.794; being asked for the pair is not a reason to clone her
+# twice. The pairs that sit in the ambiguous middle, 0.46-0.56, stay apart --
+# there the caller's own count is the better evidence.
+SAME_VOICE_SIMILARITY = 0.65
+
+
+def diarize_primary_speakers(
+    audio16k_path: str,
+    *,
+    backend: str = "auto",
+    num_speakers: Optional[int],
+    models_root: str,
+    device: str = "cpu",
+    headroom: int = SPEAKER_SPLIT_HEADROOM,
+    merge_similarity: float = MERGE_INTO_PRIMARY_SIMILARITY,
+    same_voice_similarity: float = SAME_VOICE_SIMILARITY,
+    log: LogCallback = print,
+) -> List[Turn]:
+    """Diarize for ``num_speakers`` voices to clone, keeping distinct extras.
+
+    ``num_speakers`` says how many voices the caller wants held together, not
+    how many the recording holds. Handing that straight to the diarizer as an
+    exact cluster count answers a different question, and answers it badly at
+    both ends. At 1 every voice in the title lands in one bucket, so a man's
+    lines are cloned from the woman's anchor and her bucket, polluted with his
+    voice, no longer matches her own other parts. At 2 the two longest clusters
+    are taken as two people without ever being compared, so a title with one
+    woman and one man came back with the woman cloned as two different voices.
+
+    So ask the diarizer for more clusters than that, and walk them longest
+    first. A cluster that clearly is one of the voices already taken on rejoins
+    it; otherwise it becomes one of them, until ``num_speakers`` of them are
+    held. Everything after that either rejoins a held voice or, if it resembles
+    none of them, keeps a label of its own. The count is therefore a bound on
+    how many voices are held together rather than a number to hit, and a
+    clearly different voice is still separated out to get its own anchor.
+
+    Labels come back numbered by speaking time, so ``SPEAKER_00`` is the voice
+    the title is mostly made of.
+
+    Without the ECAPA bundle there is nothing to merge on, so this falls back
+    to a plain exact-count diarization.
+    """
+    import numpy as np
+
+    requested = int(num_speakers) if num_speakers else 0
+    if requested <= 0:
+        return diarize(audio16k_path, backend=backend, num_speakers=None,
+                       models_root=models_root, device=device, log=log)
+
+    if resolve_backend(backend, models_root) != "pyannote" or not ecapa_available(models_root):
+        log(f"[diarize] no voice embeddings available; asking for exactly {requested} speaker(s)")
+        return diarize(audio16k_path, backend=backend, num_speakers=requested,
+                       models_root=models_root, device=device, log=log)
+
+    split_k = min(requested + max(0, int(headroom)), MAX_SPLIT_CLUSTERS)
+    log(f"[diarize] splitting into {split_k} cluster(s) to keep {requested} voice(s) together")
+    turns = diarize(audio16k_path, backend=backend, num_speakers=split_k,
+                    models_root=models_root, device=device, log=log)
+
+    seconds: dict[str, float] = {}
+    for start, end, speaker in turns:
+        seconds[str(speaker)] = seconds.get(str(speaker), 0.0) + max(0.0, float(end) - float(start))
+    if len(seconds) <= requested:
+        return turns
+
+    centroids = speaker_centroids(audio16k_path, turns, models_root=models_root,
+                                  device=device, log=log)
+    if not centroids:
+        log("[diarize] no voice centroids; keeping the split as the diarizer left it")
+        return turns
+
+    ordered = sorted(seconds, key=lambda name: (-seconds[name], name))
+    if not any(name in centroids for name in ordered):
+        log("[diarize] no centroid for any cluster; keeping the split as it is")
+        return turns
+
+    mapping: dict[str, str] = {}
+    primaries: list[str] = []
+    merged: list[str] = []
+    kept: list[str] = []
+    for name in ordered:
+        vector = centroids.get(name)
+        best_name, best_score = None, -1.0
+        if vector is not None:
+            for primary in primaries:
+                score = float(np.dot(vector, centroids[primary]))
+                if score > best_score:
+                    best_name, best_score = primary, score
+        # While voices are still being taken on, the caller has asked for this
+        # many, so only collapse two of them on strong evidence of one person.
+        # Once the count is used up the choice is between rejoining and adding
+        # a voice nobody asked for, and a weaker match settles that.
+        threshold = same_voice_similarity if len(primaries) < requested else merge_similarity
+        if best_name is not None and best_score >= threshold:
+            mapping[name] = best_name
+            merged.append(f"{name}({seconds[name]:.0f}s)->{best_name} cos {best_score:.2f}")
+        elif vector is not None and len(primaries) < requested:
+            primaries.append(name)
+            mapping[name] = name
+        else:
+            mapping[name] = name
+            reason = "no embedding" if vector is None else f"cos {best_score:.2f}"
+            kept.append(f"{name}({seconds[name]:.0f}s, {reason})")
+
+    grouped: dict[str, float] = {}
+    for name, target in mapping.items():
+        grouped[target] = grouped.get(target, 0.0) + seconds.get(name, 0.0)
+    rename = {
+        target: f"SPEAKER_{index:02d}"
+        for index, target in enumerate(sorted(grouped, key=lambda name: (-grouped[name], name)))
+    }
+    if merged:
+        log("[diarize] rejoined as one voice: " + ", ".join(merged))
+    if kept:
+        log("[diarize] kept apart as its own voice: " + ", ".join(kept))
+    log(
+        f"[diarize] {len(grouped)} voice(s) out of {len(seconds)} cluster(s): "
+        + ", ".join(
+            f"{rename[target]}={grouped[target]:.0f}s"
+            for target in sorted(grouped, key=lambda name: rename[name])
+        )
+    )
+    return [
+        (float(start), float(end), rename[mapping[str(speaker)]])
+        for start, end, speaker in turns
+    ]
+
+
 def _make_agglomerative_clusterer(k: int):
     from sklearn.cluster import AgglomerativeClustering
 
@@ -497,6 +741,178 @@ def _diarize_ecapa(
                     pass
         except Exception:
             pass
+
+
+# A conversational turn runs about a second; the diarizer also emits much
+# shorter fragments, and on a two-person title it collected 126 turns averaging
+# 0.50s and 68 averaging 0.31s into two extra "speakers" beside the real pair
+# (1.37s and 1.07s means). Those fragment clusters are backchannels, breaths and
+# overlap, and letting them vote produced a false split inside a 2.16s line that
+# held seven turns, three of them under 0.1s.
+SUBSTANTIAL_SPEAKER_MIN_MEAN_TURN = 0.7
+# The share of total speech used to matter here too, at 10%, and that is what
+# actually discarded the man on 3dsvr-1911: he introduces the new hire in the
+# opening minute and says nothing after, 26.3s of 673.5s -- 3.9%. His turns
+# average 0.73s, so he speaks in sentences; he is simply brief. Dropping him
+# meant no line was ever cut at his boundary and his dialogue reached the
+# synthesizer in the woman's voice.
+#
+# Share was the wrong measure. What distinguishes a pile of backchannels and
+# breaths is that every piece is short -- the clusters this rule was written
+# for average 0.31-0.65s -- not that they add up to little. Mean turn length
+# alone still rejects every one of them across the 39 clusters in the existing
+# manifests. These two only guard against a cluster of one or two stray turns
+# whose mean happens to look conversational.
+SUBSTANTIAL_SPEAKER_MIN_SECONDS = 5.0
+SUBSTANTIAL_SPEAKER_MIN_TURNS = 3
+# A speaker change is only believed once this much of the line has moved with
+# it; below that it is diarizer jitter over a single speaker.
+TURN_SPLIT_MIN_RUN_WORDS = 3
+TURN_SPLIT_MIN_RUN_SECONDS = 0.8
+
+
+def substantial_speakers(
+    turns: List[Turn],
+    *,
+    min_mean_turn: float = SUBSTANTIAL_SPEAKER_MIN_MEAN_TURN,
+    min_seconds: float = SUBSTANTIAL_SPEAKER_MIN_SECONDS,
+    min_turns: int = SUBSTANTIAL_SPEAKER_MIN_TURNS,
+) -> set:
+    """Labels that behave like a person rather than a pile of fragments.
+
+    Judged on how the speaker talks, not on how much of the video they hold: a
+    brief part is still a part.
+    """
+    totals: dict[str, list] = {}
+    for start, end, speaker in turns:
+        entry = totals.setdefault(speaker, [0, 0.0])
+        entry[0] += 1
+        entry[1] += max(0.0, float(end) - float(start))
+    if not totals:
+        return set()
+    keep = {
+        speaker for speaker, (count, span) in totals.items()
+        if count >= min_turns and span >= min_seconds and span / count >= min_mean_turn
+    }
+    return keep or set(totals)
+
+
+def _word_speakers(words: List[dict], turns: List[Turn]) -> List[Optional[str]]:
+    """Attribute each word to the speaker it overlaps most, filling the gaps."""
+    labels: List[Optional[str]] = []
+    for word in words:
+        start, end = float(word["start"]), float(word["end"])
+        best, best_overlap = None, 0.0
+        for turn_start, turn_end, speaker in turns:
+            overlap = min(end, turn_end) - max(start, turn_start)
+            if overlap > best_overlap:
+                best_overlap, best = overlap, speaker
+        labels.append(best)
+    # A word inside a diarization gap belongs with whoever was last speaking.
+    previous = None
+    for index, label in enumerate(labels):
+        if label:
+            previous = label
+        else:
+            labels[index] = previous
+    following = None
+    for index in range(len(labels) - 1, -1, -1):
+        if labels[index]:
+            following = labels[index]
+        else:
+            labels[index] = following
+    return labels
+
+
+def _smooth_runs(labels: List[str], words: List[dict],
+                 min_run_words: int, min_run_seconds: float) -> List[str]:
+    """Absorb runs too short to be a real turn into their neighbour."""
+    out = list(labels)
+    index = 0
+    while index < len(out):
+        end = index
+        while end + 1 < len(out) and out[end + 1] == out[index]:
+            end += 1
+        span = float(words[end]["end"]) - float(words[index]["start"])
+        undersized = (end - index + 1) < min_run_words or span < min_run_seconds
+        if undersized and (index > 0 or end + 1 < len(out)):
+            filler = out[index - 1] if index > 0 else out[end + 1]
+            for position in range(index, end + 1):
+                out[position] = filler
+            index = 0  # neighbours may now merge into one another
+            continue
+        index = end + 1
+    return out
+
+
+def split_segments_by_turns(
+    segments: List[dict],
+    turns: List[Turn],
+    *,
+    min_run_words: int = TURN_SPLIT_MIN_RUN_WORDS,
+    min_run_seconds: float = TURN_SPLIT_MIN_RUN_SECONDS,
+    log: LogCallback = print,
+) -> List[dict]:
+    """Cut lines that carry more than one speaker at the speaker change.
+
+    :func:`assign_speakers` only tags a line with whoever dominates it, so a
+    question and its answer reach the synthesizer as one inference and come back
+    in one voice — on a two-person title that was 23% of the lines. Words carry
+    their own timestamps, so each word is attributed instead and the line cut
+    where the attribution changes, rebuilding each side's text from its words.
+    """
+    if not turns or not segments:
+        return segments
+    keep = substantial_speakers(turns)
+    dropped = {speaker for _s, _e, speaker in turns} - keep
+    if dropped:
+        log(f"[diarize] ignoring fragment cluster(s) {sorted(dropped)} when splitting")
+    usable = [turn for turn in turns if turn[2] in keep]
+    if not usable:
+        return segments
+
+    result: List[dict] = []
+    split_lines = 0
+    for segment in segments:
+        words = segment.get("words") or []
+        if len(words) < max(2, min_run_words):
+            result.append(segment)
+            continue
+        labels = _word_speakers(words, usable)
+        if not any(labels):
+            result.append(segment)
+            continue
+        labels = _smooth_runs([str(x) for x in labels], words,
+                              min_run_words, min_run_seconds)
+        if len(set(labels)) < 2:
+            result.append(segment)
+            continue
+        start = 0
+        for index in range(1, len(words) + 1):
+            if index == len(words) or labels[index] != labels[start]:
+                group = words[start:index]
+                piece = dict(segment)
+                piece["start"] = round(float(group[0]["start"]), 3)
+                piece["end"] = round(float(group[-1]["end"]), 3)
+                piece["dur"] = round(piece["end"] - piece["start"], 3)
+                piece["src_text"] = "".join(w.get("w", "") for w in group).strip()
+                piece["words"] = group
+                piece["speaker"] = labels[start]
+                # Any translation on the parent described the whole line.
+                piece["tgt_text"] = ""
+                result.append(piece)
+                start = index
+        split_lines += 1
+
+    if split_lines:
+        log(
+            f"[diarize] split {split_lines} line(s) at speaker changes; "
+            f"{len(segments)} -> {len(result)} lines"
+        )
+    for index, segment in enumerate(result, start=1):
+        segment["id"] = index
+        segment["srt_index"] = index
+    return result
 
 
 def assign_speakers(segments: List[dict], turns: List[Turn]) -> List[dict]:
