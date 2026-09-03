@@ -240,3 +240,30 @@ def test_turn_boundaries_are_never_moved(stub):
     turns = run(1)
 
     assert [(t[0], t[1]) for t in turns] == [(0.0, 200.0), (200.5, 260.25), (260.25, 280.0)]
+
+
+def test_a_missing_embedding_runtime_does_not_kill_the_run(monkeypatch):
+    """The ECAPA files can be present while the code loading them is not.
+
+    Its hubconf imports s3prl, which a build can leave out; that raised
+    ModuleNotFoundError straight through diarization and ended transcription.
+    Voice matching only refines a split that already exists, so it is dropped.
+    """
+    monkeypatch.setattr(diar, "ecapa_available", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        diar, "_read_wav_mono", lambda _p: (np.zeros(16000, dtype=np.float32), 16000)
+    )
+
+    def missing(*_a, **_k):
+        raise ModuleNotFoundError("No module named 's3prl'")
+
+    monkeypatch.setattr(diar, "_load_ecapa_model", missing)
+    messages = []
+
+    centroids = diar.speaker_centroids(
+        "audio.wav", [(0.0, 5.0, "A"), (5.0, 10.0, "B")],
+        models_root="models", device="cpu", log=messages.append,
+    )
+
+    assert centroids == {}
+    assert any("s3prl" in message for message in messages), messages

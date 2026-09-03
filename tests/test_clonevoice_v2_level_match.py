@@ -238,24 +238,37 @@ def test_synthesize_manifest_level_match_can_be_turned_off(tmp_path):
 
 # --- the slot no longer crushes the delivery ---
 
-def test_the_target_is_the_natural_reading_not_the_slot():
-    """Two failures, opposite directions, one rule.
+def test_a_rendition_that_fits_is_not_touched_at_all():
+    """Reverses "aim at the natural reading": that estimate is about half of
+    what IndexTTS actually speaks, so aiming at it meant generated/1.15 always
+    won and every line was compressed by exactly 1.15x. Measured over three
+    titles, 96.2% of lines already fitted the room they had -- on 3dsvr-1911
+    all 377 of them, at 0.62-0.69x of the source line.
 
-    sivr-314 line 5: a 0.98s slot sized for the Japanese held a 9-character
-    Chinese line needing 1.64s, and crushing it to fit made it unintelligible.
-    Line 6: the model dragged 6 characters over 2.84s, and letting that play
-    in full sounded just as wrong. Aim at the natural reading in both cases.
+    Compressing costs pitch as well as pace: 1.15 sits at or below tool_si's
+    branch, which resamples linearly and carries the pitch up 2.42 semitones.
     """
-    import inspect
+    clip = np.zeros(int(backend.SAMPLE_RATE * 2.0), dtype=np.float32)
+    # Two seconds of speech in a one-second slot with room behind it.
+    kept = backend._fit_to_slot(clip, 10.0, 11.0, 30.0, True)
+    assert kept.size == clip.size, "room behind the line means no compression"
+    # The same clip with the next line right behind it: compressed to fit.
+    squeezed = backend._fit_to_slot(clip, 10.0, 11.0, 11.5, True)
+    assert squeezed.size < clip.size
+    assert squeezed.size == pytest.approx(int(backend.SAMPLE_RATE * 1.5), rel=0.01)
 
-    source = inspect.getsource(backend._fit_to_slot)
-    assert "natural_reading_seconds" in source
-    assert "MAX_HARD_COMPRESSION" in source
-    assert "overflow_end" in inspect.getsource(backend.synthesize_manifest)
-    # A slot shorter than the line needs: extend towards natural.
-    assert backend.natural_reading_seconds("回来的时候都淋湿了", "zh") > 1.5
-    # A dragged reading is compressed back, not played out in full.
-    assert backend.natural_reading_seconds("雨一直没停嘛", "zh") < 1.3
+
+def test_only_the_ratio_actually_needed_is_applied():
+    """No floor, no estimate: a line that overruns by a tenth is squeezed by a
+    tenth, not by 1.15x."""
+    clip = np.zeros(int(backend.SAMPLE_RATE * 1.1), dtype=np.float32)
+    fitted = backend._fit_to_slot(clip, 0.0, 1.0, 1.0, True)
+    assert fitted.size == pytest.approx(int(backend.SAMPLE_RATE * 1.0), rel=0.01)
+
+
+def test_fitting_off_leaves_every_rendition_alone():
+    clip = np.zeros(int(backend.SAMPLE_RATE * 5.0), dtype=np.float32)
+    assert backend._fit_to_slot(clip, 0.0, 1.0, 1.0, False).size == clip.size
 
 
 def test_the_overflow_never_reaches_the_next_line(tmp_path):

@@ -398,6 +398,7 @@
       "opt_vad_high": "高 (かすれ声)",
       "opt_vad_max": "最高 (ささやき)",
       "opt_model_kotoba": "kotoba(日本語)",
+      "opt_model_anime": "anime-whisper(日本語)",
       "model_ready": "認識モデル準備完了: {}",
       "model_missing": "認識モデルが未配置または不完全です: {}",
       "grp_voice_models": "音声クローンモデル",

@@ -61,19 +61,33 @@ MODEL_DIR_NAMES = {
     "large-v3": "faster-whisper-large-v3",
     "large-v2": "faster-whisper-large-v2",
     "kotoba": "kotoba-whisper-v2.0-faster",
+    "anime-whisper": "anime-whisper",
 }
 
 MODEL_REPO_IDS = {
     "large-v3": "Systran/faster-whisper-large-v3",
     "large-v2": "Systran/faster-whisper-large-v2",
     "kotoba": "kotoba-tech/kotoba-whisper-v2.0-faster",
+    "anime-whisper": "litagin/anime-whisper",
 }
 
 MODEL_ESTIMATED_BYTES = {
     "large-v3": 3_090_837_754,
     "large-v2": 3_089_121_016,
     "kotoba": 1_516_480_672,
+    "anime-whisper": 3_025_686_376,
 }
+
+# The weight file that proves a model is really on disk. The CTranslate2 models
+# ship "model.bin"; anime-whisper is a plain HuggingFace checkpoint and ships
+# safetensors instead.
+MODEL_MAIN_FILE = {"anime-whisper": "model.safetensors"}
+DEFAULT_MAIN_FILE = "model.bin"
+
+# Files to leave on the server. anime-whisper publishes its weights twice, as
+# safetensors and as a .bin; downloading both would double a three-gigabyte
+# transfer for nothing.
+MODEL_SKIP_SUFFIXES = {"anime-whisper": (".bin",)}
 
 # Language code -> shallow local wav2vec2 align model dir name under models/whisperx/.
 # Kept flat (no HF cache layout) so non-technical users can drop downloaded files in.
@@ -175,6 +189,9 @@ def resolve_asr_device() -> tuple[str, str]:
 def resolve_model_arg(model_key: str, models_root: str) -> str:
     """Resolve a UI model key to a local model dir path, else the bare key.
 
+    Not used for anime-whisper, which is loaded by
+    :mod:`tool_clonevoice_v2.anime_whisper_backend` from its directory directly.
+
     faster-whisper's ``WhisperModel`` accepts a local CTranslate2 directory
     directly, so a bundled ``models/faster-whisper-large-v3`` is used without
     any re-download. If the local dir is missing, the bare key is returned so
@@ -194,7 +211,8 @@ def model_dir(model_key: str, models_root: str) -> Path:
 
 def check_model_files(model_key: str, models_root: str) -> bool:
     local = model_dir(model_key, models_root)
-    return (local / "model.bin").is_file() and (local / "config.json").is_file()
+    main = MODEL_MAIN_FILE.get(model_key, DEFAULT_MAIN_FILE)
+    return (local / main).is_file() and (local / "config.json").is_file()
 
 
 def remote_file_plan(model_key: str, log: LogCallback = print) -> tuple[list[tuple[str, int | None]], int | None]:
@@ -215,9 +233,12 @@ def remote_file_plan(model_key: str, log: LogCallback = print) -> tuple[list[tup
     files: list[tuple[str, int | None]] = []
     total = 0
     complete = True
+    skip = MODEL_SKIP_SUFFIXES.get(model_key, ())
     for sibling in info.siblings:
         filename = getattr(sibling, "rfilename", "") or ""
         if not filename or filename.startswith(".cache/"):
+            continue
+        if skip and filename.endswith(skip):
             continue
         size = getattr(sibling, "size", None)
         files.append((filename, size))
@@ -249,7 +270,9 @@ def download_model(model_key: str, models_root: str, log: LogCallback = print) -
         filenames = [name for name, _size in files]
         if not filenames:
             from huggingface_hub import list_repo_files
-            filenames = list_repo_files(repo_id)
+            skip = MODEL_SKIP_SUFFIXES.get(model_key, ())
+            filenames = [name for name in list_repo_files(repo_id)
+                         if not (skip and name.endswith(skip))]
         log(f"HuggingFace Endpoint: {huggingface_hub.constants.ENDPOINT}")
         log(f"Downloading {repo_id} to {local_dir}")
         for filename in filenames:

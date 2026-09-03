@@ -1013,33 +1013,44 @@ def _short_prompt_runtime_error(exc: BaseException) -> bool:
     return any(marker in message for marker in _PROMPT_SHAPE_ERROR_MARKERS)
 
 
-def _fit_to_slot(clip: np.ndarray, text: str, language: str, start: float,
-                 end: float, overflow_end: float, fit_duration: bool) -> np.ndarray:
-    """Place a generated clip in its slot without crushing it.
+def _fit_to_slot(clip: np.ndarray, start: float, end: float,
+                 overflow_end: float, fit_duration: bool) -> np.ndarray:
+    """Leave a rendition alone unless it genuinely does not fit.
 
-    Aim at what a person would take to say the line, not at what the model
-    returned: compressing a dragged reading back towards natural is a repair,
-    while compressing a natural reading into a slot sized for the *source*
-    language is what made lines unintelligible. Never stretch to fill either --
-    finishing early and leaving silence costs nothing.
+    The target used to be natural_reading_seconds, an estimate from the
+    translated text, with MAX_HARD_COMPRESSION as a floor beneath it. Measured
+    against the real renditions that estimate is about half of what IndexTTS
+    actually speaks, so the floor was never a limit on crushing -- it was the
+    operating point. generated/1.15 beat the estimate on essentially every
+    line, so essentially every line came out compressed by exactly 1.15x. On
+    3dsvr-1911 all 377 lines were squeezed that way, and all 377 already
+    fitted, most at 0.62-0.69x of the source line they replace.
 
-    But `natural` is an estimate of reading time, not a licence to crush the
-    rendition down to it. On ipvr-385 the estimate for a one-character line is
-    0.30s, the model rendered it as a 1.7-2.9s delivery, and the fit squeezed it
-    by up to 9.6x -- 97% of the title over 1.15x, 39% over 3x, which is the
-    "flashes past, cannot make out a word" report. MAX_HARD_COMPRESSION was
-    added for exactly this and then never wired to anything. Give the clip the
-    room it needs; the gap behind it is usually enormous (84s on line 36).
+    1.15 is also the wrong side of tool_si's branch: a factor at or below it
+    takes a linear-resample path that carries pitch with it, and at 1.15 that
+    is 2.42 semitones, not the quarter-tone the comment there claims.
+
+    So measure against the rendition itself, the only honest account of how
+    long the line takes to say. It fits, or it is compressed by exactly the
+    ratio needed and no more. Across three titles that leaves 96.2% of lines
+    untouched, against 0% before.
+
+    What this gives up is pulling a dragged rendition back towards an estimated
+    pace; it now plays out in full. That is the right trade here -- the dub
+    runs shorter than the line it replaces on almost every line, so the room
+    exists, and the estimate was never accurate enough to aim at.
     """
     if not fit_duration:
         return clip
     generated = clip.size / SAMPLE_RATE
-    natural = natural_reading_seconds(text, normalize_language(language))
     room = max(0.0, overflow_end - start)
     allowed = max(room, end - start)
-    wanted = min(natural, allowed)
-    least_crushed = generated / MAX_HARD_COMPRESSION
-    return _fit_audio(clip, SAMPLE_RATE, min(allowed, max(wanted, least_crushed)))
+    if generated <= allowed:
+        # Returned as generated rather than fitted to its own length: rounding
+        # a duration to a sample count can land a hair above 1.0 and send the
+        # clip through the resampler, and its pitch with it, for nothing.
+        return clip
+    return _fit_audio(clip, SAMPLE_RATE, allowed)
 
 
 def _synth_line(idx: int, total: int, start: float, end: float, note: str,
@@ -1369,9 +1380,7 @@ def synthesize_manifest(model, source_audio: str | Path, segments: Iterable[dict
                 clip = torchaudio.functional.resample(
                     torch.from_numpy(clip), clip_sr, SAMPLE_RATE
                 ).numpy()
-            clip = _fit_to_slot(
-                clip, text, language, start, end, overflow_end[idx - 1], fit_duration
-            )
+            clip = _fit_to_slot(clip, start, end, overflow_end[idx - 1], fit_duration)
             log(_synth_line(idx, len(entries), start, end, prompt_note + " cached",
                             generated_duration, clip, fit_duration))
             clips.append(clip)
@@ -1431,9 +1440,7 @@ def synthesize_manifest(model, source_audio: str | Path, segments: Iterable[dict
         if clip_sr != SAMPLE_RATE:
             import torchaudio, torch
             clip = torchaudio.functional.resample(torch.from_numpy(clip), clip_sr, SAMPLE_RATE).numpy()
-        clip = _fit_to_slot(
-            clip, text, language, start, end, overflow_end[idx - 1], fit_duration
-        )
+        clip = _fit_to_slot(clip, start, end, overflow_end[idx - 1], fit_duration)
         fresh_cache[cache_id] = cache_key
         log(_synth_line(idx, len(entries), start, end, prompt_note,
                         generated_duration, clip, fit_duration))

@@ -398,6 +398,7 @@
       "opt_vad_high": "高 (拾取气声)",
       "opt_vad_max": "极高 (耳语场景)",
       "opt_model_kotoba": "kotoba(日文)",
+      "opt_model_anime": "anime-whisper(日文)",
       "model_ready": "识别模型已就绪：{}",
       "model_missing": "识别模型缺失或不完整：{}",
       "grp_voice_models": "克隆配音模型",

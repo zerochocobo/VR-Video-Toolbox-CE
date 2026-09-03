@@ -166,9 +166,10 @@ class ClonevoiceToolsApp:
         ttk.Combobox(row1, textvariable=self.src_lang_var, values=list(self._lang_map.keys()), state="readonly", width=14).pack(side="left", padx=(0, 16))
         ttk.Label(row1, text=get_text("lbl_model"), width=10).pack(side="left")
         self._model_map = {
+            get_text("opt_model_anime"): "anime-whisper",
+            get_text("opt_model_kotoba"): "kotoba",
             "large-v3": "large-v3",
             "large-v2": "large-v2",
-            get_text("opt_model_kotoba"): "kotoba",
         }
         self.model_var = tk.StringVar(value=get_text("opt_model_kotoba"))
         self.model_combo = ttk.Combobox(row1, textvariable=self.model_var, values=list(self._model_map.keys()), state="readonly", width=18)
@@ -202,7 +203,7 @@ class ClonevoiceToolsApp:
             get_text("opt_denoise_balanced"): "balanced",
             get_text("opt_denoise_strong"): "strong",
         }
-        self.denoise_var = tk.StringVar(value=get_text("opt_denoise_mild"))
+        self.denoise_var = tk.StringVar(value=get_text("opt_denoise_none"))
         ttk.Combobox(clone_vad_row, textvariable=self.denoise_var, values=list(self._denoise_map.keys()), state="readonly", width=12).pack(side="left", padx=(0, 16))
         ttk.Label(clone_vad_row, text=get_text("lbl_vad_sensitivity"), width=12).pack(side="left")
         self.clone_vad_var = tk.StringVar(value=get_text("opt_vad_high"))
@@ -391,9 +392,10 @@ class ClonevoiceToolsApp:
             get_text("opt_lang_zh"): "zh",
         }
         self.single_clone_model_map = {
+            get_text("opt_model_anime"): "anime-whisper",
+            get_text("opt_model_kotoba"): "kotoba",
             "large-v3": "large-v3",
             "large-v2": "large-v2",
-            get_text("opt_model_kotoba"): "kotoba",
         }
         self.single_clone_denoise_map = {
             get_text("opt_denoise_none"): "none",
@@ -426,7 +428,7 @@ class ClonevoiceToolsApp:
         ttk.Label(single_clone_options_row, text=get_text("lbl_denoise"), width=step1_secondary_label_width).pack(
             side="left", padx=(0, 6)
         )
-        self.single_clone_denoise_var = tk.StringVar(value=get_text("opt_denoise_mild"))
+        self.single_clone_denoise_var = tk.StringVar(value=get_text("opt_denoise_none"))
         ttk.Combobox(
             single_clone_options_row,
             textvariable=self.single_clone_denoise_var,
@@ -696,9 +698,10 @@ class ClonevoiceToolsApp:
             get_text("opt_lang_zh"): "zh",
         }
         self.multi_clone_model_map = {
+            get_text("opt_model_anime"): "anime-whisper",
+            get_text("opt_model_kotoba"): "kotoba",
             "large-v3": "large-v3",
             "large-v2": "large-v2",
-            get_text("opt_model_kotoba"): "kotoba",
         }
         self.multi_clone_denoise_map = {
             get_text("opt_denoise_none"): "none",
@@ -820,7 +823,7 @@ class ClonevoiceToolsApp:
             width=14,
         ).pack(side="left", padx=(0, 16))
         ttk.Label(lang_row, text=get_text("lbl_denoise"), width=secondary_width).pack(side="left", padx=(0, 6))
-        self.multi_clone_denoise_var = tk.StringVar(value=get_text("opt_denoise_mild"))
+        self.multi_clone_denoise_var = tk.StringVar(value=get_text("opt_denoise_none"))
         ttk.Combobox(
             lang_row,
             textvariable=self.multi_clone_denoise_var,

@@ -64,7 +64,7 @@ def run_single_transcribe(
     language: Optional[str],
     target_language: str,
     models_root: str,
-    denoise: str = "mild",
+    denoise: str = "none",
     vad_sensitivity: str = "high",
     diarize_backend: str = "none",
     num_speakers: Optional[int] = None,

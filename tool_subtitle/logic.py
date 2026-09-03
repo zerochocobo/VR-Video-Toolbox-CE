@@ -1427,7 +1427,8 @@ class SubtitleGenerator:
 
         return segmented_chunks or [chunk]
 
-    def split_audio_auditok_whisperseg(self, audio_path: str, chunk_seconds: float):
+    def split_audio_auditok_whisperseg(self, audio_path: str, chunk_seconds: float,
+                                       merge_gap_seconds: float | None = None):
         auditok_chunks = self.split_audio_auditok(audio_path, chunk_seconds)
         _, decode_audio, _ = _ensure_faster_whisper()
         audio = decode_audio(audio_path, sampling_rate=16000)
@@ -1458,7 +1459,9 @@ class SubtitleGenerator:
         segmented_chunks = []
         fallback_chunks = 0
         max_samples = int(AUDITOK_MAX_DURATION * 16000)
-        merge_gap_samples = int(WHISPERSEG_MERGE_GAP_SECONDS * 16000)
+        merge_gap = (WHISPERSEG_MERGE_GAP_SECONDS if merge_gap_seconds is None
+                     else merge_gap_seconds)
+        merge_gap_samples = int(merge_gap * 16000)
 
         for chunk in auditok_chunks:
             chunk_start = int(chunk["offset_sec"] * 16000)
@@ -1524,18 +1527,51 @@ class SubtitleGenerator:
         )
         return segmented_chunks
 
-    def split_audio_whisperseg(self, audio_path: str, chunk_seconds: float):
+    def split_audio_whisperseg(self, audio_path: str, chunk_seconds: float,
+                               vad_audio_path: str | None = None,
+                               merge_gap_seconds: float | None = None):
+        """Split into ASR chunks at WhisperSeg's speech boundaries.
+
+        ``vad_audio_path`` lets the speech detector listen to a cleaned copy of
+        the audio while the decoder still receives the original. Denoising the
+        ASR feed is a trade -- it lifts quiet speech above the gate but dulls the
+        consonant detail the decoder needs -- and separating the two feeds takes
+        only the first half of it. The RMS gate deliberately stays on the
+        original: its thresholds were calibrated against mixture levels, and a
+        denoised copy has a different noise floor.
+
+        ``merge_gap_seconds`` overrides how far apart two speech regions may be
+        and still land in the same decode window. It is a parameter rather than
+        only a module constant because the answer differs by consumer: subtitles
+        want long windows for context, while the dub measurably recovers more
+        speech from short ones (scripts/asr_bench).
+        """
         _, decode_audio, _ = _ensure_faster_whisper()
         audio = decode_audio(audio_path, sampling_rate=16000)
         if audio.ndim != 1:
             audio = np.asarray(audio).reshape(-1)
 
-        probs = self.whisperseg_speech_probs(audio, sampling_rate=16000)
+        vad_audio = audio
+        if vad_audio_path:
+            vad_audio = decode_audio(vad_audio_path, sampling_rate=16000)
+            if vad_audio.ndim != 1:
+                vad_audio = np.asarray(vad_audio).reshape(-1)
+            # A filter pass can change the length by a frame or two; the region
+            # times must stay valid indices into the audio the chunks come from.
+            if len(vad_audio) != len(audio):
+                self.log_callback(
+                    f"VAD audio is {len(vad_audio) - len(audio)} samples off the "
+                    "decode audio; trimming to the shorter of the two"
+                )
+                shortest = min(len(vad_audio), len(audio))
+                vad_audio = vad_audio[:shortest]
+
+        probs = self.whisperseg_speech_probs(vad_audio, sampling_rate=16000)
         # Kept for postprocess: per-line speech coverage (hallucination check).
         self.last_speech_probs = probs
         speech_regions = self.frame_probs_to_segments(
             probs,
-            len(audio),
+            len(vad_audio),
             threshold=self.vad_threshold,
             neg_threshold=self.vad_neg_threshold,
             min_speech_ms=WHISPERSEG_MIN_SPEECH_MS,
@@ -1552,8 +1588,28 @@ class SubtitleGenerator:
         chunks = []
         current_start, current_end = speech_regions[0]
         max_samples = int(min(chunk_seconds, AUDITOK_MAX_DURATION) * 16000)
-        merge_gap_samples = int(WHISPERSEG_MERGE_GAP_SECONDS * 16000)
+        merge_gap = (WHISPERSEG_MERGE_GAP_SECONDS if merge_gap_seconds is None
+                     else merge_gap_seconds)
+        merge_gap_samples = int(merge_gap * 16000)
         min_samples = int(WHISPERSEG_MIN_CHUNK_SECONDS * 16000)
+
+        def emit(start: int, end: int):
+            # The speech regions this window covers, window-relative. A
+            # recogniser that returns text without timestamps needs them: they
+            # are where the utterances inside the window actually are, and they
+            # come from the VAD rather than from a guess.
+            covered = [
+                (max(0.0, (max(rs, start) - start) / 16000.0),
+                 (min(re_, end) - start) / 16000.0)
+                for rs, re_ in speech_regions
+                if re_ > start and rs < end
+            ]
+            chunks.append({
+                "array": audio[start:end].astype(np.float32, copy=False),
+                "offset_sec": start / 16000.0,
+                "duration_sec": (end - start) / 16000.0,
+                "regions": covered,
+            })
 
         def add_chunk(start: int, end: int):
             # A region WhisperSeg already classified as speech must never be
@@ -1566,11 +1622,20 @@ class SubtitleGenerator:
                 start = max(0, start - deficit // 2)
                 end = min(len(audio), start + min_samples)
                 start = max(0, end - min_samples)
-            chunks.append({
-                "array": audio[start:end].astype(np.float32, copy=False),
-                "offset_sec": start / 16000.0,
-                "duration_sec": (end - start) / 16000.0,
-            })
+            # The merge loop keeps *combined* regions under max_samples, but a
+            # single unbroken region can be longer than the window on its own --
+            # continuous dialogue with no pause the VAD can see. Whisper pads or
+            # truncates its input to 30 seconds, so everything past that in an
+            # over-long window is silently dropped: on the benchmark corpus one
+            # region ran 65 seconds and 35 of them never reached the model.
+            # Split at the quietest point near the middle so the cut lands in a
+            # breath rather than inside a word.
+            while end - start > max_samples:
+                cut = SubtitleGenerator.quietest_split_point(
+                    audio, start, end, max_samples)
+                emit(start, cut)
+                start = cut
+            emit(start, end)
 
         for start, end in speech_regions[1:]:
             gap = start - current_end
@@ -1593,6 +1658,7 @@ class SubtitleGenerator:
             f"coalesced to {len(chunks)} ASR chunks, "
             f"kept {kept_duration:.2f}s / {total_duration:.2f}s "
             f"(sensitivity={self.vad_sensitivity}, threshold={self.vad_threshold}, "
+            f"window={chunk_seconds:.1f}s, merge_gap={merge_gap:.2f}s, "
             f"rms_gate_removed={removed_by_energy})"
         )
         return chunks
@@ -1621,11 +1687,15 @@ class SubtitleGenerator:
             filtered.append((start, end))
         return filtered, removed
 
-    def split_audio_for_profile(self, audio_path: str, chunk_seconds: float, profile_name: str):
+    def split_audio_for_profile(self, audio_path: str, chunk_seconds: float, profile_name: str,
+                                vad_audio_path: str | None = None,
+                                merge_gap_seconds: float | None = None):
         if SCENE_SPLIT_METHOD == "whisperseg":
-            return self.split_audio_whisperseg(audio_path, chunk_seconds)
+            return self.split_audio_whisperseg(
+                audio_path, chunk_seconds, vad_audio_path, merge_gap_seconds)
         if SCENE_SPLIT_METHOD == "auditok_whisperseg":
-            return self.split_audio_auditok_whisperseg(audio_path, chunk_seconds)
+            return self.split_audio_auditok_whisperseg(
+                audio_path, chunk_seconds, merge_gap_seconds)
         if SCENE_SPLIT_METHOD == "auditok":
             return self.split_audio_auditok(audio_path, chunk_seconds)
         if SCENE_SPLIT_METHOD not in {"fixed", "none"}:
@@ -1733,6 +1803,29 @@ class SubtitleGenerator:
                 new_end = offset + pos / sampling_rate
             if new_end > entry["end"]:
                 entry["end"] = min(new_end + TAIL_EXTEND_RELEASE_PAD_SECONDS, limit)
+
+    @staticmethod
+    def quietest_split_point(audio, start: int, end: int, max_samples: int,
+                             sampling_rate: int = 16000) -> int:
+        """Sample index to cut an over-long window at.
+
+        Searched over the last third of what will fit, so the piece before the
+        cut stays close to a full window while the cut itself still lands in the
+        quietest 20ms frame available -- a breath or a pause between sentences
+        rather than the middle of a syllable.
+        """
+        frame = max(1, int(sampling_rate * 0.02))
+        limit = start + max_samples
+        search_start = max(start + frame, limit - max_samples // 3)
+        search_end = min(limit, end - frame)
+        if search_end <= search_start:
+            return min(limit, end)
+        span = np.asarray(audio[search_start:search_end], dtype=np.float64)
+        frames = len(span) // frame
+        if frames < 1:
+            return min(limit, end)
+        rms = np.sqrt((span[:frames * frame].reshape(frames, frame) ** 2).mean(axis=1))
+        return search_start + int(np.argmin(rms)) * frame
 
     @staticmethod
     def find_silence_runs(audio, start: float, end: float,

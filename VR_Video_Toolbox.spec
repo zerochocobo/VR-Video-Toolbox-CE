@@ -16,7 +16,7 @@ into dist after build; see the copy steps in build_exe.bat.
 import os
 import sys
 import importlib.util
-from PyInstaller.utils.hooks import collect_all, collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
 
 block_cipher = None
 PROJECT_ROOT = os.path.abspath(os.getcwd())
@@ -167,6 +167,25 @@ for pkg in (
         hiddenimports += h
     except Exception:
         pass
+
+# s3prl: the ECAPA-WavLM speaker model loads its WavLM backbone through
+# torch.hub.load(source="local") against models/OmniVoice_ECAPA/.../hubconf.py,
+# and that hubconf is the only thing that imports s3prl. Nothing in our source
+# does, so PyInstaller's static graph never sees it and the frozen build died
+# with "No module named 's3prl'" the moment diarization asked for voice
+# embeddings. collect_all("s3prl") would drag in all ~500 upstream modules (and
+# their uninstalled optional deps), so name only the wavlm chain the hubconf
+# uses. version.txt is required: s3prl/__init__.py reads it at import time.
+hiddenimports += [
+    "s3prl",
+    "s3prl.util.download",
+    "s3prl.upstream.wavlm.expert",
+    "s3prl.upstream.wavlm.hubconf",
+]
+try:
+    datas += collect_data_files("s3prl")
+except Exception:
+    pass
 
 a = Analysis(
     ["main.py"],

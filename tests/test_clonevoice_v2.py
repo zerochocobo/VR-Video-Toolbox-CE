@@ -380,15 +380,24 @@ def test_a_non_japanese_only_model_is_never_second_guessed(tmp_path: Path):
 
 
 def test_the_v2_transcription_defaults():
-    """kotoba because large-v3 invents stock phrases over this material rather
-    than transcribing it; "high" because "max" answers every breath with one.
-    Counted over the transcribed titles, the runs at "max" carry 12-15%
-    stock-phrase lines and 31-46% three-character fragments, against 0-5% and
-    3-13% at "high" -- and a hallucinated line is spoken aloud in the dub,
-    where a missing one is only silence."""
+    """anime-whisper since 2026-09-03; "high" because "max" answers every breath
+    with a stock phrase.
+
+    anime-whisper is a Whisper large-v2 fine-tune on anime/drama Japanese, the
+    register this material is actually in. Measured on the benchmark corpus it
+    recognises 13% more kanji than kotoba -- content words, not characters --
+    and gets words right that kotoba misses ("同時ないように" ->
+    "動じないように"). kotoba stays selectable and is the first fallback when
+    anime-whisper is not installed; large-v3 remains last, because it invents
+    stock phrases over this material rather than transcribing it.
+
+    "high" over "max": counted over the transcribed titles, the runs at "max"
+    carry 12-15% stock-phrase lines and 31-46% three-character fragments,
+    against 0-5% and 3-13% at "high" -- and a hallucinated line is spoken aloud
+    in the dub, where a missing one is only silence."""
     import inspect
 
     for fn in (logic.run_transcribe_diarize, logic.run_full, logic.run_batch):
         params = inspect.signature(fn).parameters
-        assert params["model_key"].default == "kotoba"
+        assert params["model_key"].default == "anime-whisper"
         assert params["vad_sensitivity"].default == "high"

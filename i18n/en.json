@@ -398,6 +398,7 @@
       "opt_vad_high": "High (breathy speech)",
       "opt_vad_max": "Max (whispering)",
       "opt_model_kotoba": "kotoba (Japanese)",
+      "opt_model_anime": "anime-whisper (Japanese)",
       "model_ready": "ASR model ready: {}",
       "model_missing": "ASR model missing or incomplete: {}",
       "grp_voice_models": "Voice Clone Models",

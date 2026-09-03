@@ -304,11 +304,19 @@ def speaker_centroids(
     if not windows:
         return {}
     audio, sr = _read_wav_mono(audio16k_path)
-    model = _load_ecapa_model(models_root, device, log)
+    model = None
     try:
+        model = _load_ecapa_model(models_root, device, log)
         embeddings = _extract_ecapa_embeddings(
             model, audio, sr, windows, device, lambda _m: None
         )
+    except Exception as exc:
+        # The bundle's files can be on disk while the code that loads them is
+        # not: its hubconf imports s3prl, which a build may have left out. Voice
+        # matching only refines a split the diarizer already made, so lose that
+        # refinement rather than the whole transcription run.
+        log(f"[diarize] voice embeddings unavailable ({exc}); continuing without them")
+        return {}
     finally:
         del model
     centroids: dict[str, "np.ndarray"] = {}

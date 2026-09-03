@@ -18,6 +18,7 @@ dist
 .base 
 .vscode/settings.json
 /prompt
+/scripts/asr_bench/results
 /GUI/VR_Mosaic_Removal/prompt
 uv.lock
 reference
@@ -31,5 +32,10 @@ tool_pinyin_wav_generator
 /models/**/*
 !/models/**/
 !/models/**/*.txt
+# ...except tokenizer vocabularies that merely happen to end in .txt
+# (anime-whisper ships a 500 KB merges.txt); only the get_*.txt download
+# guides are meant to be tracked.
+/models/**/merges.txt
+/models/**/vocab.txt
 
 tool_clonevoice/gui.py
