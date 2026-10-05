@@ -533,6 +533,9 @@ def run_synthesize(
         max_segments=max_segments, log=log, stop_event=stop_event,
     )
     _release_cuda_cache()
+    if max_segments is None:
+        from tool_si import logic as si
+        si.prepare_dlna_audio(video, out, log_callback=log, stop_event=stop_event)
     return out
 
 
@@ -568,6 +571,7 @@ def run_full(
     out_path = si.default_si_audio_path(str(video))
     if skip_existing and Path(out_path).exists():
         log(f"[full] output exists, skipping: {out_path}")
+        si.prepare_dlna_audio(video, out_path, log_callback=log, stop_event=stop_event)
         return str(out_path)
 
     log("=== [1/4] Transcription + diarization ===")

@@ -86,6 +86,7 @@ class SimultaneousInterpretationLogicTests(unittest.TestCase):
         app.model_frame = FakePackedWidget(packed=frame_packed)
         app.btn_download_model = FakePackedWidget(packed=button_packed)
         app.notebook = FakePackedWidget()
+        app._log_frame = FakePackedWidget()
         app._model_frame_packed = frame_packed
         app._download_button_packed = button_packed
         return app
@@ -117,7 +118,7 @@ class SimultaneousInterpretationLogicTests(unittest.TestCase):
         self.assertIn("models/qwen", app.model_status_var.value)
         self.assertTrue(app._model_frame_packed)
         self.assertTrue(app.model_frame.packed)
-        self.assertIs(app.model_frame.pack_calls[-1]["before"], app.notebook)
+        self.assertIs(app.model_frame.pack_calls[-1]["before"], app._log_frame)
         self.assertTrue(app._download_button_packed)
         self.assertTrue(app.btn_download_model.packed)
         self.assertEqual(app.btn_download_model.config_calls[-1], {"state": "normal"})

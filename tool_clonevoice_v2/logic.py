@@ -1357,6 +1357,7 @@ def run_synthesize(
     save_manifest(video, manifest)
     _release_cuda_cache()
     log_memory("after synthesis", log)
+    si.prepare_dlna_audio(video, out, log_callback=log, stop_event=stop_event)
     return out
 
 
@@ -1390,6 +1391,7 @@ def run_full(
     out_path = si.default_si_audio_path(str(video))
     if skip_existing and Path(out_path).exists():
         log(f"[full] output exists, skipping: {out_path}")
+        si.prepare_dlna_audio(video, out_path, log_callback=log, stop_event=stop_event)
         return str(out_path)
 
     log("=== [1/3] Transcription (sentence references, no speaker detection) ===")
@@ -1466,6 +1468,7 @@ def run_batch(
             level_match=level_match, timbre_anchor=timbre_anchor,
         ):
             log(f"[batch] output is up to date, skipping: {output}")
+            si.prepare_dlna_audio(video, output, log_callback=log, stop_event=stop_event)
             outputs_by_video[video] = str(output)
         else:
             pending_by_directory.setdefault(video.parent, []).append(video)

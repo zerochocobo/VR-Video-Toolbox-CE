@@ -767,6 +767,7 @@ def translate_and_synthesize(
         out_path = si.default_si_audio_path(video)
         if skip_existing and Path(out_path).exists():
             log(f"[single] target .SI.WAV exists; skipped translation and cloning: {out_path}")
+            si.prepare_dlna_audio(video, out_path, log_callback=log, stop_event=stop_event)
             outputs.append(out_path)
             skipped.append(out_path)
             continue

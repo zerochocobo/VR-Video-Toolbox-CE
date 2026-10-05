@@ -1,18 +1,20 @@
 """Real-time DLNA SI audio mixing streams.
 
-The service exposes a virtual MP4 stream where the original video is copied and
-the first audio track is mixed with the sibling ``.si.wav`` file on demand.
+The service copies original video and a matching prepared ``.si.mix.m4a`` audio
+track, or mixes the sibling ``.si.wav`` on demand when no prepared mix matches.
 DLNA directory entries use the separate MPEG-TS live iterator because common VR
 players handle it more reliably than fragmented MP4 for live playback.
 """
 from __future__ import annotations
 
 import logging
+import json
 import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,7 @@ from tool_dlna import content_directory
 from tool_dlna.firewall import hidden_subprocess_kwargs
 from tool_dlna.media_library import safe_resolve_path
 from tool_si import logic as si_logic
+from utils.si_prepared_audio import find_prepared_audio, prepared_paths
 
 
 AUDIO_BITRATE_BPS = 192_000
@@ -214,6 +217,72 @@ class ConfigHolder:
             self._config = config
 
 
+def _file_identity(path: Path | None) -> tuple | None:
+    if path is None:
+        return None
+    try:
+        stat = path.stat()
+        return str(path), stat.st_size, stat.st_mtime_ns
+    except OSError:
+        return None
+
+
+@lru_cache(maxsize=64)
+def _valid_prepared_audio(identity: tuple) -> bool:
+    """Probe once per file version; malformed assets fall back to WAV mixing."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "stream=codec_name,profile,sample_rate,channels:format=duration",
+             "-of", "json", identity[0]],
+            capture_output=True, text=True, errors="replace", timeout=10,
+            check=True, **hidden_subprocess_kwargs(),
+        )
+        data = json.loads(result.stdout)
+        streams = data.get("streams", [])
+        return (len(streams) == 1 and streams[0].get("codec_name") == "aac"
+                and streams[0].get("profile") == "LC"
+                and streams[0].get("sample_rate") == "48000"
+                and streams[0].get("channels") == 2
+                and float(data.get("format", {}).get("duration", 0)) > 0)
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError, AttributeError) as exc:
+        log.warning("Ignoring invalid prepared SI audio %s: %s", identity[0], exc)
+        return False
+
+
+def _prepared_audio_for_stream(video: Path, si_wav: Path, config: SIMixConfig,
+                               duck_key: Path | None) -> Path | None:
+    audio = find_prepared_audio(
+        video, si_wav, duck_key, config.filter_string(duck_key_input=duck_key is not None),
+    )
+    identity = _file_identity(audio)
+    return audio if identity is not None and _valid_prepared_audio(identity) else None
+
+
+def _stream_input_identity(video: Path, si_wav: Path, duck_key: Path | None) -> tuple:
+    audio, metadata = prepared_paths(video)
+    return tuple(_file_identity(path) for path in (video, si_wav, duck_key, audio, metadata))
+
+
+def _si_input_command(video: Path, si_wav: Path, config: SIMixConfig,
+                      start_time: float, duck_key: Path | None) -> list[str]:
+    """Shared input/codec selection for MPEG-TS and fragmented MP4 streams."""
+    seek = f"{max(0.0, float(start_time or 0.0)):.3f}"
+    prepared = _prepared_audio_for_stream(video, si_wav, config, duck_key)
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", seek, "-i", str(video),
+           "-ss", seek, "-i", str(prepared or si_wav)]
+    if prepared is not None:
+        log.info("Using prepared SI audio video=%s audio=%s seek=%s", video, prepared, seek)
+        return cmd + ["-map", "0:v", "-c:v", "copy", "-map", "1:a:0", "-c:a", "copy"]
+    if duck_key is not None:
+        cmd += ["-ss", seek, "-i", str(duck_key)]
+    return cmd + [
+        "-filter_complex", config.filter_string(duck_key_input=duck_key is not None),
+        "-map", "0:v", "-c:v", "copy", "-map", "[si_track]",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+    ]
+
+
 def parse_range_header(value: str | None) -> tuple[int, int | None]:
     """Parse a single HTTP bytes range, falling back to a full stream."""
     header = (value or "").strip()
@@ -261,40 +330,8 @@ class LiveStreamSession:
 
     def _start_ffmpeg(self, start_time: float) -> None:
         seek = f"{max(0.0, start_time):.3f}"
-        use_duck_key = self.duck_key is not None
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-ss",
-            seek,
-            "-i",
-            str(self.video),
-            "-ss",
-            seek,
-            "-i",
-            str(self.si_wav),
-        ]
-        if use_duck_key:
-            cmd += ["-ss", seek, "-i", str(self.duck_key)]
+        cmd = _si_input_command(self.video, self.si_wav, self.config, start_time, self.duck_key)
         cmd += [
-            "-filter_complex",
-            self.config.filter_string(duck_key_input=use_duck_key),
-            "-map",
-            "0:v",
-            "-c:v",
-            "copy",
-            "-map",
-            "[si_track]",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-ar",
-            "48000",
-            "-ac",
-            "2",
             "-movflags",
             "+frag_keyframe+empty_moov+default_base_moof",
             "-f",
@@ -312,7 +349,10 @@ class LiveStreamSession:
 
     def is_usable(self) -> bool:
         proc = self.proc
-        return not self._closed and proc is not None and proc.stdout is not None and proc.poll() is None
+        # A fast remux can exit before the client drains stdout. Keep reading
+        # buffered bytes; open_stream drops the session only after actual EOF.
+        return (not self._closed and proc is not None and proc.stdout is not None
+                and not proc.stdout.closed)
 
     def read(self, n: int) -> bytes:
         with self.lock:
@@ -378,6 +418,7 @@ class SIStreamService:
         self._reuse_tolerance_bytes = max(0, int(reuse_tolerance_bytes))
         self._seek_cooldown_seconds = max(0.0, float(seek_cooldown_seconds))
         self._sessions: dict[str, Any] = {}
+        self._session_inputs: dict[str, tuple] = {}
         self._last_start_at: dict[str, float] = {}
         self._estimate_cache: dict[str, tuple[float, int]] = {}
         self._sessions_lock = threading.Lock()
@@ -501,13 +542,16 @@ class SIStreamService:
         duck_key: Path | None = None,
     ) -> Any:
         key = self._session_key(video, client_id)
+        input_identity = _stream_input_identity(video, si_wav, duck_key)
         with self._sessions_lock:
             session = self._sessions.get(key)
-            if session is not None and self._can_reuse(session, config, si_wav, duck_key, range_start):
+            if (session is not None and self._session_inputs.get(key) == input_identity
+                    and self._can_reuse(session, config, si_wav, duck_key, range_start)):
                 return session
             if session is not None:
                 self._close_session(session)
                 self._sessions.pop(key, None)
+                self._session_inputs.pop(key, None)
 
             last_start = self._last_start_at.get(key, 0.0)
             wait_seconds = self._seek_cooldown_seconds - (time.monotonic() - last_start)
@@ -525,6 +569,7 @@ class SIStreamService:
                 duck_key=duck_key,
             )
             self._sessions[key] = session
+            self._session_inputs[key] = input_identity
             self._last_start_at[key] = time.monotonic()
             return session
 
@@ -541,6 +586,7 @@ class SIStreamService:
             if self._sessions.get(key) is not session:
                 return
             self._sessions.pop(key, None)
+            self._session_inputs.pop(key, None)
         if close:
             self._close_session(session)
 
@@ -604,6 +650,7 @@ class SIStreamService:
         with self._sessions_lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()
+            self._session_inputs.clear()
         for session in sessions:
             self._close_session(session)
         log.info("Reloaded DLNA SI config: %s", new_config.as_dict())
@@ -612,6 +659,7 @@ class SIStreamService:
         with self._sessions_lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()
+            self._session_inputs.clear()
         for session in sessions:
             self._close_session(session)
 
@@ -625,42 +673,10 @@ def iter_si_mpegts(
     duck_key: Path | None = None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
 ) -> Iterator[bytes]:
-    """Yield a realtime MPEG-TS SI mix stream from ``start_time`` seconds."""
+    """Remux a prepared mix or produce live SI audio from ``start_time``."""
     seek = f"{max(0.0, float(start_time or 0.0)):.3f}"
-    use_duck_key = duck_key is not None
-    cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-ss",
-        seek,
-        "-i",
-        str(video),
-        "-ss",
-        seek,
-        "-i",
-        str(si_wav),
-    ]
-    if use_duck_key:
-        cmd += ["-ss", seek, "-i", str(duck_key)]
+    cmd = _si_input_command(video, si_wav, config, start_time, duck_key)
     cmd += [
-        "-filter_complex",
-        config.filter_string(duck_key_input=use_duck_key),
-        "-map",
-        "0:v",
-        "-c:v",
-        "copy",
-        "-map",
-        "[si_track]",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-ar",
-        "48000",
-        "-ac",
-        "2",
         "-muxpreload",
         "0",
         "-muxdelay",

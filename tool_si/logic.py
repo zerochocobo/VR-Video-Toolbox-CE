@@ -423,6 +423,13 @@ def default_si_audio_path(video_path: str | os.PathLike[str]) -> str:
     return _format_path_like_source(path.with_suffix(".si.wav"), video_path)
 
 
+def prepare_dlna_audio(video_path, si_audio_path=None, *, log_callback=print, stop_event=None):
+    """Add the prepared PTMediaServer mix without rerunning voice synthesis."""
+    from tool_si.dlna_audio import prepare_after_synthesis
+
+    return prepare_after_synthesis(video_path, si_audio_path, log=log_callback, stop_event=stop_event)
+
+
 def default_si_duck_key_path(path: str | os.PathLike[str]) -> str:
     source = Path(path)
     if source.name.lower().endswith(".si.wav"):
@@ -1607,6 +1614,12 @@ def subtitle_to_audio(
         timeline = np.zeros(1, dtype=np.float32)
     write_wav_mono(output_path, timeline, sample_rate)
     log_callback(f"Saved audio: {output_path}")
+    # A preview timeline is rebased/truncated and must never become the full
+    # movie's ready-to-play mix. A standalone SRT has no original track to mix.
+    if not time_limited and max_entries is None:
+        video = srt_path.with_suffix(".mp4")
+        if video.is_file() and output_path.resolve() == video.with_suffix(".si.wav").resolve():
+            prepare_dlna_audio(video, output_path, log_callback=log_callback, stop_event=stop_event)
     return str(output_path)
 
 

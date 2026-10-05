@@ -2,6 +2,51 @@
 
 ## English
 
+### 2026-10-03
+
+- New: Full SI generation and OmniVoice/IndexTTS cloning now prepare a complete source/voice/duck-key mix as paired `.si.mix.m4a` and `.si.mix.json` sidecars, using AAC-LC at 192 kb/s, 48 kHz, stereo, and faststart for PTMediaServer virtual MP4 playback.
+- New: Added `python -m tool_si.dlna_audio VIDEO_OR_DIRECTORY [--recursive]` to prepare existing WAV outputs without loading voice models or calling translation APIs; clone skip-existing paths also backfill missing mixes, while partial SI previews are excluded.
+- Optimization: The built-in DLNA server now reuses compatible prepared audio in both MPEG-TS and fragmented-MP4 SI streams by copying AAC packets. Exact input/filter/format validation keeps stale, incomplete, or mismatched assets on the existing WAV-mixing fallback; ordinary SI reuse requires matching the exported zero-delay settings.
+- Fix: Prepared-audio creation validates output before publishing its completion marker and preserves successful WAVs on failure or cancellation; DLNA sessions restart when media identities change and drain buffered FFmpeg output after process exit.
+
+### 2026-08-18
+
+- New: Added default-on per-line source-level matching for IndexTTS cloning. Bandit separates only padded subtitle/word spans, supplying speech-level references and a reusable `.dub_bg.wav` background bed while preserving source samples outside those spans; missing or unreliable speech stems use safe mixture-based estimates.
+- Fix: Level matching now measures the actual word extent, rejects implausibly weak separated stems, clears stale measurements, and uses bounded gain, peak protection, and a median-relative audibility floor. Span signatures and completion markers prevent repeated separation when some stems are legitimately empty.
+- Fix: Repaired collapsed dubbing time slots that compressed whole lines into tiny fragments. V2 fragment merging expands slots when they cannot hold the text, and both clone backends prevent split boundaries from cutting inside their own word timestamps.
+- New: Added optional speaker-turn splitting before v2 fragment merging, with fragment-cluster filtering and short-run smoothing to reduce mixed-speaker references. Single and batch clone pages offer speaker count 1 (default, no diarization), automatic, or 2-7; enabling splitting requires rebuilding existing transcription/translation checkpoints.
+- New: Restored v2 dubbing mode to replace dialogue within subtitle spans, reuse validated background beds, and export `_DUB.mp4` while retaining original audio outside the spans.
+- Fix: V2 batch/full cloning now honors Keep intermediate files: when disabled, each successfully synthesized video's entire `.clone` directory is removed, including transcription, translation, and proofreading checkpoints. Background beds remain, and videos skipped because `.si.wav` already exists are left untouched.
+- UI/Fix: Corrected overlapping grid rows in the mix/dubbing page so start/stop buttons remain visible; added geometry regression checks. Final level-matching and turn-splitting changes were tested and replayed against real manifests, with end-to-end resynthesis/listening still pending in the handover.
+
+### 2026-08-15
+
+- Fix: IndexTTS synthesis now tries each sentence's exact source span first instead of preemptively replacing short lines with the longest sentence in the video. Actual short-input failures retry a nearby context window, and old per-line outputs are cleared before inference to prevent false success from stale WAVs.
+- Fix/Optimization: Added effective-speech, level, and periodic-voicing checks for weak/breathy references. Unreliable lines can use a nearby stable timbre reference while retaining the current sentence's emotion with reduced conditioning for unvoiced input; source audio is read once per video.
+- Packaging: Explicitly collect and verify the complete IndexTTS text runtime, including UniDic/Fugashi, Contractions, WeText, KaldiFST, SentencePiece, Textstat/Pyphen, and SoundFile/libsndfile, so incomplete packages fail during building.
+- Major fix: Replaced codec-dependent WAV saves with standard PCM16 writers and fixed SoundFile-backed reads to avoid torio/PyNv FFmpeg DLL conflicts. Corrected IndexTTS's pre-scaled float-to-int16 conversion so generated audio is not clipped into a full-scale square wave.
+- Packaging/UI: Build cleanup now checks running GUI and both DLNA executable locations before deletion, including DLNA-only builds, and fails explicitly if process inspection is unavailable. Releases exclude model weights and include all three user guides; debug intermediate-file retention defaults to off in both clone tools.
+
+### 2026-08-14
+
+- New: Expanded Sentence Emotion Voice Cloning into a video workflow with a two-step single-video path and recursive batch directory processing: transcription, translation, and per-sentence IndexTTS synthesis, with one model load per directory and controlled release before further ASR.
+- New/Fix: Batch resume reuses valid audio, manifests, source subtitles, translated subtitles, and final WAVs. Existing `translated.srt` can restore missing manifest translations; cached translation paths avoid repeating AI source proofreading and can resume synthesis without an API configuration when translations are complete.
+- Fix: Removed forced per-line peak normalization and whole-timeline scaling so IndexTTS output retains its original amplitude. Mix controls were simplified around original-audio ducking, with strongest ducking and leakage prevention enabled by default.
+- Fix/Optimization: Added duration- and silence-budgeted fragment merging in v2 before synthesis, reducing tiny reference clips and mid-sentence prosody resets while respecting speaker boundaries.
+- Change/Documentation: Moved IndexTTS intermediate WAVs into the video's `.clone` directory, placed the new tool before the legacy OmniVoice launcher entry, and updated all three README and release-guide languages for the new workflow.
+
+### 2026-08-13
+
+- New: Integrated IndexTTS-2.5 with transcription, translation, proofreading, manifest/timeline export, and video mixing. The single-video UI was reduced to two steps using sentence WAV references without required reference text or speaker grouping, with moderate tempo fitting fixed for the single/batch paths.
+- Compatibility/Fix: Corrected vendored GPT2 generation/cache handling for Transformers 5.x, including legacy-cache conversion and explicit mel token IDs, resolving empty semantic output; real generated Chinese speech was independently checked with local ASR.
+- Change: Removed ineffective OmniVoice-specific synthesis and voice-design controls from v2; target languages are limited to Chinese, English, Japanese, Spanish, and Arabic, and per-line logs show raw, fitted, and slot durations.
+- New/Fix: Standardized auxiliary models under `models/IndexTTS-2.5/aux_models`, automatically recover missing or incomplete main/auxiliary assets, support resumable BigVGAN mirror downloads, and exclude unused MaskGCT and optional Qwen emotion weights from mandatory checks.
+
+### 2026-08-12
+
+- New: Added an experimental `tool_clonevoice_v2` entry using vendored IndexTTS-2.5 for per-sentence source-WAV references, duration fitting, and timeline assembly, while keeping the legacy OmniVoice tool available.
+- Compatibility/Packaging: Adapted the vendor imports to the existing Transformers 5.9 environment and added text-processing dependencies plus PyInstaller vendor/assets collection. This first stage used source WAV plus segment JSON; real model inference and the full video workflow were still pending.
+
 ### 2026-08-08
 
 - Major fix: Explicitly configured DeepSeek thinking mode instead of inheriting the service default. Translation now keeps thinking enabled at low reasoning effort by default, uses a 900-second processing timeout, and keeps API connection tests at a short 30-second timeout.
@@ -23,6 +68,10 @@
 
 - Clarification: Documented that source-scan restoration segments and intermediate SBS files may intentionally contain video only; the final Stage 4 timeline merge restores audio from the original source, and completion is indicated by `Done! Output:`.
 - Documentation/Performance: Documented Native GPU `max_clip_length` as a frame count, including automatic VRAM guard limits of 24/48/64 frames on large inputs and an estimated 1-6% whole-pipeline advantage for 180-frame clips over 90-frame clips under typical workloads.
+
+### 2026-07-25
+
+- Documentation/Verification: Confirmed sparse AI source proofreading covers all Clone Translation Dubbing entry points through the shared correction function. Manual translation proofreading makes no AI calls, and complete cached target-language translations skip both translation and source proofreading.
 
 ### 2026-07-24
 
@@ -247,6 +296,57 @@
 - Major update: Completed dubbing remix behavior: SI-only controls are hidden in dubbing mode, ducking is disabled, and DUB audio can optionally be added as an independent track.
 - Fix: Batch scans now ignore generated `_SI.mp4` and `_DUB.mp4` outputs so they are not reprocessed as source videos.
 
+### 2026-06-13
+
+- New: Clone Translation Dubbing gained recursive batch-directory processing and a unified video-audio mixing tab with single-file/batch modes sharing SI/dubbing settings.
+- New/UI: Added ASR, OmniVoice, and ECAPA model completeness/status checks, missing-model download actions, and download-size confirmation; ready model rows are hidden to reduce clutter.
+- Fix: Release ASR/diarization models before OmniVoice synthesis and clean up native model holders on the Tk main thread between batch videos; pyannote and ECAPA objects now receive explicit final cleanup.
+- Documentation/UI: Updated the launcher/tool naming, reordered clone settings, localized ASR model labels, and expanded bilingual model placement/download guides.
+
+### 2026-06-12
+
+- New/Change: Implemented an offline ECAPA-WavLM diarization backend with bounded automatic clustering and explicit speaker-count support. After real-material over-splitting, it was retained for explicit developer use while automatic selection reverted to pyannote or single-speaker fallback.
+- Fix: OmniVoice reference selection now prefers continuous speaker-exclusive diarization spans, subtracts other speakers' overlaps, protects boundaries, and scores purity to reduce reference voice leakage.
+- New/Diagnostics: Saved original diarization turns and subtitle indices in manifests, added source-subtitle references for each voice sample, and generated `references.md` with the selected source spans/text.
+- Fix/Investigation: Empty reference text no longer implicitly triggers OmniVoice's Whisper Turbo download. Evaluated CosyVoice cross-language cloning, then rolled back its integration and dependencies after listening comparisons.
+
+### 2026-06-11
+
+- Major fix: Normalized SimpleDecoder/ThreadedDecoder PTS origins and allowed tiny sub-frame residuals in NVDEC seek/pre-roll verification, eliminating false frame-mismatch errors while preserving detection of actual misalignment.
+- Major fix: Disabled `-shortest` for GPU timeline and Split/Combine final muxing and added shared output audio validation with source-audio remux fallback, preventing raw-HEVC outputs from silently losing their audio track.
+- UI/Change: Clone translation API settings now reuse subtitle-tool keyring loading and default to the dubbing-optimized prompt; simplified the configuration title and saved-key status wording.
+
+### 2026-06-09
+
+- New: Added One-Click Listening Translation with recursive video scanning, shared translation API settings, reusable `.jp.srt` checkpoints, completed-subtitle skipping, optional source-subtitle retention, and ASR/denoising controls; compacted this and the translation page to keep logs visible.
+- New: Added an SI/dubbing-optimized translation prompt switch shared by subtitle translation and one-click listening translation, with UTF-8 BOM-compatible prompt/config loading.
+- Fix: SI batch subtitle-to-speech now releases generated tensors and CUDA caches between TTS batches and files, preventing growing reserved VRAM from differently shaped batches.
+
+### 2026-06-08
+
+- New: Added recursive batch SI video mixing, an optional independent SI track, selectable delay, and default-on original-audio ducking. Padded sidechain audio preserves the full source duration when the SI WAV is shorter.
+- New: Added built-in DLNA [SI] virtual entries and on-demand fragmented-MP4 live mixing with seek/session reuse and local configuration reload; sessions are isolated by client IP and video.
+- Fix: Hardened SI mixing for mono/multichannel inputs and additional original tracks, moved limiting after stereo assembly, reduced overlap clipping, bounded FFprobe/tempo-fit work, and rejected malformed or extreme SRT timestamps with diagnostics.
+- UI: Replaced SI test-line controls with start/duration windows, added localized speaker descriptions, and made generated default paths preserve the source separator style; applied matching time-window controls to the then-local 2DVR tool.
+- Optimization: Deferred subtitle ASR/FFmpeg/network/keyring imports and moved saved-key loading to a background task so opening the subtitle tool no longer waits for the heavy backend.
+- Packaging/Documentation: Aligned torchaudio with the CUDA Torch ABI, explicitly collected and verified Qwen3-TTS vendor source/runtime assets, and updated all three README languages for SI/2DVR plus Chinese package-download links.
+
+### 2026-06-07
+
+- Optimization: Changed launcher tools to lazy imports and made homepage GPU warmup opt-in; opening OneClick uses lightweight dependency checks, while actual GPU tasks retain full runtime validation.
+- Compatibility/Fix: Corrected Qwen3-TTS cache-position handling for Transformers 5.9 and introduced an official legacy-runtime worker to avoid unrelated/garbled speech. Bilingual SRT parsing now selects the line matching the requested language.
+- Optimization: Added SDPA fallback, token-budgeted small TTS batches, tighter generation limits, and in-memory duration fitting with fallback, reducing per-line inference and FFmpeg startup overhead.
+- New: Added an SI video-audio mixing test that copies video/original tracks and appends a named SI mix with channel and volume controls.
+- UI/Change: Split single/batch subtitle-to-audio tabs with shared model/log panels, hid completed model-download controls, added ordered limited-line previews and optional recursive scanning, made Serena the Chinese default voice, and stopped persisting internal non-UI runtime settings.
+
+### 2026-06-06
+
+- Fix: GPU progress FPS now uses adjacent samples with EMA smoothing, and ETA follows current throughput instead of drifting as warmup samples leave a rolling window.
+- New/Fix: Added NativeGPU inference tuning and an opt-in bounded CUDA Graph cache with eager fallback and dedicated capture/replay stream isolation. CUDA Graph and channels-last defaults were disabled after a native fast-fail report pending broader pipeline validation.
+- Optimization: Small restoration inputs automatically use the CPU frame reader while retaining GPU encoding, avoiding NVDEC setup/contention overhead; larger inputs keep the GPU frame-source path.
+- New/Optimization: The then-local 2DVR tool gained depth-only GPU preprocessing, pipelined I/O, explicit inverse-warp mode, corrected limited-range color metadata, temporal stabilization with scene resets, and resolution-guarded subpixel splatting; LaMa ONNX replaced the earlier video-inpainting backend.
+- New/UI: Added the initial Qwen3-TTS SI subtitle-to-WAV tool with timed SRT assembly, single-file/batch processing, model-download controls, and three-language text; renamed the subtitle launcher to Japanese Batch Subtitle Tools.
+
 ### 2026-06-05
 
 - New: Added the grouped OneClick paired pre-extract pipeline. Rects sharing the same frame window can now share one GPU decode, and restored rects can use raw HEVC plus sidecar metadata instead of temporary MP4 muxes.
@@ -268,11 +368,26 @@
 - Major fix: Repaired Kotoba Whisper CTranslate2 alignment-head configs and safely re-enabled Kotoba word timestamps.
 - Major fix: Tuned OneClick source-scan recall by scanning the source left eye at native size, fixing detector cache keys, and aligning detection metadata/debug coordinates.
 
+### 2026-06-02
+
+- Major fix: Materialized SBS timeline gaps before fast HEVC merging to avoid broken repeated source seeks, and disabled `-shortest` in final copy muxing to preserve the source audio track; verified playback boundaries and audio passthrough on the reported 8K output.
+- Fix: Added explicit target/peak bitrate propagation for OneClick single-eye split intermediates and area-scaled VBR budgets for fine rect clips, preventing small crops or individual eyes from inheriting oversized full-source bitrate settings.
+- Change/Documentation: Standardized CUDA Edition naming and the GitHub homepage, synchronized all three README/release-guide languages with NVIDIA/CUDA requirements, and translated Python/spec comments and docstrings into English.
+- Change: Subtitle generation now defaults to the `large-v3` ASR model.
+
 ### 2026-06-01
 
 - New: Added the OneClick source-scan and pre-extract workflow to process only detected mosaic intervals and paste restored rects back onto the base video.
 - Major optimization: Added fast HEVC timeline concat for source-scan outputs, with original audio copied once and GPU timeline merge kept as a fallback.
 - Major fix: Corrected source-scan final merge playback/seeking issues and final GPU timeline bitrate overshoot.
+
+### 2026-05-31
+
+- Major fix: Restored the direct CuPy RawKernel path and explicitly typed float kernel arguments, resolving launch hangs from the experimental PTX path and incorrect NV12/BGR colors; verified exact color-conversion agreement with the Torch reference.
+- Fix/New: Added spatial clustering and multiple rects per time window so distant low-confidence detections no longer expand local mosaic crops to the whole frame. Inner pre-extract no-hit results copy through, while source-scan no-hit results skip the video.
+- New/Optimization: Added source-level keyframe/low-resolution time filtering with coarse interval merging, keyframe-aligned copy cuts, and GPU timeline replacement; removed the preliminary dense-GOP whole-video rewrite.
+- Optimization: Re-enabled the native single-eye streaming path with file fallback after correcting color kernels, allowing geometry to run within the restoration pipeline.
+- Diagnostics/Fix: OneClick now writes a UTF-8 process log beside every source video, adds scan/cut/replace/mux context, decodes subprocess logs as UTF-8, and creates missing output parent directories before muxing.
 
 ### 2026-05-29 to 2026-05-30
 
@@ -281,6 +396,51 @@
 - Major optimization: GPU-accelerated VR split/merge, fisheye/equirectangular conversion, VR-to-flat projection, and OneClick geometry stages.
 
 ## 中文
+
+### 2026-10-03
+
+- 新功能：完整 SI 生成及 OmniVoice/IndexTTS 克隆完成后，自动生成原声、译音和 duck key 的完整预混结果 `.si.mix.m4a` 与 `.si.mix.json`，使用 AAC-LC、192 kb/s、48 kHz、双声道和 faststart，供 PTMediaServer 虚拟 MP4 播放复用。
+- 新功能：新增 `python -m tool_si.dlna_audio VIDEO_OR_DIRECTORY [--recursive]` 命令，可为已有 WAV 补齐预混文件，无需加载语音模型或调用翻译 API；克隆流程的跳过已有输出分支也会补齐缺失预混，局部 SI 试听不生成整片预混。
+- 优化：内置 DLNA 的 MPEG-TS 和 fragmented MP4 SI 流可直接复制匹配的预混 AAC 音频包；严格校验输入文件、混音参数和输出格式，过期、残缺或参数不符时回退原有 WAV 混音。普通 SI 直接复用需要与导出时的零延迟等参数一致。
+- 修复：预混输出通过校验后才发布完成标记，失败或取消时保留已成功生成的 WAV；媒体文件变化会重建 DLNA 会话，FFmpeg 退出后仍会读完缓冲输出。
+
+### 2026-08-18
+
+- 新功能：IndexTTS 克隆新增默认开启的逐句音量贴合原片。Bandit 仅分离带上下文的字幕/词跨度，同时提供干声电平参考和可复用的 `.dub_bg.wav` 背景床，跨度外保留原声采样；缺失或不可信的干声使用混合音估计回退。
+- 修复：音量校准改为覆盖真实词跨度，拒绝异常偏弱的分离干声，清除陈旧测量值，并加入增益边界、峰值保护和相对中位电平的可听性下限；跨度签名与完成标记避免部分干声为空时反复重跑分离。
+- 修复：解决整句台词被压进极短碎片时间槽的问题。v2 碎片合并在槽位无法容纳文本时扩展时长，新旧克隆后端均防止拆句边界缩进自身词时间戳内部。
+- 新功能：v2 碎片合并前可按说话人轮次切分，过滤碎片簇并平滑过短标签游程，减少男女对话共用同一参考音的问题；单片和批量页面统一提供说话人数 1（默认，不执行分离）、自动、2–7。启用后需要重新生成原有转录和翻译检查点。
+- 新功能：恢复 v2 配音模式，仅替换字幕区间内的台词，复用通过校验的背景床并输出 `_DUB.mp4`，区间外保留原声。
+- 修复：v2 批量/完整克隆的“保留中间文件”选项真正生效；关闭时逐视频删除成功合成后的整个 `.clone` 目录，包括转录、翻译和人工校对检查点。保留背景床，因 `.si.wav` 已存在而跳过的视频不清理。
+- UI/修复：修正混音配音页网格行重叠，恢复开始/停止按钮可见性并增加真实几何回归；最终音量校准和轮次切分已完成测试及真实 manifest 回放，交接时仍待端到端重新合成试听。
+
+### 2026-08-15
+
+- 修复：IndexTTS 合成始终先使用当前句的精确原声范围，不再预先把短句替换成全片最长句；仅在真实短输入失败时使用附近上下文窗口重试，推理前清理同编号旧输出，避免历史 WAV 被误判为本轮成功。
+- 修复/优化：新增有效语音、音量和周期有声比例检查；短弱气声可用附近稳定句提供音色，同时保留当前句情感，对无基频参考降低情感权重以抑制异常发声；每个视频的源音频只读取一次。
+- 打包：显式收集并校验完整 IndexTTS 文本运行时，包括 UniDic/Fugashi、Contractions、WeText、KaldiFST、SentencePiece、Textstat/Pyphen，以及 SoundFile/libsndfile，缺失资产在构建阶段直接报错。
+- 重大修复：WAV 保存统一使用标准 PCM16 写入器，读取显式固定 SoundFile 后端，规避 torio 与 PyNv 的 FFmpeg DLL 冲突；修复 IndexTTS 已放大浮点波形转 int16 的量纲错误，避免生成音频变成满幅方波。
+- 打包/UI：清理发布目录前检查主 GUI 和两个 DLNA 可执行文件位置，单独重打 DLNA 时同样保护，无法检查进程时明确失败；发行包排除模型权重并附带三语用户指南，新旧克隆工具默认关闭调试中间文件保留。
+
+### 2026-08-14
+
+- 新功能：逐句情感语音克隆扩展为完整视频流程，单片采用两步向导，批量支持递归目录扫描并按目录完成转录、翻译和逐句 IndexTTS 合成；同目录复用一次模型加载，需要继续 ASR 时受控释放模型。
+- 新功能/修复：批量续传复用有效音频、manifest、原文字幕、译文字幕和最终 WAV；已有 `translated.srt` 可恢复 manifest 缺失译文，缓存路径避免重复 AI 原文校对，译文完整时无需翻译 API 配置即可续跑合成。
+- 修复：移除逐句固定峰值归一化和整条时间线缩放，保留 IndexTTS 原始输出幅度；混音控件简化为原声压低流程，默认最强压低并启用防漏原声。
+- 修复/优化：v2 在合成前按时长和累计静音预算合并字幕碎片，减少过短参考音和句中韵律重启，同时遵守说话人边界。
+- 变更/文档：IndexTTS 中间 WAV 改存视频旁的 `.clone` 目录，首页新版入口排在旧 OmniVoice 工具之前，并同步更新三语 README 和发行版指南。
+
+### 2026-08-13
+
+- 新功能：IndexTTS-2.5 接入转录、翻译、人工校对、manifest/时间线导出和视频混音；单片界面收敛为两步，使用逐句源 WAV 作为参考，无需参考文本或按说话人分组，单片/批量流程固定使用适中语速贴合。
+- 兼容/修复：修正 vendored GPT2 在 Transformers 5.x 下的生成与缓存处理，包括 legacy cache 转换和显式 mel token ID，解决空 semantic 输出；真实生成的中文语音已用本地 ASR 独立回读验证。
+- 变更：v2 移除无效的 OmniVoice 专属合成参数与音色设计控件；目标语言限制为中文、英文、日文、西班牙文和阿拉伯文，逐句日志显示原始时长、适配时长和字幕槽位时长。
+- 新功能/修复：辅助模型统一存入 `models/IndexTTS-2.5/aux_models`，主模型及辅助资产缺失或残缺时自动恢复，BigVGAN 镜像下载支持断点续传；不再强制要求未使用的 MaskGCT 和可选 Qwen 情感模型。
+
+### 2026-08-12
+
+- 新功能：新增实验性 `tool_clonevoice_v2` 入口，使用 vendored IndexTTS-2.5 按原句 WAV 参考进行合成、时长适配和时间线回填，同时保留旧 OmniVoice 工具。
+- 兼容/打包：适配现有 Transformers 5.9 环境，补充文本前处理依赖及 PyInstaller vendor/资产收集；这一阶段输入仍为源 WAV 和句段 JSON，真实模型推理及完整视频流程尚待后续接入。
 
 ### 2026-08-08
 
@@ -303,6 +463,10 @@
 
 - 说明：补充 source-scan 去马赛克片段和部分 SBS 中间文件可能刻意只含视频；最终 Stage 4 时间线合并会从原始输入恢复音轨，真正完成以 `Done! Output:` 日志为准。
 - 文档/性能：明确 Native GPU `max_clip_length` 的单位是帧，并记录大分辨率输入下显存保护会自动限制为 24/48/64 帧；典型负载下 180 帧相对 90 帧对整个流水线的预计速度优势约为 1%-6%。
+
+### 2026-07-25
+
+- 文档/核对：确认克隆翻译配音各入口均通过共享校对函数使用稀疏差异返回；人工“校对翻译”窗口不调用 AI，已有完整目标语言译文时会跳过翻译及 AI 原文校对。
 
 ### 2026-07-24
 
@@ -527,6 +691,57 @@
 - 重大更新：完善配音回混行为：配音模式隐藏 SI 专用控件、禁用 ducking，并支持将 DUB 音频作为独立音轨加入。
 - 修复：批量扫描会忽略已生成的 `_SI.mp4` / `_DUB.mp4`，避免把输出文件再次当作源视频处理。
 
+### 2026-06-13
+
+- 新功能：克隆翻译配音新增递归批量目录处理，视频音轨混合合并为统一页面，单文件/批量模式共用 SI/配音设置。
+- 新功能/UI：新增 ASR、OmniVoice 和 ECAPA 模型完整性及状态检查、缺失模型下载按钮和下载体积确认，模型就绪后隐藏状态行以减少界面占用。
+- 修复：OmniVoice 合成前释放 ASR/说话人分离模型，批量视频之间在 Tk 主线程清理原生模型持有对象，pyannote 和 ECAPA 对象增加显式最终清理。
+- 文档/UI：统一启动器和工具命名，调整克隆设置顺序、本地化 ASR 模型名称，并扩充双语模型放置与下载指南。
+
+### 2026-06-12
+
+- 新功能/变更：实现离线 ECAPA-WavLM 说话人分离后端，支持有界自动聚类和指定人数；真实素材出现过分裂后保留为显式开发备用，自动后端恢复优先 pyannote、否则单说话人回退。
+- 修复：OmniVoice 参考音优先选择连续的说话人独占区间，扣除其它说话人重叠并加入边界保护和纯度评分，减少参考音串音。
+- 新功能/诊断：manifest 保存原始说话人轮次和字幕编号，参考样本记录对应原文字幕，新增 `references.md` 汇总所选范围、编号和文本。
+- 修复/研究：空参考文本不再隐式触发 OmniVoice 下载 Whisper Turbo；评估 CosyVoice 跨语言克隆后根据试听结果撤回接入及相关依赖。
+
+### 2026-06-11
+
+- 重大修复：NVDEC seek/pre-roll 校验统一 SimpleDecoder/ThreadedDecoder 的 PTS 原点，并容忍远小于一帧的残差，消除正确画面被误报错位的问题，同时保留真实错帧检测。
+- 重大修复：GPU 时间线合并及分屏合并最终封装禁用 `-shortest`，通用 mux 增加输出音轨校验与源音频二次 remux 兜底，避免 raw HEVC 输出静默丢失音轨。
+- UI/变更：克隆翻译 API 设置复用字幕工具 keyring 读取，默认使用配音优化 prompt，并简化配置标题及已保存密钥的状态文案。
+
+### 2026-06-09
+
+- 新功能：新增“一键听译”，支持递归视频扫描、复用翻译 API 设置和 `.jp.srt` 检查点、跳过已完成字幕、可选保留原文字幕，以及 ASR/降噪设置；压缩听译和翻译页布局，增加日志可见空间。
+- 新功能：字幕翻译和一键听译共用同传/配音优化 prompt 开关，prompt 与配置读取兼容 UTF-8 BOM。
+- 修复：SI 批量字幕转语音在 TTS batch 和文件之间释放生成张量及 CUDA 缓存，避免不同批次形状导致保留显存持续膨胀。
+
+### 2026-06-08
+
+- 新功能：新增递归批量 SI 视频混音、可选独立 SI 音轨、延迟选择和默认开启的原声自动压低；侧链音频补静音，避免 SI WAV 较短时混合音轨提前结束。
+- 新功能：内置 DLNA 新增 [SI] 虚拟入口和按需 fragmented MP4 实时混音，支持定位、会话复用和本地配置热重载，会话按客户端 IP 与视频隔离。
+- 修复：增强单声道/多声道输入和额外原音轨兼容性，限幅移至双声道合成之后，减少时间线重叠削波，限制 FFprobe/变速处理时间，并拒绝异常 SRT 时间码、输出分类诊断。
+- UI：SI 测试行数改为开始时间/时长窗口，增加本地化音色说明，自动填充路径保留源分隔符风格；当时的本地 2DVR 工具同步采用时间窗口控件。
+- 优化：字幕工具的 ASR、FFmpeg、网络和 keyring 改为按需导入，已保存密钥后台读取，打开工具不再等待重型后端加载。
+- 打包/文档：torchaudio 版本与 CUDA Torch ABI 对齐，显式收集并验证 Qwen3-TTS vendor 源码和运行资产；同步三语 README 的 SI/2DVR 说明及中文版整合包下载链接。
+
+### 2026-06-07
+
+- 优化：首页工具改为点击后惰性导入，GPU 预热改为显式启用；打开 OneClick 只做轻量依赖检查，实际 GPU 任务仍保留完整运行时验证。
+- 兼容/修复：修正 Transformers 5.9 下的 Qwen3-TTS cache position，并引入官方旧版运行时 worker，避免无关套话或乱码语音；双语 SRT 按所选语言选择匹配文本行。
+- 优化：新增 SDPA 回退、按 token 预算合并的小批量 TTS、更紧的生成上限，以及带兜底的内存时长适配，减少逐句推理和 FFmpeg 启动开销。
+- 新功能：新增 SI 视频音轨混合测试，复制视频及原音轨，并追加命名为 SI 的混合音轨，支持声道和音量控制。
+- UI/变更：字幕转音频拆分单文件/批量页，共享模型和日志区域；模型就绪后隐藏下载控件，新增按原顺序的限行试听和可选递归扫描，中文默认音色改为 Serena，内部无 UI 参数不再持久化。
+
+### 2026-06-06
+
+- 修复：GPU 进度 FPS 改为相邻采样加 EMA 平滑，ETA 跟随当前吞吐，不再因滚动窗口逐步丢弃预热样本而持续虚增。
+- 新功能/修复：NativeGPU 新增推理调优和可选的有界 CUDA Graph 缓存，失败回退 eager，并使用专属 capture/replay stream 隔离；收到原生 fast-fail 报告后默认关闭 CUDA Graph 与 channels-last，等待更广泛管线验证。
+- 优化：小分辨率恢复输入自动回退 CPU 读帧但保留 GPU 编码，减少 NVDEC 初始化和资源争用，大分辨率仍走 GPU frame source。
+- 新功能/优化：当时的本地 2DVR 新增 depth-only GPU 预处理、流水线 I/O、独立 inverse-warp 模式、正确的 limited-range 色彩元数据、场景切换重置的时序稳定和分辨率保护的亚像素 splat，并以 LaMa ONNX 替换早期视频修补后端。
+- 新功能/UI：新增初版 Qwen3-TTS 同传字幕转 WAV 工具，支持 SRT 时间线合成、单文件/批量处理、模型下载控件和三语界面，字幕工具入口改名为“日语批量字幕工具”。
+
 ### 2026-06-05
 
 - 新功能：新增 OneClick paired pre-extract 分组流水线。同一帧窗口内的多个 rect 可共享一次 GPU 解码，恢复小段可使用 raw HEVC + sidecar 元数据，减少临时 MP4 mux。
@@ -548,11 +763,26 @@
 - 重大修复：修复 Kotoba Whisper CTranslate2 alignment-head 配置，安全恢复 Kotoba word timestamps。
 - 重大修复：调优 OneClick source-scan 召回率：改为原始尺寸左眼粗扫，修复 detector cache key，并对齐检测 metadata/debug 坐标。
 
+### 2026-06-02
+
+- 重大修复：SBS 快速 HEVC 合并前将 gap 段落盘，避免反复定位同一源文件导致后半段解码损坏；最终 copy 封装禁用 `-shortest` 以保留源音轨，并在报告的 8K 输出上验证片段边界及音频直通。
+- 修复：OneClick 单眼切分中间文件显式传递目标/峰值码率，fine rect 按面积分配 VBR 预算，避免小区域或单眼套用过高的整片源码率。
+- 变更/文档：统一 CUDA 专版命名和 GitHub 首页，同步三语 README/发行指南中的 NVIDIA/CUDA 要求，并将 Python/spec 注释与 docstring 翻译为英文。
+- 变更：字幕生成默认 ASR 模型改为 `large-v3`。
+
 ### 2026-06-01
 
 - 新功能：新增 OneClick source-scan / pre-extract 工作流，只处理检测到马赛克的时间区间，并把恢复后的 rect 贴回底片视频。
 - 重大优化：新增 source-scan 输出的 HEVC timeline 快速拼接，最终音频只从原始源复制一次，并保留 GPU timeline merge 作为兜底。
 - 重大修复：修复 source-scan 最终合并后的播放/seek 问题，以及最终 GPU timeline merge 的码率膨胀问题。
+
+### 2026-05-31
+
+- 重大修复：恢复直接 CuPy RawKernel 路径并显式指定浮点 kernel 参数类型，解决实验性 PTX 路径的 launch 卡死及 NV12/BGR 颜色错误，颜色转换已与 Torch 参考逐像素一致。
+- 修复/新功能：新增空间分簇和同时间窗多 rect，避免远处低置信误检把局部马赛克区域拉成全图；内层 pre-extract 无命中时直通，源级扫描无命中时跳过视频。
+- 新功能/优化：新增源级关键帧低分辨率时间筛选、粗时间区间合并、关键帧对齐 copy 切段和 GPU 时间线替换，移除扫描前的全片 dense GOP 重编码。
+- 优化：颜色 kernel 修正后重新开启 native 单眼流式路径并保留文件回退，使几何处理可融入恢复管线。
+- 诊断/修复：OneClick 为每个源视频在同目录写 UTF-8 process log，补充扫描、切段、替换和封装上下文，子进程日志按 UTF-8 解码，mux 前自动创建缺失输出父目录。
 
 ### 2026-05-29 至 2026-05-30
 

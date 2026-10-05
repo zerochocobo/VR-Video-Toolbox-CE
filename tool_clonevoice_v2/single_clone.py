@@ -835,6 +835,7 @@ def translate_and_synthesize(
             level_match=level_match,
         ):
             log(f"[single] target .SI.WAV is up to date; skipped: {out_path}")
+            si.prepare_dlna_audio(video, out_path, log_callback=log, stop_event=stop_event)
             outputs.append(out_path)
             skipped.append(out_path)
             continue
